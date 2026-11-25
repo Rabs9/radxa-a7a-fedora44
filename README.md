@@ -96,10 +96,12 @@ terminal) checks the whole stack and ends with "0 fail, 0 warn".
    about GLX. Imagination's driver has OpenGL ES only (see
    [the GPU section](#imaginations-gpu-driver-the-one-piece-we-need)). Two ways:
    - on the default entry, in software: `LD_LIBRARY_PATH=/usr/lib64 <program>` (slower, but it runs);
-   - on the GPU: start the board on the **second boot entry** (the open driver). There, desktop OpenGL runs on the
-     PowerVR through zink (OpenGL on top of Mesa's PowerVR Vulkan driver), for Wayland and X11 programs alike.
-4. **Vulkan programs** need the second boot entry too: Mesa's PowerVR Vulkan driver (Vulkan 1.2) shows windows on
-   Wayland. On the default entry, Imagination's Vulkan driver cannot.
+   - on the GPU, slowly: start the board on the **second boot entry** (the open driver). There, desktop OpenGL runs
+     on the PowerVR through zink (OpenGL on top of Mesa's PowerVR Vulkan driver), for Wayland and X11 programs
+     alike, but only up to **OpenGL 2.1** and slowly (glmark2's build scene: 39 fps, against about 2000 for OpenGL
+     ES on the default entry). Programs that need OpenGL 3 or newer do not run there either.
+4. **Vulkan programs** need the second boot entry: Mesa's PowerVR Vulkan driver (Vulkan 1.2) shows windows on
+   Wayland (`vkcube` runs on the PowerVR). On the default entry, Imagination's Vulkan driver cannot.
 5. **Flatpak apps** (Flathub) bring their own graphics libraries, which do not include Imagination's driver: expect
    them to draw in software. For anything that needs the GPU, prefer Fedora's package. (Not measured here.)
 
@@ -107,7 +109,7 @@ terminal) checks the whole stack and ends with "0 fail, 0 warn".
 
 The boot menu shows only on a serial console, so the switch is a command, in a terminal:
 
-- `sudo prepare616.sh`: the open driver (Mesa: desktop OpenGL through zink, Vulkan on Wayland) from the next start;
+- `sudo prepare616.sh`: the open driver (Mesa: Vulkan on Wayland, desktop OpenGL 2.1 through zink) from the next start;
 - `sudo backtoddk.sh`: back to Imagination's driver (the default: the fastest desktop and OpenGL ES).
 
 Each makes its entry the default and restarts the board after 3 seconds; nothing is removed, and the session follows
