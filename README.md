@@ -25,7 +25,7 @@ Built and tested by Rabs9 on one Cubie A7A. It is a hobby project, not a Radxa o
 
 From the board, the standard image, 1024x600 screen:
 
-![The desktop: "hey cubie, type hello world" typed by voice into KWrite](docs/screenshots/desktop.png)
+![The Fedora 44 KDE Plasma desktop on the Cubie A7A](docs/screenshots/desktop.png)
 
 | | |
 |---|---|
