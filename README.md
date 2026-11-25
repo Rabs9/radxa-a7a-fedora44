@@ -6,6 +6,7 @@ board, optional cloud assistants, and an update channel for the board's own pack
 
 Built and tested by Rabs9 on one Cubie A7A. It is a hobby project, not a Radxa or Fedora product.
 
+- [Screenshots](#screenshots)
 - [Download and first start](#download-and-first-start)
 - [What you get](#what-you-get)
 - [The A7A Panel](#the-a7a-panel)
@@ -19,6 +20,21 @@ Built and tested by Rabs9 on one Cubie A7A. It is a hobby project, not a Radxa o
 - [Imagination's GPU driver: the one piece we need](#imaginations-gpu-driver-the-one-piece-we-need)
 - [Known limits](#known-limits)
 - [Licences](#licences)
+
+## Screenshots
+
+From the board, the standard image, 1024x600 screen:
+
+![The desktop: "hey cubie, type hello world" typed by voice into KWrite](docs/screenshots/desktop.png)
+
+| | |
+|---|---|
+| ![A7A Panel, Overview](docs/screenshots/panel-overview.png) | ![A7A Panel, Controls](docs/screenshots/panel-controls.png) |
+| Overview: clocks, load and memory live | Controls: power profile, CPU caps, memory, L3, NPU, GPU, jack |
+| ![A7A Panel, Getting started](docs/screenshots/panel-guide.png) | ![A7A Panel, Voice](docs/screenshots/panel-voice.png) |
+| Getting started: the setup guide | Voice: wake phrases and who answers them |
+| ![A7A Panel, Hardware](docs/screenshots/panel-hardware.png) | ![A7A Panel, Assistant](docs/screenshots/panel-assistant.png) |
+| Hardware: programs on the GPU, display and NPU | Assistant: the board's own model |
 
 ## Download and first start
 

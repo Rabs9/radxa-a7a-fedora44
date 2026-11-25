@@ -39,3 +39,5 @@ idr@us.ibm.com
 benjaminfranzke@googlemail.com
 # GitHub's ssh address (the README's remote line)
 git@github.com
+# xz bytes of a7a-board-tools-20261125-202611250956 shaped like an address: in no file of the package (2026-11-25)
+W@f.KT

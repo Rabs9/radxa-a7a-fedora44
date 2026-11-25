@@ -59,6 +59,22 @@ MARK = "a7a-packages"                    # OUT/.git/<MARK>: the folder is this s
 SOURCE = "https://github.com/Rabs9/radxa-a7a-fedora44"
 
 
+def unpack(rpm: Path, into: Path) -> bool:
+    """rpm2cpio | cpio -idm into a folder; whether both did it. cpio stops at the archive's end marker, and rpm2cpio
+    may still have padding to write after it: what is left in the pipe is read here, or rpm2cpio waits for a reader
+    for ever (the publish of 2026-11-25 hung 25 minutes on a7a-repo, whose first run had passed)."""
+    p2c = subprocess.Popen(["rpm2cpio", str(rpm)], stdout=subprocess.PIPE)
+    try:
+        c = subprocess.run(["cpio", "-idm", "--quiet", "--no-absolute-filenames"], stdin=p2c.stdout, cwd=into,
+                           capture_output=True)
+        while p2c.stdout.read(1 << 16):
+            pass
+    finally:
+        p2c.stdout.close()
+        p2c.wait()
+    return p2c.returncode == 0 and c.returncode == 0
+
+
 class Refused(Exception):
     def __init__(self, why: str, code: int = 2):
         super().__init__(why)
@@ -304,11 +320,7 @@ class Publish:
         for i, r in enumerate(files):
             s = where / f"{i:03d}-{r.name}"
             (s / "files").mkdir(parents=True)
-            p2c = subprocess.Popen(["rpm2cpio", str(r)], stdout=subprocess.PIPE)
-            c = subprocess.run(["cpio", "-idm", "--quiet", "--no-absolute-filenames"], stdin=p2c.stdout, cwd=s / "files",
-                               capture_output=True)
-            p2c.wait()
-            if p2c.returncode or c.returncode:
+            if not unpack(r, s / "files"):
                 raise Refused(f"{r.name}: cannot unpack it", 1)
             (s / "header.xml").write_text(must(["rpm", "-qp", "--nosignature", "--xml", str(r)], f"{r.name}: its header"))
         c = run([sys.executable, str(P / "tools/public-check.py"), str(where), "--private", str(self.private),

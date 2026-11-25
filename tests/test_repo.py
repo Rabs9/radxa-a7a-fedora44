@@ -80,6 +80,41 @@ def git(*args, check=True) -> str:
 
 
 @unittest.skipUnless(HAVE_PUBLISH, "rpm-sign/createrepo_c/dnf5 not installed (sudo dnf install rpm-sign createrepo_c)")
+class UnpackTest(unittest.TestCase):
+    """repo-publish.py's unpack(): cpio stops at the archive's end, rpm2cpio may still be writing (2026-11-25: the
+    publish hung 25 minutes). An rpm2cpio stand-in writes a real archive and 1 MB of padding after it."""
+
+    def test_padding_after_the_archive_does_not_hang_it(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader("repo_publish", str(P / "tools/repo-publish.py"))
+        rp = importlib.util.module_from_spec(importlib.util.spec_from_loader("repo_publish", loader))
+        loader.exec_module(rp)
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "src").mkdir()
+            (d / "src" / "hello.txt").write_text("hi\n")
+            archive = subprocess.run(["cpio", "-o", "-H", "newc", "--quiet"], input=b"hello.txt\n", cwd=d / "src",
+                                     capture_output=True, check=True).stdout
+            (d / "archive.cpio").write_bytes(archive)
+            bin_ = d / "bin"
+            bin_.mkdir()
+            (bin_ / "rpm2cpio").write_text(f"#!/bin/bash\ncat {d}/archive.cpio; head -c 1048576 /dev/zero\n")
+            (bin_ / "rpm2cpio").chmod(0o755)
+            (d / "out").mkdir()
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = f"{bin_}:{old_path}"
+            try:
+                import threading
+                done = []
+                t = threading.Thread(target=lambda: done.append(rp.unpack(d / "x.rpm", d / "out")), daemon=True)
+                t.start()
+                t.join(30)
+            finally:
+                os.environ["PATH"] = old_path
+            self.assertEqual(done, [True], "unpack hung or failed")
+            self.assertEqual((d / "out" / "hello.txt").read_text(), "hi\n")
+
+
 class PublishTest(unittest.TestCase):
     """The whole publish against a bare repository standing in for GitHub; packages built here, a throwaway key."""
 
