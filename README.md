@@ -103,6 +103,16 @@ terminal) checks the whole stack and ends with "0 fail, 0 warn".
 5. **Flatpak apps** (Flathub) bring their own graphics libraries, which do not include Imagination's driver: expect
    them to draw in software. For anything that needs the GPU, prefer Fedora's package. (Not measured here.)
 
+### Switching between the two drivers
+
+The boot menu shows only on a serial console, so the switch is a command, in a terminal:
+
+- `sudo prepare616.sh`: the open driver (Mesa: desktop OpenGL through zink, Vulkan on Wayland) from the next start;
+- `sudo backtoddk.sh`: back to Imagination's driver (the default: the fastest desktop and OpenGL ES).
+
+Each makes its entry the default and restarts the board after 3 seconds; nothing is removed, and the session follows
+the driver by itself.
+
 ## The A7A Panel
 
 One window for the board:
