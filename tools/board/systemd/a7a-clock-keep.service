@@ -1,0 +1,19 @@
+# a7a-board-tools: keep the time the next boot starts its clock from (/usr/local/bin/a7a-clock-keep says why), at
+# boot and at shutdown. Enabled by the package itself (a link in /usr/lib/systemd/system/multi-user.target.wants):
+# it does nothing until chronyd has synchronised the clock. `systemctl is-enabled` says "disabled" (no link in /etc)
+# and `systemctl disable` cannot turn it off: `systemctl mask a7a-clock-keep.service a7a-clock-keep.timer` does.
+[Unit]
+Description=Keep the time the next boot starts its clock from (a7a)
+Documentation=man:systemd(1)
+# stopped before chronyd at shutdown, so that chronyd can still say the clock is right
+After=chronyd.service
+ConditionPathExists=/usr/bin/chronyc
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/a7a-clock-keep
+ExecStop=/usr/local/bin/a7a-clock-keep
+
+[Install]
+WantedBy=multi-user.target

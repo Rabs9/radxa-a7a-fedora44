@@ -1,0 +1,9 @@
+[Unit]
+Description=a7a: watch kwin_wayland for package updates that restore cap_sys_nice
+
+[Path]
+PathChanged=/usr/bin/kwin_wayland
+Unit=a7a-kwin-nocap.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,707 @@
+#!/bin/bash
+# a7a-clock — unified clock+voltage control for the Radxa Cubie A7A (Allwinner A733)
+# a7a-fedora port of Rabs9/radxa-a7a-toolkit tools/a7a-clock: kernel, append and base DTB come from the running
+# system and the default extlinux entry; the GPU soak uses the PowerVR DDK under /opt/pvr through Xwayland.
+# status                       show all clocks, voltages, temps
+# check                        compare every clock with what the image promises (/etc/a7a-image-variant) and with
+#                              what the hardware offers: PASS/WARN/FAIL per domain, changes nothing
+# gpu <MHz> [mV]               set GPU clock + rail voltage (boot entry; reboot to apply).
+#                              mV optional -> sensible default per clock. UNDERVOLT = pass a lower mV.
+# ram <MHz>                    set DRAM controller freq (runtime, devfreq; see status for the
+#                              available list — 2136-firmware card: 427|854|1221|2136)
+# npu <492|852|1008>           set NPU freq (runtime, devfreq)  [1008 = qualified max for this bin]
+#                              (the NPU scales inside its 1008 MHz module clock: the rate in effect is devfreq's
+#                              target_freq; cur_freq is the module clock and never moves)
+# cpu <performance|schedutil|ondemand|powersave>  CPU governor (runtime)
+# cpumax <littleMHz> <bigMHz>  cap each cluster's clock (runtime; 'max' = the OPP ceiling)
+# dsu <stock|dyn|dynoc|MHz>    DSU/L3: stock 780, dynamic to the bin max (dynoc: and the 1352 rung on top), or a
+#                              fixed rung (1352 validated)
+# wifi <2.4|5|both>            lock the wifi band on the saved connection(s) (NetworkManager)
+# soak [minutes]               GPU stress soak with error/temp watch (default 10)
+# power <power-saver|balanced|performance>  what KDE's power slider means on this board (tuned runs it, through the
+#                              a7a-* tuned profiles; tuned-ppd maps the slider to them):
+#                              power-saver  governor schedutil, littles<=1196 bigs<=1508 RAM 854, dynamic DSU (= eco)
+#                              balanced     governor schedutil, full CPU, RAM full, dynamic DSU (the image's default)
+#                              performance  governor performance (clocks held at the top), RAM full, dynamic DSU
+# profile <eco|balanced|oc|dynoc>  one-switch performance profile (CPU caps + RAM + DSU):
+#                              eco      littles<=1196 bigs<=1508 RAM 854, dynamic DSU
+#                              balanced full CPU, RAM full, dynamic DSU (bin max 1274)
+#                              oc       full CPU, RAM full, DSU forced 1352 (over-bin, validated)
+#                              dynoc    full CPU, RAM full, dynamic DSU incl. the 1352 rung
+# codec <ac101|ac101b|status|state>  the 3.5 mm jack's codec in every device tree of the board (reboot to apply): Radxa
+#                              builds the board with an AC101 (option 1) or an AC101B (option 2), and the kernel
+#                              packages' tree describes the AC101B only: on an AC101 board the jack has no sound card.
+#                              ac101 gives every tree the AC101 instead (each tree as it was kept, for ac101b to put
+#                              back); a7a-codec.service then keeps it so after a kernel update and sets the playback path
+# usb-stick <on|off>           electrically toggle the USB drive (it shares a hub with WiFi
+#                              + the 2.4GHz HID dongle; busy stick = 38ms avg WiFi ping)
+set -e
+DMC=/sys/class/devfreq/a020000.dmcfreq
+NPU=/sys/class/devfreq/3600000.npu
+EXT=/boot/extlinux/extlinux.conf
+GPU_NODE=/soc@3000000/gpu@1800000
+DC_NODE=/soc@3000000/twi@7083000/pmu@36/regulators@0/dcdc4
+# kernel for new GPU boot entries: whatever the current default entry boots
+# (the rbfix/custom/colorfix name differs per card — never hardcode it)
+DEF_LABEL=$(grep '^default' "$EXT" 2>/dev/null | awk '{print $2}' || true)
+KERNEL=$(awk -v l="$DEF_LABEL" '$1=="label"{cur=$2} $1=="linux"&&cur==l{print $2; exit}' "$EXT" 2>/dev/null || true)
+[ -n "$KERNEL" ] || KERNEL=/boot/vmlinuz-$(uname -r)
+# base DTB for new GPU boot entries: the tree of the kernel that default entry boots (the release is in the kernel
+# file's name), not of the kernel that happens to run. With the other flavour booted from the menu, the running
+# kernel's tree would pair the vendor kernel with the open driver's device tree. The default entry's own fdtdir is
+# kept when it is that kernel's (or its "-standard" tree); a g_* entry's is a copy, never a base.
+BASE_REL=${KERNEL##*/vmlinuz-}
+BASE_DIR=$(awk -v l="$DEF_LABEL" '$1=="label"{cur=$2} $1=="fdtdir"&&cur==l{print $2; exit}' "$EXT" 2>/dev/null || true)
+case "$BASE_DIR" in
+  /usr/lib/linux-image-"$BASE_REL"/|/usr/lib/linux-image-"$BASE_REL"-standard/) ;;
+  /usr/lib/linux-image-gpu*/)
+    # a GPU entry made by this tool: the tree it was copied from is noted in it, so a second `gpu` on a system whose
+    # own tree is the "-standard" one does not bring the other tree's CPU table back
+    BASE_NOTE=$(cat "${BASE_DIR}base" 2>/dev/null || true)
+    if [ -n "$BASE_NOTE" ] && [ -d "$BASE_NOTE" ]; then BASE_DIR=$BASE_NOTE; else BASE_DIR=/usr/lib/linux-image-$BASE_REL/; fi ;;
+  *) BASE_DIR=/usr/lib/linux-image-$BASE_REL/ ;;
+esac
+BASE_DTB=${BASE_DIR}allwinner/sun60i-a733-cubie-a7a.dtb
+# append line: whatever the current default entry uses (a7a-fedora: root=/dev/mmcblk0p3 console=ttyAS0 ... selinux=0)
+APPEND=$(awk -v l="$DEF_LABEL" '$1=="label"{cur=$2} $1=="append"&&cur==l{sub(/^[ 	]*append[ 	]+/,""); print; exit}' "$EXT" 2>/dev/null || true)
+
+# DSU modules + the validated over-bin rung (12-min soak @1352/1000mV, 2026-08-20).
+# This kernel has no CONFIG_MODVERSIONS: a module loads only under the exact release it was built for. Every image
+# until 2026-11-16 carried the Debian card's builds ("6.6.98+") in /home/radxa, and under a 6.6.98-a7a.<stamp>
+# kernel `dsu`, the four profiles and the panel's DSU buttons all ended in "Invalid module format". The module for
+# the running kernel: its own package's (extra/), else the image's per-release copy (tools/build-dsu-modules.sh),
+# else the Debian layout in the home directory.
+dsu_ko() {   # dsu_oc | dsu_dyn -> the file to load (the per-release place when there is none, for the message)
+  local f
+  for f in "/usr/lib/modules/$(uname -r)/extra/$1.ko" "/usr/local/lib/a7a/dsu/$(uname -r)/$1.ko" "/home/radxa/$1/$1.ko"; do
+    [ -f "$f" ] && { echo "$f"; return 0; }
+  done
+  echo "/usr/local/lib/a7a/dsu/$(uname -r)/$1.ko"
+}
+dsu_fits() {  # <file>: says why not, and fails, when the module cannot load under this kernel
+  local vm
+  [ -f "$1" ] || { echo "DSU module missing: $1"; return 1; }
+  vm=$(modinfo -F vermagic "$1" 2>/dev/null | awk '{print $1}' || true)
+  [ "$vm" = "$(uname -r)" ] || { echo "$1 is built for kernel '${vm:-?}', this one is $(uname -r): it cannot load (tools/build-dsu-modules.sh makes the one for this kernel)"; return 1; }
+}
+DSU_OC_KO=$(dsu_ko dsu_oc)
+DSU_DYN_KO=$(dsu_ko dsu_dyn)
+OC_HZ=1352000000
+OC_UV=1000000
+POL0=/sys/devices/system/cpu/cpufreq/policy0
+POL6=/sys/devices/system/cpu/cpufreq/policy6
+STICK=/sys/bus/usb/devices/1-1.2/authorized
+
+# validated undervolt floors (+small margin) from the 2026-08-12 hunt; 1008@800 = daily. The pairs are 400-1008 @ 800,
+# 1200 @ 920, 1300 @ 1040, 1400 @ 1150; a clock between two of them gets the voltage of the next pair up. (Any clock
+# that was not in the list used to get 800 mV: `gpu 1250` made 1250 MHz @ 800 mV the default boot entry, and 1200 MHz
+# at 800 mV is known not to hold.)
+default_mv() { if [ "$1" -le 1008 ]; then echo 800; elif [ "$1" -le 1200 ]; then echo 920; elif [ "$1" -le 1300 ]; then echo 1040; else echo 1150; fi; }
+
+status() {
+  echo "=== a7a-clock status ==="
+  echo "-- Power profile (KDE's slider): $(power_now | sed 's/^$/unknown (tuned not running?)/')"
+  echo "-- CPU:"
+  for p in /sys/devices/system/cpu/cpufreq/policy*; do
+    echo "  $(basename $p): $(($(cat $p/scaling_cur_freq)/1000)) MHz  gov=$(cat $p/scaling_governor)  max=$(($(cat $p/scaling_max_freq)/1000)) MHz"
+  done
+  echo "-- GPU:"
+  echo "  boot entry: $(grep '^default' $EXT | cut -d' ' -f2)  (running: $(sudo grep -E '^ +gpu0 ' /sys/kernel/debug/clk/clk_summary 2>/dev/null | awk '{print int($5/1000000) " MHz"}' | head -1))"
+  sudo grep -A1 'axp8191-dcdc4' /sys/kernel/debug/regulator/regulator_summary | head -1 | awk '{print "  rail: " $6}'
+  echo "-- RAM (DMC): $(($(cat $DMC/cur_freq)/1000000)) MHz  (available: $(awk '{for(i=1;i<=NF;i++) printf "%s%d", (i>1?" ":""), $i/1000000}' $DMC/available_frequencies))"
+  echo "-- NPU: $(($(devfreq_now $NPU)/1000000)) MHz  (available: $(awk '{for(i=1;i<=NF;i++) printf "%s%d", (i>1?" ":""), $i/1000000}' $NPU/available_frequencies))"
+  local dsumod
+  dsumod=$(dsu_modules)
+  echo "-- DSU/L3: $(sudo grep -m1 ' cpu_dsu ' /sys/kernel/debug/clk/clk_summary | awk '{print $5/1000000" MHz"}')  (module: ${dsumod:-none -> stock 780})"
+  echo "-- USB stick: $( [ "$(cat $STICK 2>/dev/null)" = 1 ] && echo on || echo off )"
+  echo "-- WiFi: $(nmcli -t -f DEVICE,STATE,CONNECTION dev status 2>/dev/null | grep '^wlan' | head -1 | cut -d: -f2-3 | tr ':' ' ')  band: $(wifi_band_status)"
+  echo "-- Temps:"
+  for z in /sys/class/thermal/thermal_zone*; do
+    printf "  %s: %d°C\n" "$(cat $z/type 2>/dev/null)" "$(( $(cat $z/temp 2>/dev/null || echo 0) / 1000 ))"
+  done
+}
+
+set_devfreq() {
+  # The request is in MHz, as status, check and the panel's buttons show the rates. The device lists Hz, and on this
+  # board's memory controller they are not round (427200000 854400000 1220571428 2136000000): until 2026-11-16 the
+  # request times a million was looked up in that list, so only the top memory rate could be set and the panel's
+  # other memory buttons answered "not available". Take the listed rate within 1 MHz of the request.
+  [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "usage: a7a-clock ram|npu <MHz>  (available: $(awk '{for(i=1;i<=NF;i++) printf "%d ", $i/1000000}' "$1/available_frequencies"))"; exit 1; }
+  local hz
+  hz=$(tr ' ' '\n' < "$1/available_frequencies" | awk -v m="$2" 'NF {d = $1/1000000 - m; if (d < 0) d = -d; if (d <= 1) {print $1; exit}}')
+  [ -n "$hz" ] || { echo "freq $2 MHz not available: $(awk '{for(i=1;i<=NF;i++) printf "%d ", $i/1000000}' "$1/available_frequencies")"; exit 1; }
+  # `profile eco` leaves the memory controller's max_freq at 854 MHz: a request above it was clamped without a
+  # word and reported as "set"
+  local top got
+  top=$(tr ' ' '\n' < "$1/available_frequencies" | sort -n | tail -1)
+  echo "$top" | sudo tee "$1/max_freq" > /dev/null 2>&1 || true
+  echo userspace | sudo tee "$1/governor" > /dev/null
+  # the memory clock changes under the running system: what is not on the card yet would be lost with a hang
+  [ "$1" != "$DMC" ] || sync
+  # a switch the hardware refuses comes back as a write error (the memory driver returns -ETIMEDOUT)
+  echo "$hz" | sudo tee "$1/userspace/set_freq" > /dev/null 2>&1 \
+    || { echo "the device refused $((hz/1000000)) MHz (the write failed); it is at $(( $(devfreq_now "$1") / 1000000 )) MHz"; exit 1; }
+  sleep 0.3
+  got=$(devfreq_now "$1")
+  if awk -v a="$got" -v b="$hz" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d <= 1000000) }'; then echo "set to $((got/1000000)) MHz"
+  else echo "asked for $((hz/1000000)) MHz, the device is at $((got/1000000)) MHz"; exit 1; fi
+}
+# the rate in effect, in Hz. The NPU driver's cur_freq is its module clock (clk_get_rate(mclk)): the devfreq target
+# only scales the core inside that clock, so cur_freq stays at 1008 MHz whatever is set. target_freq is the last
+# rate the driver accepted.
+devfreq_now() {
+  case "$1" in "$NPU") cat "$1/target_freq" 2>/dev/null || cat "$1/cur_freq" ;; *) cat "$1/cur_freq" ;; esac
+}
+
+gpu_set() {   # $1=MHz  $2=mV(optional)
+  local clk="$1" mv="${2:-}"
+  # `a7a-clock gpu abc` used to write clk_rate 0 into a new device tree and make it the default entry. The vendor
+  # driver (sunxi_platform.c, sunxiSetFrequency) knows 200, 300, 400, 600 and 800 MHz as fixed sources and programs
+  # the PLL for anything above 800.
+  [[ "$clk" =~ ^[0-9]{1,5}$ ]] || { echo "usage: a7a-clock gpu <MHz> [mV]   (200 300 400 600 800, or 801-1400 from the PLL; 1008 @ 800 mV is the validated pair)"; exit 1; }
+  clk=$((10#$clk))     # decimal whatever the leading zeros: to the shell's arithmetic "01300" is octal, 704
+  case "$clk" in 200|300|400|600|800) ;; *)
+    if [ "$clk" -le 800 ] || [ "$clk" -gt 1400 ]; then echo "GPU clock $clk MHz is not one the driver can run: 200 300 400 600 800, or 801-1400 from the PLL"; exit 1; fi ;;
+  esac
+  [ -n "$mv" ] || mv=$(default_mv "$clk")
+  [[ "$mv" =~ ^[0-9]{1,5}$ ]] || { echo "GPU rail '$mv' mV: a number from 700 to 1300"; exit 1; }
+  mv=$((10#$mv))
+  { [ "$mv" -ge 700 ] && [ "$mv" -le 1300 ]; } || { echo "GPU rail $mv mV: a number from 700 to 1300"; exit 1; }
+  [ -f "$BASE_DTB" ] || { echo "base DTB missing: $BASE_DTB"; exit 1; }
+  command -v fdtput >/dev/null 2>&1 || { echo "fdtput missing (package dtc, not in the Fedora KDE image): sudo dnf install dtc"; exit 1; }
+  local name="gpu${clk}v${mv}" dir="/usr/lib/linux-image-gpu${clk}v${mv}"
+  sudo mkdir -p "$dir/allwinner"
+  sudo cp "$BASE_DTB" "$dir/allwinner/sun60i-a733-cubie-a7a.dtb"
+  echo "$BASE_DIR" | sudo tee "$dir/base" > /dev/null      # the tree this copy was made from (read back at the top)
+  local d="$dir/allwinner/sun60i-a733-cubie-a7a.dtb"
+  sudo fdtput -t i "$d" "$GPU_NODE" clk_rate $((clk*1000000))
+  sudo fdtput -t i "$d" "$DC_NODE" regulator-min-microvolt $((mv*1000))
+  local label="g_${clk}_${mv}"
+  sudo chattr -i "$EXT"
+  if ! grep -q "^label $label\$" "$EXT"; then
+    printf '\nlabel %s\n\tmenu label Fedora, GPU %s MHz @ %s mV\n\tlinux %s\n\tfdtdir %s/\n\tappend %s\n' \
+      "$label" "$clk" "$mv" "$KERNEL" "$dir" "$APPEND" | sudo tee -a "$EXT" > /dev/null
+  fi
+  sudo sed -i "s/^default .*/default $label/" "$EXT"
+  sudo chattr +i "$EXT"
+  sync
+  echo "GPU -> $clk MHz @ $mv mV (boot entry $label). REBOOT to apply."
+  echo "  (undervolt tip: if it artifacts, a7a-clock gpu $clk $((mv+40)) gives it more; lower mV = less power/heat)"
+}
+
+unload_dsu() {
+  sudo rmmod dsu_dyn 2>/dev/null || true
+  sudo rmmod dsu_oc 2>/dev/null || true
+}
+# the L3 modules loaded, for status and check: dsu_dyn with an over-bin rung ("with the load + 1352", dynoc) looks
+# like the plain one in lsmod; its oc_hz is read once (a module going away between two reads left an empty number)
+dsu_modules() {
+  local m oc
+  m=$(lsmod | awk '/^dsu_(oc|dyn)/{print $1}' | paste -sd, -)
+  oc=$(cat /sys/module/dsu_dyn/parameters/oc_hz 2>/dev/null || true)
+  case ",$m," in *,dsu_dyn,*) [ "${oc:-0}" -gt 0 ] 2>/dev/null && m="$m + $((oc / 1000000)) MHz rung" ;; esac
+  echo "$m"
+}
+
+# "RAM full": the top clock the boot firmware of this card offers (2136 MHz on the overclocked image, 2040 on the
+# standard one), not a number of one of them
+RAM_FULL=$(tr ' ' '\n' < "$DMC/available_frequencies" 2>/dev/null | sort -n | tail -1); RAM_FULL=${RAM_FULL:-2136000000}
+set_caps() { # littles_khz bigs_khz ram_hz
+  echo "$1" | sudo tee "$POL0/scaling_max_freq" > /dev/null
+  echo "$2" | sudo tee "$POL6/scaling_max_freq" > /dev/null
+  echo performance | sudo tee "$DMC/governor" > /dev/null
+  echo "$3" | sudo tee "$DMC/max_freq" > /dev/null
+}
+
+cpumax_set() {   # littleMHz bigMHz (or "max")
+  local want0="$1" want6="$2" hz0 hz6
+  { [[ "$want0" =~ ^([0-9]{1,5}|max)$ ]] && [[ "$want6" =~ ^([0-9]{1,5}|max)$ ]]; } || { echo "usage: a7a-clock cpumax <littleMHz|max> <bigMHz|max>"; exit 1; }
+  if [ "$want0" = max ]; then hz0=$(cat "$POL0/cpuinfo_max_freq"); else hz0=$((10#$want0*1000)); fi
+  if [ "$want6" = max ]; then hz6=3000000; [ "$(cat "$POL6/cpuinfo_max_freq")" -lt "$hz6" ] && hz6=$(cat "$POL6/cpuinfo_max_freq"); else hz6=$((10#$want6*1000)); fi
+  grep -qw "$hz0" "$POL0/scaling_available_frequencies" || { echo "little: $want0 MHz is not an OPP: $(awk '{for(i=1;i<=NF;i++) printf "%d ", $i/1000}' "$POL0/scaling_available_frequencies")"; exit 1; }
+  grep -qw "$hz6" "$POL6/scaling_available_frequencies" || { echo "big: $want6 MHz is not an OPP: $(awk '{for(i=1;i<=NF;i++) printf "%d ", $i/1000}' "$POL6/scaling_available_frequencies")"; exit 1; }
+  echo "$hz0" | sudo tee "$POL0/scaling_max_freq" > /dev/null
+  echo "$hz6" | sudo tee "$POL6/scaling_max_freq" > /dev/null
+  echo "CPU caps -> little $((hz0/1000)) MHz, big $((hz6/1000)) MHz (governor $(cat "$POL6/scaling_governor"))"
+}
+
+dsu_set() {      # stock | dyn | <MHz>
+  case "$1" in
+  stock) unload_dsu; echo "DSU/L3 -> stock (780 MHz)" ;;
+  dyn)   dsu_fits "$DSU_DYN_KO"; unload_dsu; sudo insmod "$DSU_DYN_KO"; echo "DSU/L3 -> dynamic to the bin max" ;;
+  dynoc) dsu_fits "$DSU_DYN_KO"; unload_dsu; sudo insmod "$DSU_DYN_KO" oc_hz=$OC_HZ oc_uv=$OC_UV; echo "DSU/L3 -> dynamic incl. the $((OC_HZ/1000000)) MHz rung" ;;
+  ''|*[!0-9]*) echo "usage: a7a-clock dsu stock|dyn|dynoc|<MHz>  (1352 = validated over-bin rung)"; exit 1 ;;
+  *)     # the module hands the number to clk_set_rate at the 1.0 V floor: `dsu 0` and `dsu 99999` were taken as they came
+         [[ "$1" =~ ^[0-9]{1,5}$ ]] || { echo "usage: a7a-clock dsu stock|dyn|dynoc|<MHz>"; exit 1; }
+         local n=$((10#$1))
+         { [ "$n" -ge 780 ] && [ "$n" -le $((OC_HZ/1000000)) ]; } || { echo "DSU clock $n MHz: from 780 (stock) to $((OC_HZ/1000000)) (the validated over-bin rung)"; exit 1; }
+         dsu_fits "$DSU_OC_KO"; unload_dsu; sudo insmod "$DSU_OC_KO" freq=$((n*1000000)) uv=$OC_UV; echo "DSU/L3 -> forced $n MHz @ $((OC_UV/1000)) mV" ;;
+  esac
+  sleep 1; sudo grep -m1 ' cpu_dsu ' /sys/kernel/debug/clk/clk_summary 2>/dev/null | awk '{print "  cpu_dsu now: " $5/1000000 " MHz"}'
+}
+
+wifi_uuids() { nmcli -t -f UUID,TYPE con show 2>/dev/null | awk -F: '$2=="802-11-wireless"{print $1}' || true; }
+wifi_name() { nmcli -e no -g connection.id con show "$1" 2>/dev/null || echo "$1"; }
+wifi_band_status() {
+  local u b out=""
+  for u in $(wifi_uuids); do
+    b=$(nmcli -g 802-11-wireless.band con show "$u" 2>/dev/null || true); out="$out$(wifi_name "$u")=${b:-both} "
+  done
+  echo "${out:-no saved wifi connection}"
+}
+wifi_set() {     # 2.4 | 5 | both
+  local band u old dev failed=0 was_active=""
+  local -A old_band=()
+  case "$1" in 2.4|2) band=bg ;; 5) band=a ;; both|any) band="" ;; *) echo "usage: a7a-clock wifi 2.4|5|both"; exit 1 ;; esac
+  local uuids; uuids=$(wifi_uuids)
+  [ -n "$uuids" ] || { echo "no saved wifi connection yet: connect to your network once (Plasma or nmcli), then lock the band"; exit 1; }
+  for u in $uuids; do nmcli -t -f UUID con show --active 2>/dev/null | grep -qxF "$u" && was_active=$u; done
+  # profiles are addressed by UUID: a name is free text (a "Wi-Fi [5G]" read as a pattern matched nothing, and a
+  # name with a colon was cut in nmcli's terse output)
+  for u in $uuids; do
+    old=$(nmcli -g 802-11-wireless.band con show "$u" 2>/dev/null || true); old_band[$u]=$old
+    sudo nmcli con modify "$u" 802-11-wireless.band "$band" || { echo "$(wifi_name "$u"): the band could not be changed"; failed=1; continue; }
+    echo "$(wifi_name "$u"): band -> ${1}"
+    nmcli -t -f UUID con show --active 2>/dev/null | grep -qxF "$u" || continue
+    # A network that is not there on the new band must not take the board off the network: 2026-11-16 `wifi 2.4`
+    # on a network with no 2.4 GHz signal in reach left a board unreachable until someone typed at it.
+    if sudo nmcli -w 30 con up "$u" >/dev/null 2>&1; then echo "  reconnected"
+    else
+      failed=1
+      sudo nmcli con modify "$u" 802-11-wireless.band "$old" 2>/dev/null || true
+      if sudo nmcli -w 30 con up "$u" >/dev/null 2>&1; then echo "  no connection on $1: band put back, reconnected"
+      else echo "  no connection on $1: band put back, NOT reconnected"; fi
+    fi
+  done
+  # only after a failed switch: the connection is no longer active then and nothing above brings it up again
+  # (on every call this would also connect a WiFi the user had switched off)
+  if [ "$failed" = 1 ]; then
+    dev=$(nmcli -t -f DEVICE,TYPE,STATE dev status 2>/dev/null | awk -F: '$2=="wifi" && $3!="connected" {print $1; exit}' || true)
+    [ -z "$dev" ] || sudo nmcli -w 30 device connect "$dev" >/dev/null 2>&1 || true
+  fi
+  # Nothing was connected because the WiFi had dropped: a band chosen now is a request to be on the network on that
+  # band (2026-11-17: the panel's buttons changed the band and nothing else while the board was off its WiFi). A
+  # device the user disconnected stays so (NetworkManager then answers "no" to GENERAL.AUTOCONNECT). When the band
+  # does not connect, every profile gets its band back and the board connects as it did before.
+  if [ -z "$was_active" ] && [ "$failed" = 0 ]; then
+    dev=$(nmcli -t -f DEVICE,TYPE,STATE dev status 2>/dev/null | awk -F: '$2=="wifi" {print $1; exit}' || true)
+    if [ -n "$dev" ] && [ "$(nmcli -g GENERAL.AUTOCONNECT device show "$dev" 2>/dev/null)" = yes ]; then
+      if sudo nmcli -w 30 device connect "$dev" >/dev/null 2>&1; then echo "  connected on $1"
+      else
+        failed=1
+        for u in $uuids; do sudo nmcli con modify "$u" 802-11-wireless.band "${old_band[$u]}" 2>/dev/null || true; done
+        if sudo nmcli -w 30 device connect "$dev" >/dev/null 2>&1; then echo "  no connection on $1: band put back, connected"
+        else echo "  no connection on $1: band put back, NOT connected"; fi
+      fi
+    fi
+  fi
+  [ "$failed" = 0 ]
+}
+
+profile_set() {
+  local max0 max6
+  max0=$(cat "$POL0/cpuinfo_max_freq")
+  # NOT cpuinfo_max_freq for the bigs: the parked cpu32 experiment leaves a 3.2 GHz
+  # OPP visible, but the CCU PLL clamps at 3.0 — requesting 3.2 only raises voltage
+  # for zero speed (docs/cpu-oc-findings.md). Cap at the real ceiling.
+  max6=3000000
+  [ "$(cat "$POL6/cpuinfo_max_freq")" -lt "$max6" ] && max6=$(cat "$POL6/cpuinfo_max_freq")
+  case "$1" in eco|balanced|dynoc) dsu_fits "$DSU_DYN_KO" ;; oc) dsu_fits "$DSU_OC_KO" ;; esac
+  case "$1" in
+  eco)
+    unload_dsu; set_caps 1196000 1512000 854400000
+    sudo insmod "$DSU_DYN_KO"
+    echo "profile: eco (littles<=1196, bigs<=1512, RAM 854, DSU dynamic)" ;;
+  balanced)
+    unload_dsu; set_caps "$max0" "$max6" "$RAM_FULL"
+    sudo insmod "$DSU_DYN_KO"
+    echo "profile: balanced (full CPU, RAM full, DSU dynamic to bin max)" ;;
+  oc)
+    unload_dsu; set_caps "$max0" "$max6" "$RAM_FULL"
+    sudo insmod "$DSU_OC_KO" freq=$OC_HZ uv=$OC_UV
+    echo "profile: oc (full CPU, RAM full, DSU forced $((OC_HZ/1000000)) MHz)" ;;
+  dynoc)
+    unload_dsu; set_caps "$max0" "$max6" "$RAM_FULL"
+    sudo insmod "$DSU_DYN_KO" oc_hz=$OC_HZ oc_uv=$OC_UV
+    echo "profile: dynoc (full CPU, RAM full, DSU dynamic incl. $((OC_HZ/1000000)) MHz rung)" ;;
+  *)
+    echo "usage: a7a-clock profile eco|balanced|oc|dynoc" >&2; exit 1 ;;
+  esac
+}
+
+# power: the three positions of KDE's power slider, applied by the a7a-* tuned profiles (tools/board/tuned/). The
+# governor matters here: Fedora's own profiles held the CPUs at the top all the time ("Performance", the setting the
+# images were made with until 2026-11-17) or did the same as Balanced ("Power Save" relies on settings this chip does
+# not have). The DSU module is optional: without one for this kernel the clocks are set and the DSU stays stock.
+power_set() {
+  local gov l b ram max0 max6
+  max0=$(cat "$POL0/cpuinfo_max_freq")
+  max6=3000000; [ "$(cat "$POL6/cpuinfo_max_freq")" -lt "$max6" ] && max6=$(cat "$POL6/cpuinfo_max_freq")
+  case "${1:-}" in
+    power-saver) gov=schedutil;   l=1196000; b=1512000; ram=854400000 ;;
+    balanced)    gov=schedutil;   l=$max0;   b=$max6;   ram=$RAM_FULL ;;
+    performance) gov=performance; l=$max0;   b=$max6;   ram=$RAM_FULL ;;
+    *) echo "usage: a7a-clock power power-saver|balanced|performance"; exit 1 ;;
+  esac
+  grep -qwF "$gov" "$POL0/scaling_available_governors" || gov=schedutil
+  local p; for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "$gov" | sudo tee "$p/scaling_governor" > /dev/null; done
+  set_caps "$l" "$b" "$ram"
+  # the plain dynamic module and nothing else: the L3 button "with the load + 1352" and the dynoc preset load the same
+  # module with an over-bin rung (oc_hz), which a change of profile takes away like the CPU and memory clocks above (on
+  # the board 2026-11-17, Balanced after dynoc kept the 1352 MHz rung); a dsu_oc beside it (two runs at once) goes too
+  if dsu_fits "$DSU_DYN_KO" > /dev/null; then
+    if ! lsmod | grep -q '^dsu_dyn ' || lsmod | grep -q '^dsu_oc ' \
+       || [ "$(cat /sys/module/dsu_dyn/parameters/oc_hz 2>/dev/null || echo 0)" != 0 ]; then
+      unload_dsu; sudo insmod "$DSU_DYN_KO"
+    fi
+  else unload_dsu; fi
+  echo "power: $1 (governor $gov, CPU caps $(( $(cat "$POL0/scaling_max_freq")/1000 ))/$(( $(cat "$POL6/scaling_max_freq")/1000 )) MHz, RAM up to $(( $(cat "$DMC/max_freq")/1000000 )) MHz, DSU $(lsmod | awk '/^dsu_(oc|dyn)/{print $1}' | paste -sd, - | sed 's/^$/stock/'))"
+}
+# the position of KDE's power slider, as tuned has it ("" when tuned is not running or not on an a7a profile)
+power_now() {
+  local a; a=$(cat /etc/tuned/active_profile 2>/dev/null || true)
+  case "$a" in a7a-powersave) echo "Power Save" ;; a7a-balanced) echo "Balanced" ;; a7a-performance) echo "Performance" ;; "") ;; *) echo "$a (not an a7a profile)" ;; esac
+}
+
+# check: read-only. "The image boots at these clocks" is a claim about five clock domains; this says for each
+# whether it holds on this board right now, and whether the panel's tools are there to change it.
+check() {
+  local fails=0 warns=0 VF=/etc/a7a-image-variant
+  ok()   { printf "  PASS  %s\n" "$*"; }
+  bad()  { printf "  FAIL  %s\n" "$*"; fails=$((fails+1)); }
+  note() { printf "  WARN  %s\n" "$*"; warns=$((warns+1)); }
+  local variant want_ram want_gpu want_big want_little
+  variant=$(sed -n 's/^variant=//p' $VF 2>/dev/null || true)
+  want_ram=$(sed -n 's/^ram=\([0-9]*\) MHz.*/\1/p' $VF 2>/dev/null || true)
+  want_gpu=$(sed -n 's/^gpu=\([0-9]*\) MHz.*/\1/p' $VF 2>/dev/null || true)
+  want_big=$(sed -n 's/^cpu=.*A76 \([0-9]*\) MHz.*/\1/p' $VF 2>/dev/null || true)
+  want_little=$(sed -n 's/^cpu=.*A55 \([0-9]*\) MHz.*/\1/p' $VF 2>/dev/null || true)
+  if [ -n "$variant" ]; then echo "=== a7a-clock check: the '$variant' image ==="
+  else echo "=== a7a-clock check: no $VF (not a published image), compared with what the hardware offers ==="; fi
+
+  echo "-- CPU"
+  local p name want top cap gov cur
+  for p in "$POL0" "$POL6"; do
+    [ -d "$p" ] || { bad "$(basename "$p") is missing: no clock control for that cluster"; continue; }
+    if [ "$p" = "$POL6" ]; then name="A76 (big)"; want=${want_big:-3000}; else name="A55 (little)"; want=${want_little:-2800}; fi
+    top=$(( $(cat "$p/cpuinfo_max_freq" 2>/dev/null || echo 0) / 1000 )); cap=$(( $(cat "$p/scaling_max_freq" 2>/dev/null || echo 0) / 1000 ))
+    gov=$(cat "$p/scaling_governor" 2>/dev/null || echo "?"); cur=$(( $(cat "$p/scaling_cur_freq" 2>/dev/null || echo 0) / 1000 ))
+    # the big cluster's table may list a 3.2 GHz point that the PLL clamps to 3.0 (docs/cpu-oc-findings.md)
+    [ "$p" = "$POL6" ] && [ "$top" -gt 3000 ] && top=3000
+    if [ "$top" -ge "$want" ]; then ok "$name: operating points up to $top MHz"
+    else bad "$name: operating points end at $top MHz, the image says $want (the overclocked device tree is not the one that booted)"; fi
+    if [ "$cap" -lt "$top" ] && [ "$(power_now)" = "Power Save" ]; then ok "$name: capped at $cap MHz by the Power Save profile (KDE's power slider)"
+    elif [ "$cap" -lt "$top" ]; then note "$name: capped at $cap MHz (a7a-clock cpumax max max lifts the cap)"
+    elif [ "$gov" = performance ]; then
+      if [ "$cur" -ge $(( cap * 99 / 100 )) ]; then ok "$name: runs at $cur MHz (governor performance)"
+      else bad "$name: governor performance, but the clock is $cur MHz, not $cap"; fi
+    else ok "$name: governor $gov, the clock follows the load up to $cap MHz (now $cur)"; fi
+  done
+
+  echo "-- GPU"
+  local dt_hz gpu_mhz mv deflabel
+  dt_hz=$(od -An -tu4 --endian=big "/proc/device-tree$GPU_NODE/clk_rate" 2>/dev/null | tr -d ' ' || true)
+  gpu_mhz=$(sudo grep -E "^ +gpu0 " /sys/kernel/debug/clk/clk_summary 2>/dev/null | awk '{print int($5/1000000)}' | head -1 || true)
+  mv=$(for r in /sys/class/regulator/regulator.*; do case "$(cat "$r/name" 2>/dev/null)" in *dcdc4*) echo $(( $(cat "$r/microvolts") / 1000 ));; esac; done | head -1)
+  deflabel=$(grep '^default' "$EXT" 2>/dev/null | awk '{print $2}' || true)
+  if [ -z "$gpu_mhz" ]; then note "the GPU clock cannot be read (clk_summary needs sudo, or the clock has another name on this kernel)"
+  # above 800 MHz the driver programs the PLL, which makes steps, not every number (1300 becomes what it can)
+  elif [ -n "$dt_hz" ] && ! awk -v a="$gpu_mhz" -v b="$(( dt_hz / 1000000 ))" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d <= 12) }'; then bad "GPU at $gpu_mhz MHz, its boot entry ($deflabel) asks for $(( dt_hz / 1000000 )) MHz"
+  else ok "GPU at $gpu_mhz MHz @ ${mv:-?} mV (boot entry $deflabel)"; fi
+  case "$deflabel" in g_*) : ;; *) [ -z "$want_gpu" ] || [ -z "$gpu_mhz" ] || [ "$gpu_mhz" -eq "$want_gpu" ] || bad "GPU at $gpu_mhz MHz on the image's own boot entry, the image says $want_gpu" ;; esac
+  [ -n "$dt_hz" ] || note "this boot's device tree has no GPU clk_rate: the driver runs its default"
+  command -v fdtput >/dev/null 2>&1 && ok "fdtput is there: 'a7a-clock gpu <MHz>' can make boot entries" || note "fdtput missing: 'a7a-clock gpu' cannot work (sudo dnf install dtc)"
+  [ -f "$BASE_DTB" ] && ok "base device tree for new GPU entries: $BASE_DTB" || bad "base device tree missing: $BASE_DTB"
+
+  echo "-- RAM"
+  local dev label wantv topf curf
+  for dev in "$DMC:memory controller:${want_ram:-}" "$NPU:NPU:"; do
+    label=${dev#*:}; wantv=${label#*:}; label=${label%%:*}; dev=${dev%%:*}
+    [ "$label" = NPU ] && echo "-- NPU"
+    [ -d "$dev" ] || { bad "$label: $dev is missing (no devfreq device: its clock cannot be read or set)"; continue; }
+    topf=$(tr ' ' '\n' < "$dev/available_frequencies" | sort -n | tail -1); topf=$(( ${topf:-0} / 1000000 )); curf=$(devfreq_now "$dev" 2>/dev/null || echo 0); curf=$(( ${curf:-0} / 1000000 ))
+    if [ -n "$wantv" ] && [ "$topf" -ne "$wantv" ]; then bad "$label: the boot firmware offers $topf MHz at most, the image says $wantv (the wrong boot0 for this variant?)"
+    else ok "$label: offers $(tr ' ' '\n' < "$dev/available_frequencies" | sort -n | awk '{printf "%d ", $1/1000000}')MHz"; fi
+    if [ "$curf" -eq "$topf" ]; then ok "$label: runs at $curf MHz"
+    else note "$label: at $curf MHz of $topf (governor $(cat "$dev/governor")): 'a7a-clock $( [ "$label" = NPU ] && echo npu || echo ram ) $topf' sets it"; fi
+  done
+
+  echo "-- DSU/L3"
+  local dsu ko vm
+  dsu=$(sudo grep -m1 ' cpu_dsu ' /sys/kernel/debug/clk/clk_summary 2>/dev/null | awk '{print int($5/1000000)}' || true)
+  [ -n "$dsu" ] && ok "DSU/L3 at $dsu MHz (module: $(dsu_modules | sed 's/^$/none, stock/'))" || note "the DSU clock cannot be read"
+  for ko in "$DSU_OC_KO" "$DSU_DYN_KO"; do
+    if vm=$(dsu_fits "$ko"); then ok "$(basename "$ko") is built for this kernel ($ko)"
+    else bad "$vm: 'a7a-clock dsu', the profiles and the panel's DSU buttons cannot work"; fi
+  done
+
+  echo "-- stress test"
+  if command -v glmark2-es2-wayland >/dev/null 2>&1 || command -v glmark2-es2 >/dev/null 2>&1; then ok "glmark2 is there: 'a7a-clock soak' can test a GPU clock"
+  else note "glmark2 missing: 'a7a-clock soak' cannot run (sudo dnf install glmark2)"; fi
+  echo "== summary: $fails fail, $warns warn"
+  [ "$fails" -eq 0 ]
+}
+
+# the 3.5 mm jack's codec (2026-11-18). Radxa builds the board with either of two codecs (schematic v1.10, page 12:
+# option 1 an AC101, option 2 an AC101B), and the kernel packages' tree, from Radxa's linux-6.6 board.dts, describes
+# only the AC101B (radxa/allwinner-device 4835925, 2026-03-17): on the owner's AC101 board the jack had no sound card
+# ("try read ac101b 5 times but failed"). a7a-ac101-dtb makes a tree with the AC101 and the AC101B off (and back:
+# --undo) and says why both cannot stay. `codec ac101` runs it over every tree of the board (the packages' and the
+# copies `gpu` makes) and keeps each tree as it was; `codec ac101b` puts those back. A tree is a boot file: every
+# write goes to a new file that is synced and renamed over the old one, and checked; the kept copies are all written
+# and checked before the first tree is touched; a step that fails stops the command with an error and leaves the
+# choice as it was. a7a-codec.service runs `codec reapply` at every boot while the choice is ac101 (a tree that a new
+# kernel package brought gets the AC101, and the playback path is set, below) and `codec reapply-trees` when it stops
+# at shutdown, so a kernel installed during a boot has the AC101 in its tree at its first boot.
+CODEC_CONF=/etc/a7a/codec
+CODEC_KEEP=/var/lib/a7a/codec
+AC101_DTB=/usr/local/bin/a7a-ac101-dtb
+CODEC_NODE=/soc@3000000/twi@7085000/ac101@1a
+codec_trees() { local f; for f in /usr/lib/linux-image-*/allwinner/sun60i-a733-cubie-a7a.dtb; do [ -f "$f" ] && echo "$f"; done; return 0; }
+codec_kept() { local d=${1%/allwinner/*}; echo "$CODEC_KEEP/${d##*/}.dtb"; }   # linux-image-<release>[-standard], linux-image-gpu<MHz>v<mV>
+codec_has_ac101() { [ "$(fdtget "$1" "$CODEC_NODE" status 2> /dev/null)" = okay ]; }
+# root (the unit) runs it all itself: sudo would add a PAM session and journal lines to every boot
+codec_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+# $1 -> $2 as a boot file is written: a new file beside it, synced, renamed over it, compared
+codec_put() { codec_root install -m 644 "$1" "$2.a7a-new" && codec_root sync "$2.a7a-new" && codec_root mv -f "$2.a7a-new" "$2" && cmp -s "$1" "$2"; }
+# the kernel log of this boot (the ring buffer alone is flooded by the display driver's trace after some uptime)
+codec_klog() { codec_root journalctl -k -b --no-pager -q 2> /dev/null || codec_root dmesg 2> /dev/null || true; }
+
+# every tree without the AC101 gets it: all of them are made first (a tree the tool does not know stops it all), then
+# each tree as it is now is kept (also a later run: the tree that gets converted is the packaged one, newer than an
+# older copy), then the trees are replaced
+codec_ac101() {
+  command -v fdtput > /dev/null 2>&1 || { echo "fdtput missing (package dtc): sudo dnf install dtc"; return 1; }
+  local f t out tmp todo=() n=0
+  tmp=$(mktemp -d)
+  for f in $(codec_trees); do
+    t=$tmp/$n.dtb; n=$((n + 1))
+    if ! out=$(python3 "$AC101_DTB" "$f" "$t" 2>&1); then echo "  $f: $out"; rm -rf "$tmp"; return 1; fi
+    cmp -s "$f" "$t" || todo+=("$f" "$t")
+  done
+  set -- "${todo[@]}"
+  [ $# -eq 0 ] || codec_root mkdir -p "$CODEC_KEEP" || { rm -rf "$tmp"; return 1; }
+  while [ $# -ge 2 ]; do
+    codec_put "$1" "$(codec_kept "$1")" || { echo "  $1: could not be kept in $CODEC_KEEP: no tree was changed"; rm -rf "$tmp"; return 1; }
+    shift 2
+  done
+  set -- "${todo[@]}"
+  while [ $# -ge 2 ]; do
+    codec_put "$2" "$1" || { echo "  $1: could not be written (the tree as it was: $(codec_kept "$1"))"; rm -rf "$tmp"; return 1; }
+    echo "  $1: the AC101, the AC101B off (as it was: $(codec_kept "$1"))"
+    shift 2
+  done
+  rm -rf "$tmp"; codec_root sync
+}
+
+# every tree with the AC101 back to the packaged state: its kept copy, or (a copy `gpu` made after the switch, nothing
+# kept) a7a-ac101-dtb --undo; a kept copy goes only once its tree is back, and a kept copy whose tree directory is gone
+# (a kernel package erased) is pruned
+codec_ac101b() {
+  local f k t bad=0
+  t=$(mktemp)
+  for f in $(codec_trees); do
+    codec_has_ac101 "$f" || continue
+    k=$(codec_kept "$f")
+    if [ -e "$k" ]; then
+      if codec_put "$k" "$f"; then codec_root rm -f "$k"; echo "  $f: as it was before the switch"; else echo "  $f: could not be put back"; bad=1; fi
+    elif python3 "$AC101_DTB" --undo "$f" "$t" > /dev/null 2>&1 && codec_put "$t" "$f"; then
+      echo "  $f: the AC101 taken out, the AC101B on (nothing was kept for it: a copy made after the switch)"
+    else echo "  $f: could not be put back"; bad=1; fi
+  done
+  rm -f "$t"
+  local n
+  for k in "$CODEC_KEEP"/*.dtb; do
+    [ -e "$k" ] || continue
+    n=$(basename "$k" .dtb); [ -d "/usr/lib/linux-image-${n#linux-image-}" ] || codec_root rm -f "$k"
+  done
+  codec_root sync
+  for f in $(codec_trees); do codec_has_ac101 "$f" && { echo "  $f: still has the AC101"; bad=1; }; done
+  return $bad
+}
+
+# the AC101's playback path, which no part of the desktop sets: the driver's HPOUT source muxes write the codec without
+# telling DAPM, so DAPM keeps the boot position (the output mixers) and never powers a DAC-to-headphone path set
+# through them (2026-11-18: the muxes on DACL/DACR left DAC and headphone off during playback). Through the output
+# mixers DAPM powers DAC, mixer and headphone while something plays (an ADC loopback recorded the 440 Hz test tone).
+codec_mixer() {
+  grep -q '\[allwinnerac101 *\]' /proc/asound/cards 2> /dev/null || return 0
+  local c
+  for c in "HPOUTL Source Mux=OMIXL" "HPOUTR Source Mux=OMIXR" "OutputL Mixer DACL=on" "OutputR Mixer DACR=on" "HPOUTL=on" "HPOUTR=on"; do
+    codec_root amixer -q -c allwinnerac101 sset "${c%=*}" "${c##*=}" || { echo "the AC101's mixer control '${c%=*}' could not be set"; return 1; }
+  done
+}
+
+codec_running() {   # the codec the running device tree describes
+  if [ -e "/proc/device-tree$CODEC_NODE" ] && [ "$(tr -d '\0' < "/proc/device-tree$CODEC_NODE/status" 2> /dev/null)" = okay ]; then echo AC101; else echo AC101B; fi
+}
+
+codec_status() {
+  local f run choice
+  run=$(codec_running)
+  choice=$(cat "$CODEC_CONF" 2> /dev/null || true)
+  [ -n "$choice" ] || choice="AC101B, the trees as the packages have them"
+  echo "3.5 mm jack: the running device tree describes the $run; the choice is $choice"
+  for f in $(codec_trees); do
+    if codec_has_ac101 "$f"; then echo "  $f: AC101"; else echo "  $f: AC101B"; fi
+  done
+  if grep -q '\[allwinnerac101 *\]\|\[sunxiac101b *\]' /proc/asound/cards 2> /dev/null; then
+    echo "  the jack's sound card: $(sed -n 's/^ *[0-9]* \[[^]]*\]: \(allwinner-ac101\|sunxi-ac101b\) .*/\1/p' /proc/asound/cards | head -n 1)"
+  elif [ "$run" = AC101B ] && [ "$(cat "$CODEC_CONF" 2> /dev/null)" = ac101 ]; then
+    echo "  the jack has no sound card yet: the trees have the AC101, REBOOT to apply"
+  else
+    echo "  the jack has no sound card"
+    if [ "$run" = AC101B ] && codec_klog | grep -q 'try read ac101b .* failed'; then
+      echo "  the AC101B did not answer, as on a board built with the AC101: 'a7a-clock codec ac101', then reboot"
+    elif [ "$run" = AC101 ] && codec_klog | grep -q 'try read ac101 .* failed'; then
+      echo "  the AC101 did not answer: this board is built with the AC101B. 'a7a-clock codec ac101b', then reboot"
+    fi
+  fi
+}
+
+# this boot's kernel log names $1: read as the user (Fedora's wheel group reads the journal), else through `sudo -n`,
+# never a password prompt (a7a-panel has no terminal); read into a variable, the whole log, before grep
+codec_log_has() {
+  local log
+  log=$(journalctl -k -b --no-pager -q 2> /dev/null || true)
+  grep -q -- "$1" <<< "$log" && return 0
+  [ "$(id -u)" = 0 ] && return 1
+  log=$(sudo -n journalctl -k -b --no-pager -q < /dev/null 2> /dev/null || true)
+  grep -q -- "$1" <<< "$log"
+}
+
+# one line for a7a-panel (2026-11-24): what the jack needs, from what the board says (codec_status in words):
+#   ok AC101|AC101B       the jack's sound card is up, on that codec, and the trees stay with it
+#   keep AC101|AC101B     the jack's card is up on that codec, but the trees were switched to the other: a restart
+#                         would silence a jack that works (`codec <that one>` keeps it; review 2026-11-24)
+#   reboot AC101|AC101B   no card; every tree describes that codec, the running one the other: a restart applies it
+#   switch AC101|AC101B   no card, and either this boot's log says the running tree's codec did not answer (the other
+#                         one is on the board), or the AC101 was chosen and a tree lacks it (a kernel's tree the
+#                         switch did not take: its run says why; review 2026-11-24): `codec <that one>`, then a restart
+#   none                  no card, nothing in the log to go by
+codec_state() {
+  local run choice card="" f all=1 any=0
+  run=$(codec_running)
+  choice=$(cat "$CODEC_CONF" 2> /dev/null || true)
+  for f in $(codec_trees); do if codec_has_ac101 "$f"; then any=1; else all=0; fi; done
+  [ -n "$(codec_trees)" ] || all=0
+  grep -q '\[sunxiac101b *\]' /proc/asound/cards 2> /dev/null && card=AC101B
+  grep -q '\[allwinnerac101 *\]' /proc/asound/cards 2> /dev/null && card=AC101
+  if [ "$card" = AC101 ]; then
+    if [ "$choice" != ac101 ] && [ $any = 0 ]; then echo "keep AC101"; else echo "ok AC101"; fi; return
+  fi
+  if [ "$card" = AC101B ]; then
+    if [ "$choice" = ac101 ]; then echo "keep AC101B"; else echo "ok AC101B"; fi; return
+  fi
+  if [ "$choice" = ac101 ] && [ "$run" = AC101B ]; then
+    if [ $all = 1 ]; then echo "reboot AC101"; else echo "switch AC101"; fi; return
+  fi
+  if [ "$choice" != ac101 ] && [ "$run" = AC101 ] && [ $any = 0 ]; then echo "reboot AC101B"; return; fi
+  if [ "$run" = AC101B ] && codec_log_has 'try read ac101b .* failed'; then echo "switch AC101"; return; fi
+  if [ "$run" = AC101 ] && codec_log_has 'try read ac101 .* failed'; then echo "switch AC101B"; return; fi
+  echo none
+}
+
+codec_set() {
+  case "${1:-status}" in
+    ac101)
+      # an AC101B that answers (its card is up) is a board of the other build: the switch would cost it the jack
+      if [ "${2:-}" != --force ] && grep -q '\[sunxiac101b *\]' /proc/asound/cards 2> /dev/null; then
+        echo "codec: the AC101B answers (its card is up): this board is built with the AC101B, the packages' trees serve it."
+        echo "  'a7a-clock codec ac101 --force' switches anyway"; exit 1
+      fi
+      codec_ac101 || { echo "codec: stopped (above); the choice is as it was"; exit 1; }
+      codec_root mkdir -p "${CODEC_CONF%/*}" && echo ac101 | codec_root tee "$CODEC_CONF" > /dev/null || { echo "codec: $CODEC_CONF could not be written"; exit 1; }
+      codec_root systemctl enable a7a-codec.service > /dev/null 2>&1 || echo "  (a7a-codec.service could not be enabled: after a kernel update run 'a7a-clock codec ac101' again)"
+      echo "3.5 mm jack -> AC101 in every device tree. REBOOT to apply ('a7a-clock codec ac101b' puts the trees back)." ;;
+    ac101b)
+      codec_ac101b || { echo "codec: not every tree could be put back (above): the choice stays ac101, run it again"; exit 1; }
+      codec_root rm -f "$CODEC_CONF"
+      codec_root systemctl disable a7a-codec.service > /dev/null 2>&1 || true
+      echo "3.5 mm jack -> AC101B (the packages' trees). REBOOT to apply." ;;
+    reapply|reapply-trees)   # a7a-codec.service: at boot (trees and the playback path) and when it stops (trees)
+      [ "$(cat "$CODEC_CONF" 2> /dev/null)" = ac101 ] || exit 0
+      local rc=0
+      codec_ac101 || { echo "codec: a device tree could not be given the AC101 (above)"; rc=1; }
+      [ "$1" = reapply-trees ] && exit $rc
+      if [ "$(codec_running)" = AC101 ] && ! grep -q '\[allwinnerac101 *\]' /proc/asound/cards 2> /dev/null && codec_klog | grep -q 'try read ac101 .* failed'; then
+        echo "codec: the AC101 did not answer: this board is built with the AC101B ('a7a-clock codec ac101b', then reboot)"; rc=1
+      fi
+      codec_mixer || rc=1
+      exit $rc ;;
+    status) codec_status ;;
+    state) codec_state ;;
+    *) echo "usage: a7a-clock codec ac101 [--force]|ac101b|status|state"; exit 1 ;;
+  esac
+}
+
+json() {   # key=value lines for a7a-panel of what only root can read: the GPU driver's state (a7a-gpu-stat, whose
+            # sudo runs stay out of the journal); the panel reads the rest itself. No terminal: never waits for a password
+  sudo -n /usr/local/bin/a7a-gpu-stat < /dev/null 2> /dev/null || true
+}
+
+case "${1:-status}" in
+  status) status ;;
+  json) json ;;
+  check) check ;;
+  gpu) [ -n "$2" ] || { echo "usage: a7a-clock gpu <MHz> [mV]"; exit 1; }; gpu_set "$2" "$3" ;;
+  ram) set_devfreq "$DMC" "$2" ;;
+  npu) set_devfreq "$NPU" "$2" ;;
+  cpu) { [[ "${2:-}" =~ ^[a-z_]+$ ]] && grep -qwF -- "$2" "$POL0/scaling_available_governors"; } || { echo "usage: a7a-clock cpu <$(tr -s ' ' '|' < "$POL0/scaling_available_governors" | sed 's/|$//')>"; exit 1; }
+       for p in /sys/devices/system/cpu/cpufreq/policy*; do echo "$2" | sudo tee "$p/scaling_governor" > /dev/null; done; echo "CPU governor -> $2" ;;
+  cpumax) cpumax_set "$2" "$3" ;;
+  dsu) dsu_set "$2" ;;
+  wifi) wifi_set "$2" ;;
+  profile) profile_set "$2" ;;
+  power) power_set "${2:-}" ;;
+  codec) codec_set "${2:-status}" "${3:-}" ;;
+  usb-stick)
+    case "$2" in
+      on)  echo 1 | sudo tee "$STICK" > /dev/null; echo "usb stick: on" ;;
+      off) echo 0 | sudo tee "$STICK" > /dev/null; echo "usb stick: off ('a7a-clock usb-stick on' restores)" ;;
+      *)   echo "usage: a7a-clock usb-stick on|off" >&2; exit 1 ;;
+    esac ;;
+  soak)
+    MIN=${2:-10}
+    # `soak 0` and `soak abc` ran nothing and ended "VERDICT: STABLE"
+    { [[ "$MIN" =~ ^[0-9]{1,4}$ ]] && [ "$((10#$MIN))" -ge 1 ]; } || { echo "usage: a7a-clock soak [minutes, 1 or more]"; exit 1; }
+    MIN=$((10#$MIN))
+    SPID=$(pgrep -x plasmashell | head -1)
+    [ -n "$SPID" ] || { echo "SOAK ABORT: no desktop session. Log in first."; exit 1; }
+    SUSER=$(stat -c %U /proc/$SPID); SRUN=/run/user/$(stat -c %u /proc/$SPID)
+    WL=$(sudo cat /proc/$SPID/environ 2>/dev/null | tr '\0' '\n' | sed -n 's/^WAYLAND_DISPLAY=//p')
+    AUTH=$(sudo cat /proc/$SPID/environ 2>/dev/null | tr '\0' '\n' | sed -n 's/^XAUTHORITY=//p')
+    LOG=$(mktemp /tmp/a7a-soak.XXXXXX)
+    if [ -n "$WL" ] && command -v glmark2-es2-wayland >/dev/null 2>&1; then
+      # the session's own GPU path, the one the applications use (/opt/pvr-wl through the loader cache)
+      soak_run() { sudo -u "$SUSER" env XDG_RUNTIME_DIR="$SRUN" WAYLAND_DISPLAY="$WL" timeout 120 glmark2-es2-wayland --off-screen -b build -b shading -b bump; }
+    else
+      # no Wayland build of glmark2: the DDK in /opt/pvr speaks X11, so render through Xwayland (DISPLAY=:0)
+      soak_run() { sudo env DISPLAY=:0 XAUTHORITY="$AUTH" LD_LIBRARY_PATH=/opt/pvr/lib LIBGL_DRIVERS_PATH=/opt/pvr/lib/dri timeout 120 glmark2-es2 --off-screen -b build -b shading -b bump; }
+    fi
+    soak_errors() { sudo dmesg | grep -cE 'PVR_K.*(Fatal|Device experienced error|HWR|Reset)' || true; }
+    soak_hwr() { sudo awk -F: '/HWR Event Count/ {gsub(/ /,"",$2); print $2}' /sys/kernel/debug/pvr/status 2>/dev/null | head -1; }
+    GZ=$(for z in /sys/class/thermal/thermal_zone*; do [ "$(cat $z/type 2>/dev/null)" = gpu_thermal_zone ] && echo $z; done | head -1); GZ=${GZ:-/sys/class/thermal/thermal_zone4}
+    E0=$(soak_errors); H0=$(soak_hwr); H0=${H0:-0}
+    END=$(( $(date +%s) + MIN*60 )); RUNS=0; TMAX=0
+    while [ "$(date +%s)" -lt "$END" ]; do
+      T0=$(date +%s); soak_run > "$LOG" 2>&1 || true
+      DUR=$(( $(date +%s) - T0 ))
+      [ "$DUR" -lt 15 ] && { echo "SOAK ABORT: run only ${DUR}s (no GPU load). Is a desktop up? Last lines:"; tail -3 "$LOG"; exit 1; }
+      # a run on the software renderer loads the CPU, passes, and says nothing about the GPU clock
+      if ! grep -q "GL_RENDERER:.*PowerVR" "$LOG"; then
+        R=$(grep -m1 "GL_RENDERER" "$LOG" | tr -s ' ' || true)
+        echo "SOAK ABORT: the test did not run on the GPU (${R:-no renderer line in its output})"; exit 1
+      fi
+      RUNS=$((RUNS+1)); T=$(($(cat $GZ/temp)/1000)); [ "$T" -gt "$TMAX" ] && TMAX=$T
+      echo "  run $RUNS (${DUR}s, score $(grep -oE 'glmark2 Score: [0-9]+' "$LOG" | grep -oE '[0-9]+$' || echo '?')), gpu ${T}°C"
+    done
+    # the two counts are judged apart: the kernel log is a ring (this kernel's display trace fills it), so its count
+    # can go DOWN during a soak, and added to the recoveries it cancelled them
+    E1=$(soak_errors); H1=$(soak_hwr); H1=${H1:-0}; DE=$((E1-E0)); DH=$((H1-H0)); [ "$DE" -ge 0 ] || DE=0
+    rm -f "$LOG"
+    echo "SOAK: $RUNS runs, new errors $DE, new hardware recoveries $DH, max gpu ${TMAX}°C"
+    [ "$RUNS" -ge 1 ] || { echo "VERDICT: NOT TESTED (no run finished)"; exit 1; }
+    if [ "$DE" -gt 0 ] || [ "$DH" -gt 0 ]; then echo "VERDICT: ERRORS — raise mV or lower clock"; else echo "VERDICT: STABLE"; fi ;;
+  *) echo "usage: a7a-clock [status|check|power P|gpu MHz [mV]|ram MHz|npu MHz|cpu GOV|cpumax L B|dsu stock/dyn/dynoc/MHz|wifi 2.4/5/both|profile P|codec ac101/ac101b/status/state|usb-stick on/off|soak MIN]"; exit 1 ;;
+esac

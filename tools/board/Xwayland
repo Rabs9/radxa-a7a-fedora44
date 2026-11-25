@@ -1,0 +1,12 @@
+#!/bin/sh
+# /usr/local/bin/Xwayland (a7a-gpu-tools): KWin starts the first "Xwayland" on its PATH (QStandardPaths::findExecutable),
+# and /usr/local/bin comes before /usr/bin there. Under KWin 6.8 the compositor names the display controller
+# (sunxi-drm, /dev/dri/card0, no render node) as the GPU of its clients; Xwayland then says "Main linux-dmabuf device
+# has no render node", turns glamor off, and every X11 program draws on the CPU. The preload answers that lookup with
+# the GPU's render node, as edit 3 of tools/mesa-img/build-mesa-img.sh does for Wayland clients (Xwayland asks libdrm
+# itself, the glue cannot reach it). It changes nothing while the named device has a render node (KWin 6.7).
+# Measured 2026-11-17 on a test display: an X11 EGL program got softpipe without it and the PowerVR with it.
+for shim in /opt/pvr-wl/lib/a7a/wl-render-node-shim.so /usr/local/lib/wl-render-node-shim.so; do
+  if [ -e "$shim" ]; then export LD_PRELOAD="$shim${LD_PRELOAD:+ $LD_PRELOAD}"; break; fi
+done
+exec /usr/bin/Xwayland "$@"

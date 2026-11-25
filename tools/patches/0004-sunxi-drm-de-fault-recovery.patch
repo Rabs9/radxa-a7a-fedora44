@@ -1,0 +1,210 @@
+From: a7a-fedora
+Subject: [PATCH] sunxi-drm: recover from a display-engine IOMMU fault instead of storming; keep the DE and DRM in step
+
+Three related fixes for the display engine scanning a buffer that is no longer mapped (docs/DE-IOMMU-STORM-2026-09-07.md):
+
+- sunxi_de_atomic_flush(): when the RCQ "update finished" poll times out (50 ms) the driver used to report the
+  page flip as done anyway, so DRM released the old framebuffer while the DE still fetched from it. Now the
+  pending (dirty) register blocks are written through AHB before returning, so the hardware matches the state
+  DRM believes is programmed.
+- IOMMU fault callback: sunxi_de_fault_stop_all() turns the real-time mixer of every running display off at the
+  first fault (IRQ context, register writes only): no storm, no starved CPU, the board stays usable. The next
+  atomic flush of that display restarts it from the current state (rtmx_start + full AHB write + RCQ update), so
+  a live compositor recovers on its next frame and a new compositor recovers with its mode-set.
+- sunxi_fbdev_plane_update(): the wait for the DRM master's flush is bounded (200 ms). Unbounded, a master that
+  never flushes again (lost its VT, or restored the console text mode before dropping master) hung this path
+  inside a VT ioctl with the console lock held (chvt, fgconsole and the compositor frozen until reboot).
+---
+diff --git a/drivers/drm/sunxi_device/hardware/lowlevel_de/de_top.c b/drivers/drm/sunxi_device/hardware/lowlevel_de/de_top.c
+index ceb2caa..2415582 100644
+--- a/drivers/drm/sunxi_device/hardware/lowlevel_de/de_top.c
++++ b/drivers/drm/sunxi_device/hardware/lowlevel_de/de_top.c
+@@ -688,6 +688,12 @@ int de_top_display_config(struct de_top_handle *hdl, const struct de_top_display
+ 	return hdl->private->dsc->display_config(hdl, cfg);
+ }
+ 
++/* a7a-fedora: stop/restart only the real-time mixer of one display (register writes only, IRQ-safe) */
++int de_top_rtmx_enable(struct de_top_handle *hdl, u32 disp, bool en)
++{
++	return de_top_set_rtmx_enable(hdl, disp, en);
++}
++
+ static int de_top_display_config_v1(struct de_top_handle *hdl, const struct de_top_display_cfg *cfg)
+ {
+ 	unsigned int id = cfg->display_id;
+diff --git a/drivers/drm/sunxi_device/hardware/lowlevel_de/de_top.h b/drivers/drm/sunxi_device/hardware/lowlevel_de/de_top.h
+index 50893ff..0abd273 100644
+--- a/drivers/drm/sunxi_device/hardware/lowlevel_de/de_top.h
++++ b/drivers/drm/sunxi_device/hardware/lowlevel_de/de_top.h
+@@ -82,6 +82,7 @@ struct dfs_cfg {
+ int de_top_request_rcq_fifo_update(struct de_top_handle *hdl, u32 disp, unsigned long rcq_header_addr, unsigned int rcq_header_byte);
+ 
+ int de_top_display_config(struct de_top_handle *hdl, const struct de_top_display_cfg *cfg);
++int de_top_rtmx_enable(struct de_top_handle *hdl, u32 disp, bool en);
+ 
+ int de_top_set_chn_mux(struct de_top_handle *hdl, u32 disp, u32 port, u32 chn_type_id, bool is_video);
+ 
+diff --git a/drivers/drm/sunxi_device/hardware/lowlevel_de/sunxi_de.c b/drivers/drm/sunxi_device/hardware/lowlevel_de/sunxi_de.c
+index e05167a..1434176 100644
+--- a/drivers/drm/sunxi_device/hardware/lowlevel_de/sunxi_de.c
++++ b/drivers/drm/sunxi_device/hardware/lowlevel_de/sunxi_de.c
+@@ -127,6 +127,10 @@ struct sunxi_de_out {
+ 
+ 	unsigned int vsync_count;
+ 	unsigned int last_rcq_vsync;
++
++	/* a7a-fedora DE fault recovery: see sunxi_de_fault_stop_all() */
++	unsigned int hwdev_index;
++	atomic_t fault_stopped;
+ };
+ 
+ struct sunxi_display_engine {
+@@ -474,6 +478,9 @@ static void __maybe_unused de_memcpy_toio(volatile void __iomem *to, const void
+ }
+ 
+ /* for debug */
++static int rtmx_start(struct sunxi_display_engine *engine, unsigned int id, unsigned int hwdev_index);
++static int de_rtmx_set_all_reg_dirty(struct sunxi_de_out *hwde, u32 dirty);
++
+ static int __maybe_unused de_update_ahb(struct sunxi_de_out *hwde)
+ {
+ 	struct de_rcq_mem_info *rcq_info = &hwde->rcq_info;
+@@ -562,6 +569,48 @@ int sunxi_de_backend_get_pqd_config(struct sunxi_de_out *hwde, struct de_backend
+ 	return -ENODEV;
+ }
+ 
++/*
++ * a7a-fedora DE fault recovery (docs/DE-IOMMU-STORM-2026-09-07.md).
++ *
++ * When the display engine fetches from an address that is no longer mapped in the IOMMU (a scanout buffer freed
++ * under it), every burst faults, the IOMMU interrupt storms and the board is lost. The IOMMU fault callback
++ * (sunxi_drm_debug.c) calls sunxi_de_fault_stop_all() from IRQ context: it turns the real-time mixer of every
++ * running display off, so the DE stops fetching at once. The next atomic flush of that display restarts it from
++ * the current register state (rtmx_start + a full AHB write + the normal RCQ update), so a live compositor
++ * recovers on its next frame and a new compositor's mode-set recovers everything else.
++ */
++static struct sunxi_display_engine *fault_stop_engines[2];
++
++void sunxi_de_fault_stop_all(void)
++{
++	int e, i;
++
++	for (e = 0; e < ARRAY_SIZE(fault_stop_engines); e++) {
++		struct sunxi_display_engine *engine = fault_stop_engines[e];
++		if (!engine)
++			continue;
++		for (i = 0; i < engine->display_out_cnt; i++) {
++			struct sunxi_de_out *hwde = &engine->display_out[i];
++			if (!hwde->enable || atomic_read(&hwde->fault_stopped))
++				continue;
++			de_top_rtmx_enable(engine->top_hdl, hwde->id, false);
++			atomic_set(&hwde->fault_stopped, 1);
++			pr_err("[SUNXI-DE] de %d stopped after an IOMMU fault; it restarts on the next atomic flush\n", hwde->id);
++		}
++	}
++}
++EXPORT_SYMBOL_GPL(sunxi_de_fault_stop_all);
++
++static void sunxi_de_fault_restart(struct sunxi_de_out *hwde)
++{
++	struct sunxi_display_engine *engine = dev_get_drvdata(hwde->dev);
++
++	DRM_ERROR("[SUNXI-DE] de %d restarting after the IOMMU fault stop\n", hwde->id);
++	rtmx_start(engine, hwde->id, hwde->hwdev_index);
++	de_rtmx_set_all_reg_dirty(hwde, 1);
++	de_update_ahb(hwde);
++}
++
+ void sunxi_de_atomic_begin(struct sunxi_de_out *hwde)
+ {
+ //	struct sunxi_display_engine *engine = dev_get_drvdata(hwde->dev);
+@@ -708,6 +757,9 @@ void sunxi_de_atomic_flush(struct sunxi_de_out *hwde, struct de_backend_data *da
+ 		return;
+ 	}
+ 
++	if (atomic_xchg(&hwde->fault_stopped, 0))
++		sunxi_de_fault_restart(hwde);
++
+ 	/* update dep */
+ 	if ((cfg || data) && (unsigned long)cfg != FORCE_ATOMIC_FLUSH)
+ 		sunxi_de_exconfig_check_and_update(hwde, data, cfg);
+@@ -771,9 +823,16 @@ void sunxi_de_atomic_flush(struct sunxi_de_out *hwde, struct de_backend_data *da
+ 
+ 	/* update finish post proc */
+ 	//de_rtmx_check_rcq_head_dirty(hwde);
+-	if (timeout)
+-		DRM_INFO("%s timeout\n", __func__);
+-	else {
++	if (timeout) {
++		/*
++		 * a7a-fedora: the DE did not take the RCQ update. The caller is about to report the flip as done
++		 * and the old framebuffer will be released, so make the hardware match the software state now:
++		 * write the pending (still dirty) register blocks directly. Leaving the DE on the old addresses
++		 * is how a freed scanout buffer ends up under it (the IOMMU fault storm).
++		 */
++		DRM_INFO("%s timeout: forcing the pending registers through AHB\n", __func__);
++		de_update_ahb(hwde);
++	} else {
+ 		de_rtmx_set_all_reg_dirty(hwde, 0);
+ 		if (hwde->work) {
+ 			if (atomic_read(&hwde->schedule_next_frame)) {
+@@ -807,6 +866,7 @@ static int rtmx_start(struct sunxi_display_engine *engine, unsigned int id, unsi
+ 	struct dfs_cfg dfs_cfg;
+ 	struct offline_cfg offline;
+ 
++	hwde->hwdev_index = hwdev_index;
+ 	memset(&cfg, 0, sizeof(cfg));
+ 	cfg.display_id = id;
+ 	cfg.enable = 1;
+@@ -1152,6 +1212,10 @@ static int sunxi_display_engine_init(struct device *dev)
+ 		return -ENODEV;
+ 	}
+ 	dev_set_drvdata(dev, engine);
++	if (!fault_stop_engines[0])
++		fault_stop_engines[0] = engine;
++	else if (!fault_stop_engines[1])
++		fault_stop_engines[1] = engine;
+ 
+ 	ret = sunxi_de_parse_dts(dev, engine);
+ 	if (ret < 0) {
+diff --git a/drivers/drm/sunxi_drm_crtc.c b/drivers/drm/sunxi_drm_crtc.c
+index a9c0562..89426ac 100644
+--- a/drivers/drm/sunxi_drm_crtc.c
++++ b/drivers/drm/sunxi_drm_crtc.c
+@@ -522,8 +522,13 @@ int sunxi_fbdev_plane_update(struct fbdev_config *config)
+ 	reinit_completion(&scrtc_fbdev->flush_done);
+ 	if (lock)
+ 		drm_modeset_unlock_all(dev);
+-	if (!update)
+-		wait_for_completion(&scrtc_fbdev->flush_done);
++	/*
++	 * a7a-fedora: bounded. Unbounded, a DRM master that never flushes again (a compositor that lost its VT,
++	 * or one that restores the console's text mode before dropping master) hangs this path inside a VT
++	 * ioctl with the console lock held: chvt, fgconsole and the compositor freeze until reboot.
++	 */
++	if (!update && !wait_for_completion_timeout(&scrtc_fbdev->flush_done, msecs_to_jiffies(200)))
++		DRM_INFO("[SUNXI-DE] fbdev: no atomic flush from the DRM master within 200 ms, continuing\n");
+ 	DRM_DEBUG_DRIVER("[SUNXI-DE] fbdev plane update finish self_update :%d\n", update);
+ 	return 0;
+ }
+diff --git a/drivers/drm/sunxi_drm_debug.c b/drivers/drm/sunxi_drm_debug.c
+index f47d295..b5f5d82 100644
+--- a/drivers/drm/sunxi_drm_debug.c
++++ b/drivers/drm/sunxi_drm_debug.c
+@@ -71,11 +71,16 @@ typedef struct sunxidrm_debug_data {
+ 
+ static sunxidrm_debug_data_t dbgdat;
+ 
++void sunxi_de_fault_stop_all(void);
++
+ static void  __maybe_unused sunxidrm_debug_record_exception(void)
+ {
+ 	unsigned long flags;
+ 	int id = 0;
+ 
++	/* a7a-fedora: stop the display engine before anything else (IRQ context, register writes only) */
++	sunxi_de_fault_stop_all();
++
+ 	if (atomic_read(&dbgdat.exception)) {
+ 		pr_err("exception had already record !\n");
+ 		return;

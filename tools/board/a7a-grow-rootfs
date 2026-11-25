@@ -1,0 +1,56 @@
+#!/bin/bash
+# a7a-grow-rootfs: at the first boot of a freshly written card, grow the root partition (the last one on the card) to
+# the end of the card, and the ext4 in it. Our own flash stage does this on the laptop (tools/priv.sh grow-rootfs); an
+# image written with any other imager stays at the image's 12 GB without this. Runs once (a7a-grow-rootfs.service,
+# ConditionPathExists=!/var/lib/a7a/rootfs-grown); every step can be repeated, so a first boot that lost power half
+# way is finished by the next one.
+# Only the root partition's END moves: its start, the other partitions and the vendor boot firmware in front of
+# partition 1 are never touched (systemd-repart, masked in the image, once "used" that area and cost the board its
+# boot0: PROGRESS.md, 2026-09-07). A root that is not a partition, or not the last partition, is left alone.
+# The disk is in use, so sfdisk must neither run its busy check nor ask the kernel to re-read the whole table
+# (--no-reread --no-tell-kernel); partx then tells the kernel about that one partition, and resize2fs grows the
+# mounted filesystem. Tests: tests/test_grow_rootfs.py (A7A_GROW_ROOT = a fake root; the tools faked on PATH).
+set -u
+ROOT=${A7A_GROW_ROOT:-}
+DONE=$ROOT/var/lib/a7a/rootfs-grown
+MIN_FREE=$(( 64 * 2048 ))   # sectors: less than 64 MiB behind the partition is not worth a table change
+say() { echo "a7a-grow-rootfs: $*"; }
+mark() { mkdir -p "${DONE%/*}"; echo "$(date -Is 2>/dev/null) $*" > "$DONE"; }
+
+[ -e "$DONE" ] && { say "already done: $(cat "$DONE")"; exit 0; }
+part=$(findmnt -n -o SOURCE /); base=${part##*/}
+disk=$(lsblk -n -o PKNAME "$part" 2>/dev/null | head -1)
+sys=$ROOT/sys/block/$disk/$base
+if [ -z "$disk" ] || [ ! -r "$sys/partition" ]; then
+  say "the root filesystem ($part) is not a partition of a whole disk: nothing to do"; mark "root is not a partition ($part)"; exit 0
+fi
+num=$(cat "$sys/partition"); start=$(cat "$sys/start"); size=$(cat "$sys/size")
+last=$(cat "$ROOT/sys/block/$disk"/*/start 2>/dev/null | sort -n | tail -1)
+if [ "$last" != "$start" ]; then
+  say "$part is not the last partition on /dev/$disk: left alone"; mark "root is not the last partition"; exit 0
+fi
+total=$(blockdev --getsz "/dev/$disk" 2>/dev/null)
+# no size is no reason to call the card full (and to mark it done at the image's size for good)
+case "$total" in ''|*[!0-9]*) say "cannot read the size of /dev/$disk: trying again at the next boot"; exit 1 ;; esac
+free=$(( total - start - size ))
+if [ "$free" -ge "$MIN_FREE" ]; then
+  say "$part is $(( size / 2048 )) MiB with $(( free / 2048 )) MiB free behind it on /dev/$disk: growing"
+  # a card bigger than the image: the image's backup GPT sits where the image ended, move it to the card's end first
+  sfdisk --relocate gpt-bak-std "/dev/$disk" >/dev/null 2>&1 || say "the backup GPT was not moved (sfdisk --relocate): continuing"
+  out=$(echo ", +" | sfdisk -q --no-reread --no-tell-kernel --wipe never --wipe-partitions never -N "$num" "/dev/$disk" 2>&1) \
+    || { say "sfdisk could not grow partition $num of /dev/$disk ($(tail -1 <<<"$out")): trying again at the next boot"; exit 1; }
+  if ! partx -u --nr "$num" "/dev/$disk"; then
+    say "the kernel did not take the new size of $part: the filesystem grows at the next boot"; exit 0
+  fi
+  newsize=$(cat "$sys/size")
+  # sfdisk can exit 0 without a change: "grown" is what the kernel sees now, not what was asked for
+  [ "$newsize" -gt "$size" ] 2>/dev/null \
+    || { say "partition $num of /dev/$disk did not grow (still $(( size / 2048 )) MiB, $(( free / 2048 )) MiB free behind it${out:+; sfdisk: $(tail -1 <<<"$out")}): trying again at the next boot"; exit 1; }
+  what="grown: partition $num of /dev/$disk from $(( size / 2048 )) to $(( newsize / 2048 )) MiB"
+else
+  what="nothing to grow ($(( free / 2048 )) MiB behind $part)"
+fi
+# always: the filesystem may still be smaller than its partition (the laptop's flash stage, or an interrupted first boot)
+resize2fs "$part" 2>&1 | tail -1 || true
+[ "${PIPESTATUS[0]}" = 0 ] || { say "resize2fs failed on $part: trying again at the next boot"; exit 1; }
+say "$what"; mark "$what"

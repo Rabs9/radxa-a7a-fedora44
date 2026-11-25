@@ -1,0 +1,2564 @@
+#!/usr/bin/python3
+"""a7a-gpu-gap: what this GPU can do (proven by the vendor DDK) against what the open stack exposes, turned into a
+ranked, actionable list. docs/GPU-GAP-2026-09-10.md is its report; the snapshots it compares live in docs/gpu-caps/.
+
+  a7a-gpu-gap snapshot [--out FILE] [--bench] [--bench-full]   ON THE BOARD: record the booted stack
+  a7a-gpu-gap report --open FILE --vendor FILE [--out MD]       diff two snapshots, evaluate Mesa's version gates
+  a7a-gpu-gap gates --mesa-src DIR [--out FILE]                 extract the gates from a Mesa source tree
+
+snapshot writes one JSON file for the stack that is booted, with one entry per "view" (a way of running GL and
+Vulkan clients on that boot):
+  open stack (drm/imagination 'powervr' bound)  open         Mesa's PowerVR Vulkan driver + zink: what every app gets
+  vendor boot (pvrsrvkm bound)                  ddk          the DDK under /opt/pvr (pvr-run's environment)
+                                                fedora-mesa  Fedora's Mesa on the same boot, for reference (llvmpipe)
+                                                zink-on-ddk  Fedora's zink over the DDK's Vulkan ICD: the GL version zink
+                                                             reaches on the Vulkan features this GPU is proven to have
+Each view records vulkaninfo --json (features, limits, extensions, formats), eglinfo (every platform), glxinfo -l
+(when a desktop session is logged in) and a small EGL probe (this script's hidden `probe` mode, ctypes, surfaceless)
+that reads the GL integer limits Mesa's gates compare. The probe runs a second time with MESA_GL_VERSION_OVERRIDE=
+4.6COMPAT / MESA_GLES_VERSION_OVERRIDE=3.2 in its own environment ONLY to make Mesa list every extension flag the
+driver computed (a GL 2.1 context hides extensions that need GL 3.1+): a diagnostic read of Mesa's internal state,
+labelled as such in the snapshot and the report; no application ever runs with an override. --bench adds
+glmark2-es2 (the same sizes on both stacks) with thermal sampling; it needs the logged-in desktop.
+
+report evaluates the version gates of Mesa (src/mesa/main/version.c, compute_version and compute_version_es2,
+extracted verbatim by `gates` into a7a-gpu-gap-mesa-<ver>-gates.json) against the flags and limits the open stack
+really has, names every failing term, maps it to the Vulkan feature, extension or limit behind it (GL_FLAG_NEEDS
+below, with the Mesa source lines), checks the vendor snapshot for that item, and ranks the fixes by what they
+unlock (APPS below). Nothing here writes to the system: snapshot only reads and runs the info tools.
+"""
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime
+
+TOOL_VERSION = "20260910"
+SELF = os.path.abspath(__file__)
+GPU = "/sys/bus/platform/devices/1800000.gpu"
+DT_GPU = "/proc/device-tree/soc@3000000/gpu@1800000"
+DDK_ENV = {"LD_LIBRARY_PATH": "/opt/pvr/lib", "LIBGL_DRIVERS_PATH": "/opt/pvr/lib/dri",
+           "VK_ICD_FILENAMES": "/opt/pvr/icd/powervr_icd.json"}           # = tools/board/pvr-run
+OVERRIDE_ENV = {"MESA_GL_VERSION_OVERRIDE": "4.6COMPAT", "MESA_GLES_VERSION_OVERRIDE": "3.2"}
+# never inherited from the caller's shell: each view sets exactly what it needs
+SCRUB = ("MESA_GL_VERSION_OVERRIDE", "MESA_GLES_VERSION_OVERRIDE", "MESA_GLSL_VERSION_OVERRIDE",
+         "MESA_LOADER_DRIVER_OVERRIDE", "MESA_EXTENSION_OVERRIDE", "VK_ICD_FILENAMES", "VK_DRIVER_FILES",
+         "LD_LIBRARY_PATH", "LIBGL_DRIVERS_PATH", "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER",
+         "PVR_I_WANT_A_BROKEN_VULKAN_DRIVER", "ZINK_DEBUG")
+BENCH_SIZES = ("640x480", "1000x560")      # never 1024x600 = the screen size: bimodal (docs/SPEED-2026-09-10.md)
+# the GL renderer (a regex) each view must show; a view showing none of it fell back (Mesa goes to llvmpipe silently)
+# and contributes no numbers. A pattern, not a word: the vendor's exact wording must not make the DDK a fallback
+EXPECT_RENDERER = {"open": "PowerVR|BXM", "ddk": "PowerVR|BXM|Imagination", "zink-on-ddk": "zink"}
+
+
+# ------------------------------------------------------------------------------------------------ small helpers
+def run_cmd(cmd, env=None, cwd=None, timeout=60):
+    """run a command with a scrubbed environment plus `env`; returns (rc, stdout, stderr); never raises and never
+    waits for ever: after the timeout the child is killed and given 10 s to go (a GPU client stuck in D state
+    inside the kernel driver cannot be reaped; it is then left behind and reported, rc 125)"""
+    e = {k: v for k, v in os.environ.items() if k not in SCRUB}
+    e.update(env or {})
+    try:
+        p = subprocess.Popen(cmd, env=e, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             errors="replace")
+    except FileNotFoundError:
+        return 127, "", "not found: %s" % cmd[0]
+    except OSError as ex:
+        return 126, "", "%s: %s" % (type(ex).__name__, ex)
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode, out, err
+    except subprocess.TimeoutExpired:
+        p.kill()
+        try:
+            out, err = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            return 125, "", "unkillable after the %ss timeout (D state?): %s" % (timeout, " ".join(cmd))
+        return 124, out, (err or "") + "\ntimeout after %ss: %s" % (timeout, " ".join(cmd))
+
+
+def read_file(path):
+    """text of a file, '->name' for a symlink (its target's basename), None when unreadable"""
+    try:
+        if os.path.islink(path):
+            return "->" + os.path.basename(os.readlink(path))
+        with open(path, errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def listdir(path):
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def read_be32(path):
+    """big-endian u32 cells of a device-tree property"""
+    try:
+        b = open(path, "rb").read()
+    except OSError:
+        return None
+    return [int.from_bytes(b[i:i + 4], "big") for i in range(0, len(b) - len(b) % 4, 4)]
+
+
+def gl_version_number(s):
+    """'2.1 Mesa 26.1.8' -> 21, 'OpenGL ES 3.2 build ...' -> 32, 'OpenGL ES GLSL ES 3.20' -> 32"""
+    if not s:
+        return None
+    m = re.search(r"(\d+)\.(\d)", s)
+    return int(m.group(1)) * 10 + int(m.group(2)) if m else None
+
+
+def glsl_number(s):
+    """'4.60' -> 460, '1.20' -> 120 (the value Mesa's consts->GLSLVersion holds)"""
+    m = re.search(r"(\d+)\.(\d+)", s or "")
+    return int(m.group(1)) * 100 + int(m.group(2)[:2].ljust(2, "0")) if m else None
+
+
+def actual_api(requested, version, profile_mask):
+    """the profile a context really got: MESA_GL_VERSION_OVERRIDE=4.6COMPAT answers a core request with a
+    compatibility context. profile_mask = GL_CONTEXT_PROFILE_MASK (None below GL 3.2)"""
+    if requested == "es":
+        return "es"
+    if profile_mask:
+        return "core" if profile_mask & 1 else "compat"
+    if "(Core Profile)" in (version or ""):
+        return "core"
+    if "(Compatibility Profile)" in (version or ""):
+        return "compat"
+    return requested
+
+
+def median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+# ------------------------------------------------------------------------------------------------ parsers
+_PROFILE = re.compile(r"^OpenGL (core|compatibility|ES) profile (vendor|renderer|version|shading language version|extensions):\s*(.*)$")
+_PROFILE_KEY = {"core": "core", "compatibility": "compat", "ES": "es"}
+_FIELD = {"vendor": "vendor", "renderer": "renderer", "version": "version",
+          "shading language version": "sl_version", "extensions": "extensions"}
+_EGL_FIELD = {"EGL API version": "api_version", "EGL vendor string": "vendor", "EGL version string": "version",
+              "EGL client APIs": "client_apis", "EGL driver name": "driver"}
+
+
+def _list_items(line):
+    return [x.strip() for x in line.split(",") if x.strip()]
+
+
+def parse_eglinfo(text):
+    """eglinfo (mesa-demos 9) output -> {"client_extensions": [...], "platforms": [{name, error, egl, gl, ...}]}"""
+    res = {"client_extensions": [], "platforms": []}
+    cur, device, dev_ext, target = None, None, [], None
+    for line in text.splitlines():
+        if target is not None and line.startswith("    ") and line.strip():
+            target.extend(_list_items(line))
+            continue
+        target = None
+        if not line.strip():
+            continue
+        if line == "EGL client extensions string:":
+            target = res["client_extensions"]
+            continue
+        m = re.match(r"^Device #(\d+):$", line)
+        if m:
+            device, dev_ext, cur = int(m.group(1)), [], None
+            continue
+        if line == "EGL device extensions string:":
+            target = dev_ext
+            continue
+        m = re.match(r"^(\S.*) platform:$", line)
+        if m:
+            name = m.group(1)
+            if name == "Device":             # container; the per-device sections follow as "Platform Device platform:"
+                cur = None
+                continue
+            if name == "Platform Device":
+                name = "Device #%s" % device
+            cur = {"name": name, "error": None, "egl": {}, "gl": {}}
+            if name.startswith("Device #"):
+                cur["device_extensions"] = dev_ext
+            res["platforms"].append(cur)
+            continue
+        if cur is None:
+            continue
+        if line.startswith("eglinfo:"):
+            cur["error"] = ((cur["error"] + "; ") if cur["error"] else "") + line[len("eglinfo:"):].strip()
+            continue
+        if line.startswith("EGL extensions string:"):
+            cur["egl"]["extensions"] = []
+            target = cur["egl"]["extensions"]
+            continue
+        k, _, v = line.partition(":")
+        if k in _EGL_FIELD:
+            cur["egl"][_EGL_FIELD[k]] = v.strip()
+            continue
+        m = _PROFILE.match(line)
+        if m:
+            prof = cur["gl"].setdefault(_PROFILE_KEY[m.group(1)], {})
+            f = _FIELD[m.group(2)]
+            if f == "extensions":
+                prof["extensions"] = _list_items(m.group(3))
+                target = prof["extensions"]
+            else:
+                prof[f] = m.group(3).strip()
+    return res
+
+
+def parse_glxinfo(text):
+    """glxinfo -l output -> {max_versions, compat, core, es, limits: {compat|core|es: {GL_...: "value"}}}"""
+    res = {"max_versions": {}, "compat": None, "core": None, "es": None, "limits": {}}
+    target, limits = None, None
+    mv = {"Max core profile version": "core", "Max compat profile version": "compat",
+          "Max GLES1 profile version": "gles1", "Max GLES[23] profile version": "gles"}
+    strings = [(re.compile(r"^OpenGL core profile (vendor|renderer|version|shading language version) string: (.*)$"), "core"),
+               (re.compile(r"^OpenGL ES profile (vendor|renderer|version|shading language version) string: (.*)$"), "es"),
+               (re.compile(r"^OpenGL (vendor|renderer|version|shading language version) string: (.*)$"), "compat")]
+    for line in text.splitlines():
+        if target is not None and line.startswith("    ") and line.strip():
+            target.extend(_list_items(line))
+            continue
+        target = None
+        if limits is not None:
+            m = re.match(r"^\s+(GL_\w+) = (.*)$", line)
+            if m:
+                limits[m.group(1)] = m.group(2).strip()
+                continue
+            if re.match(r"^\s+\S.*:$", line):     # "  GL_ARB_framebuffer_object:" group header
+                continue
+            limits = None
+        s = line.strip()
+        k, _, v = s.partition(":")
+        if k in mv:
+            res["max_versions"][mv[k]] = v.strip()
+            continue
+        for rx, prof in strings:
+            m = rx.match(line)
+            if m:
+                res[prof] = res[prof] or {}
+                res[prof][_FIELD[m.group(1)]] = m.group(2).strip()
+                break
+        else:
+            m = re.match(r"^OpenGL (?:(core|ES) profile )?extensions:$", line)
+            if m:
+                prof = {"core": "core", "ES": "es"}.get(m.group(1), "compat")
+                res[prof] = res[prof] or {}
+                res[prof]["extensions"] = []
+                target = res[prof]["extensions"]
+                continue
+            m = re.match(r"^OpenGL (?:(core|ES) profile )?limits:$", line)
+            if m:
+                limits = res["limits"].setdefault({"core": "core", "ES": "es"}.get(m.group(1), "compat"), {})
+    return res
+
+
+def api_version_str(v):
+    return "%d.%d.%d" % ((v >> 22) & 0x7F, (v >> 12) & 0x3FF, v & 0xFFF)
+
+
+def normalize_vulkan(vp):
+    """a `vulkaninfo --json` profile -> a flat view: features "Struct.member", limits, extensions, formats"""
+    dev = vp["capabilities"]["device"]
+    props = dev.get("properties", {})
+    core = props.get("VkPhysicalDeviceProperties", {})
+    v = {"device_name": core.get("deviceName"), "device_type": core.get("deviceType"),
+         "vendor_id": core.get("vendorID"), "device_id": core.get("deviceID"),
+         "driver_version": core.get("driverVersion"), "extensions": dict(dev.get("extensions", {})),
+         "features": {}, "limits": dict(core.get("limits", {})), "properties": {}, "formats": {},
+         "queue_families": dev.get("queueFamiliesProperties", [])}
+    if "apiVersion" in core:
+        v["api_version"] = api_version_str(core["apiVersion"])
+    else:
+        v["api_version"] = next(iter(vp.get("profiles", {}).values()), {}).get("api-version")
+    for struct, members in dev.get("features", {}).items():
+        for m, val in members.items():
+            v["features"]["%s.%s" % (struct, m)] = val
+    for struct, members in props.items():
+        for m, val in members.items():
+            if struct == "VkPhysicalDeviceProperties" and m in ("limits",):
+                continue
+            v["properties"]["%s.%s" % (struct, m)] = val
+    for k in ("driverName", "driverInfo"):
+        for key, val in v["properties"].items():
+            if key.endswith("." + k):
+                v["driver_name" if k == "driverName" else "driver_info"] = val
+                break
+    for fmt, entry in dev.get("formats", {}).items():
+        fp = entry.get("VkFormatProperties") or entry.get("VkFormatProperties3") or {}
+        v["formats"][fmt] = {"linear": list(fp.get("linearTilingFeatures", [])),
+                             "optimal": list(fp.get("optimalTilingFeatures", [])),
+                             "buffer": list(fp.get("bufferFeatures", []))}
+    return v
+
+
+def parse_glmark2(text):
+    r = {"renderer": None, "version": None, "vendor": None, "surface": None, "scenes": [], "score": None, "errors": []}
+    for line in text.splitlines():
+        s = line.strip()
+        for k, f in (("GL_RENDERER:", "renderer"), ("GL_VERSION:", "version"), ("GL_VENDOR:", "vendor"),
+                     ("Surface Size:", "surface")):
+            if s.startswith(k):
+                r[f] = s[len(k):].strip()
+        m = re.match(r"^\[([\w-]+)\] (.*?): FPS: (\d+)", s)
+        if m:
+            r["scenes"].append([m.group(1), m.group(2), int(m.group(3))])
+        m = re.search(r"glmark2 Score: (\d+)", s)
+        if m:
+            r["score"] = int(m.group(1))
+        if s.startswith("Error:") or "failed" in s.lower() and "Error" in s:
+            r["errors"].append(s)
+    return r
+
+
+# ------------------------------------------------------------------------------------------------ Mesa gates
+def _strip_c_comments(t):
+    t = re.sub(r"/\*.*?\*/", " ", t, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", t)
+
+
+def _function_body(text, name):
+    m = re.search(r"\n%s\s*\(" % re.escape(name), text)
+    if not m:
+        raise ValueError("function %s not found" % name)
+    start = text.index("{", m.end())
+    end = re.search(r"\n}\n", text[start:])
+    return text[start:start + end.start()] if end else text[start:]
+
+
+def parse_version_gates(text):
+    """version.c -> {"gl": [{step, var, expr}], "es": [...], "gl_defs": {}, "es_defs": {name: expr}}"""
+    t = _strip_c_comments(text)
+    res = {}
+    for key, fn in (("gl", "compute_version"), ("es", "compute_version_es2")):
+        body = _function_body(t, fn)
+        steps, defs = [], {}
+        for m in re.finditer(r"const\s+bool\s+(\w+)\s*=\s*(.*?);", body, flags=re.S):
+            var, expr = m.group(1), " ".join(m.group(2).split())
+            vm = re.match(r"^ver_(\d+)_(\d+)$", var)
+            if vm:
+                steps.append({"step": "%s.%s" % (vm.group(1), vm.group(2)), "var": var, "expr": expr})
+            else:
+                defs[var] = expr
+        res[key], res[key + "_defs"] = steps, defs
+    return res
+
+
+_EXT_ROW = re.compile(r"^EXT\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\d+)\s*\)", re.M)
+
+
+def parse_ext_table(text):
+    """extensions_table.h -> {driver flag: [{name: "GL_...", gll, glc, es1, es2}]} (min version*10, None = never)"""
+    def ver(tok):
+        if tok in ("GLL", "GLC", "ES1", "ES2"):
+            return 0
+        if tok == "x":
+            return None
+        return int(tok)
+    t = {}
+    for m in _EXT_ROW.finditer(text):
+        t.setdefault(m.group(2), []).append({"name": "GL_" + m.group(1), "gll": ver(m.group(3)), "glc": ver(m.group(4)),
+                                             "es1": ver(m.group(5)), "es2": ver(m.group(6))})
+    return t
+
+
+_TOKEN = re.compile(r"\s*(extensions->\w+|consts->[\w\[\]\.]+|&&|\|\||>=|<=|==|!=|>|<|!|\(|\)|\w+|\S)")
+
+
+def _tokens(expr):
+    out, pos = [], 0
+    while pos < len(expr):
+        m = _TOKEN.match(expr, pos)
+        if not m or not m.group(1).strip():
+            break
+        out.append(m.group(1))
+        pos = m.end()
+    return out
+
+
+def parse_expr(expr):
+    """C boolean expression of version.c -> AST: ("and"|"or", [nodes]) | ("not", n) | ("flag", name) |
+    ("const", name, op, value) | ("api", "core") | ("ref", var)"""
+    toks = _tokens(expr)
+    pos = [0]
+
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else None
+
+    def take(t=None):
+        tok = peek()
+        if t is not None and tok != t:
+            raise ValueError("expected %r got %r in %r" % (t, tok, expr))
+        pos[0] += 1
+        return tok
+
+    def orx():
+        n = [andx()]
+        while peek() == "||":
+            take()
+            n.append(andx())
+        return n[0] if len(n) == 1 else ("or", n)
+
+    def andx():
+        n = [unary()]
+        while peek() == "&&":
+            take()
+            n.append(unary())
+        return n[0] if len(n) == 1 else ("and", n)
+
+    def unary():
+        if peek() == "!":
+            take()
+            return ("not", unary())
+        if peek() == "(":
+            take("(")
+            n = orx()
+            take(")")
+            return n
+        return atom()
+
+    def atom():
+        a = take()
+        if a is None:
+            raise ValueError("unexpected end of %r" % expr)
+        if a.startswith("extensions->"):
+            return ("flag", a[len("extensions->"):])
+        if a.startswith("consts->"):
+            name = a[len("consts->"):]
+            if peek() in (">=", "<=", "==", "!=", ">", "<"):
+                op = take()
+                return ("const", name, op, int(take()))
+            return ("const", name, "truthy", None)
+        if a == "api":
+            take("==")
+            b = take()
+            if b != "API_OPENGL_CORE":
+                raise ValueError("unsupported api comparison %r" % b)
+            return ("api", "core")
+        if re.match(r"^\w+$", a):
+            return ("ref", a)
+        raise ValueError("unexpected token %r in %r" % (a, expr))
+
+    node = orx()
+    if peek() is not None:
+        raise ValueError("trailing tokens %r in %r" % (toks[pos[0]:], expr))
+    return node
+
+
+def node_text(n):
+    k = n[0]
+    if k == "flag":
+        return "extensions->" + n[1]
+    if k == "const":
+        return "consts->%s" % n[1] if n[2] == "truthy" else "consts->%s %s %d" % (n[1], n[2], n[3])
+    if k == "api":
+        return "api == API_OPENGL_CORE"
+    if k == "ref":
+        return n[1]
+    if k == "not":
+        return "!" + node_text(n[1])
+    return "(" + (" && " if k == "and" else " || ").join(node_text(c) for c in n[1]) + ")"
+
+
+def _k_and(vals):
+    return False if False in vals else (None if None in vals else True)
+
+
+def _k_or(vals):
+    return True if True in vals else (None if None in vals else False)
+
+
+def _val(x):
+    return x.get("value") if isinstance(x, dict) else x
+
+
+def gate_flags(gates):
+    out = set()
+    for key in ("gl", "es"):
+        exprs = [s["expr"] for s in gates[key]] + list(gates.get(key + "_defs", {}).values())
+        for e in exprs:
+            out.update(re.findall(r"extensions->(\w+)", e))
+    return sorted(out)
+
+
+def gate_consts(gates):
+    out = set()
+    for key in ("gl", "es"):
+        exprs = [s["expr"] for s in gates[key]] + list(gates.get(key + "_defs", {}).values())
+        for e in exprs:
+            out.update(re.findall(r"consts->([\w\[\]\.]+)", e))
+    return sorted(out)
+
+
+def evaluate_gates(gates, flags, consts):
+    """three-valued evaluation of every version step for GL compat, GL core and GLES2+.
+    flags {name: bool|None|{"value":..}}, consts {name: number|bool|None|{"value":..}}"""
+    flags = {k: _val(v) for k, v in flags.items()}
+    consts = {k: _val(v) for k, v in consts.items()}
+    out, reached = {}, {}
+    for key, api in (("gl_compat", "compat"), ("gl_core", "core"), ("es", "es")):
+        steps = gates["gl" if key.startswith("gl") else "es"]
+        defs = gates["gl_defs" if key.startswith("gl") else "es_defs"]
+        var2step = {s["var"]: s["step"] for s in steps}
+        values = {}
+
+        def ev(n):
+            k = n[0]
+            if k == "flag":
+                return flags.get(n[1])
+            if k == "const":
+                v = consts.get(n[1])
+                if v is None:
+                    return None
+                if n[2] == "truthy":
+                    return bool(v)
+                return {">=": v >= n[3], "<=": v <= n[3], "==": v == n[3], "!=": v != n[3],
+                        ">": v > n[3], "<": v < n[3]}[n[2]]
+            if k == "api":
+                return api == "core"
+            if k == "ref":
+                if n[1] in values:
+                    return values[n[1]]
+                if n[1] in defs:
+                    return ev(parse_expr(defs[n[1]]))
+                return None
+            if k == "not":
+                v = ev(n[1])
+                return None if v is None else not v
+            vals = [ev(c) for c in n[1]]
+            return _k_and(vals) if k == "and" else _k_or(vals)
+
+        rows = []
+        for s in steps:
+            node = parse_expr(s["expr"])
+            items = list(node[1]) if node[0] == "and" else [node]
+            # a reference to a helper definition (es31_compute_shader) is its own list of terms
+            flat = []
+            for it in items:
+                if it[0] == "ref" and it[1] in defs:
+                    d = parse_expr(defs[it[1]])
+                    flat.extend(d[1] if d[0] == "and" else [d])
+                else:
+                    flat.append(it)
+            fails, unknown, blocked = [], [], None
+            for it in flat:
+                v = ev(it)
+                if it[0] == "ref" and it[1] in var2step:
+                    if v is not True:
+                        blocked = var2step[it[1]]
+                    continue
+                if v is False:
+                    fails.append(node_text(it))
+                elif v is None:
+                    unknown.append(node_text(it))
+            value = ev(node)
+            values[s["var"]] = value
+            rows.append({"step": s["step"], "var": s["var"], "value": value, "fails": fails, "unknown": unknown,
+                         "blocked_by": blocked})
+        out[key] = rows
+        ok = [r["step"] for r in rows if r["value"] is True]
+        best = ok[-1] if ok else None
+        if key == "gl_core" and best is not None and gl_version_number(best) < 31:
+            best = None                       # version.c: a core context needs 3.1 at least
+        reached[key] = best
+    out["reached"] = reached
+    return out
+
+
+_API_COL = {"compat": "gll", "core": "glc", "es": "es2"}
+
+
+def observe_flags(ext_table, contexts):
+    """what the extension strings of real contexts prove about each Mesa driver flag.
+    contexts: [{api: compat|core|es, version: 21, extensions: [...], source: "..."}]"""
+    ctx = [dict(c, ext=set(c.get("extensions") or [])) for c in contexts if c.get("version")]
+    out = {}
+    for flag, entries in ext_table.items():
+        names = [e["name"] for e in entries]
+        present = [c["source"] for c in ctx if any(n in c["ext"] for n in names)]
+        if present:
+            out[flag] = {"value": True, "evidence": "listed in " + ", ".join(present), "strings": names}
+            continue
+        visible = [c["source"] for c in ctx
+                   if any(e[_API_COL[c["api"]]] is not None and c["version"] >= e[_API_COL[c["api"]]] for e in entries)]
+        if visible:
+            out[flag] = {"value": False, "evidence": "absent from " + ", ".join(visible), "strings": names}
+        else:
+            need = "; ".join("%s: %s" % (e["name"], ", ".join(
+                "%s>=%s" % (api, "%d.%d" % divmod(e[col], 10) if e[col] else "any")
+                for api, col in _API_COL.items() if e[col] is not None) or "not exposed") for e in entries)
+            out[flag] = {"value": None, "evidence": "not observable in the contexts probed (%s)" % need, "strings": names}
+    return out
+
+
+# Mesa gl_constants name -> the GL query that returns it (and how)
+CONST_QUERY = {
+    "MaxColorAttachments": ("GL_MAX_COLOR_ATTACHMENTS", None),
+    "MaxSamples": ("GL_MAX_SAMPLES", None),
+    "Program[MESA_SHADER_VERTEX].MaxTextureImageUnits": ("GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS", None),
+    "MaxTextureSize": ("GL_MAX_TEXTURE_SIZE", None),
+    "MaxRenderbufferSize": ("GL_MAX_RENDERBUFFER_SIZE", None),
+    "MaxCubeTextureLevels": ("GL_MAX_CUBE_MAP_TEXTURE_SIZE", "levels"),
+    "Max3DTextureLevels": ("GL_MAX_3D_TEXTURE_SIZE", "levels"),
+    "MaxArrayTextureLayers": ("GL_MAX_ARRAY_TEXTURE_LAYERS", None),
+    "Program[MESA_SHADER_VERTEX].MaxUniformBlocks": ("GL_MAX_VERTEX_UNIFORM_BLOCKS", None),
+    "MaxVertexAttribStride": ("GL_MAX_VERTEX_ATTRIB_STRIDE", None),
+    "MaxComputeWorkGroupInvocations": ("GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS", None),
+    "Program[MESA_SHADER_COMPUTE].MaxShaderStorageBlocks": ("GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS", None),
+    "Program[MESA_SHADER_COMPUTE].MaxAtomicBuffers": ("GL_MAX_COMPUTE_ATOMIC_COUNTER_BUFFERS", None),
+    "Program[MESA_SHADER_COMPUTE].MaxImageUniforms": ("GL_MAX_COMPUTE_IMAGE_UNIFORMS", None),
+}
+# not readable through GL: from the Mesa source (gallium st: consts come from pipe caps; zink's values in 26.1.8)
+CONST_SOURCE = {
+    "FakeSWMSAA": (False, "not queryable; gallium never sets it (st_extensions.c), and it only matters when MaxSamples < 4"),
+    "PrimitiveRestartFixedIndex": (None, "not queryable (only ORed with NV_primitive_restart in the gates)"),
+}
+
+
+def probe_contexts(probe):
+    if not probe:
+        return []
+    if "contexts" in probe:
+        return probe["contexts"]
+    out = []
+    for label in ("normal", "override"):
+        for c in (probe.get(label) or {}).get("contexts", []):
+            out.append(dict(c, label=c.get("label", label)))
+    return out
+
+
+def consts_from_probe(probe, glx=None):
+    """the gl_constants the gates compare, from the probe's glGetIntegerv (normal contexts first), else glxinfo -l"""
+    ctxs = [c for c in probe_contexts(probe) if c.get("ok")]
+    order = sorted(ctxs, key=lambda c: (c.get("label") != "normal", {"compat": 0, "es": 1, "core": 2}.get(c.get("api"), 3)))
+    out = {}
+    for name, (enum, how) in CONST_QUERY.items():
+        val, ev = None, "not readable: %s rejected in every context probed" % enum
+        for c in order:
+            v = (c.get("ints") or {}).get(enum)
+            if v:
+                val = v[0]
+                ev = "%s in the %s %s context (%s)" % (enum, c.get("label"), c.get("api"), c.get("version"))
+                break
+        if val is None and glx:
+            for prof in ("compat", "core", "es"):
+                lim = (glx.get("limits") or {}).get(prof) or {}
+                for k in (enum, enum + "_ARB", enum + "_EXT"):
+                    if k in lim and re.match(r"^\d+$", lim[k]):
+                        val, ev = int(lim[k]), "%s from glxinfo -l (%s)" % (k, prof)
+                        break
+                if val is not None:
+                    break
+        if val is not None and how == "levels":
+            val = int(math.log2(val)) + 1 if val > 0 else 0
+        out[name] = {"value": val, "evidence": ev}
+    # GLSL: a normal 2.1 context reports the clamped 1.20 (version.c _mesa_compute_version); the override context
+    # skips that clamp and reports consts->GLSLVersion itself
+    gv, gev = None, "no compat context probed"
+    for c in sorted(ctxs, key=lambda c: c.get("label") != "override"):
+        if c.get("api") == "compat" and c.get("sl_version"):
+            gv = glsl_number(c["sl_version"])
+            gev = "GL_SHADING_LANGUAGE_VERSION %s in the %s compat context%s" % (
+                c["sl_version"], c.get("label"), "" if c.get("label") == "override" else " (clamped to the context version)")
+            break
+    out["GLSLVersion"] = {"value": gv, "evidence": gev}
+    for name, (v, why) in CONST_SOURCE.items():
+        out[name] = {"value": v, "evidence": why}
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ Vulkan diff
+_LOWER_BETTER = ("bufferImageGranularity", "nonCoherentAtomSize", "pointSizeGranularity", "lineWidthGranularity",
+                 "optimalBufferCopyOffsetAlignment", "optimalBufferCopyRowPitchAlignment")
+_HIGHER_BETTER = ("subPixelPrecisionBits", "subTexelPrecisionBits", "mipmapPrecisionBits", "viewportSubPixelBits",
+                  "subPixelInterpolationOffsetBits", "discreteQueuePriorities", "sparseAddressSpaceSize")
+_INFO_ONLY = ("timestampPeriod",)
+
+
+def limit_cmp(name, o, v):
+    """'worse' | 'better' | 'equal' | 'differs' for the open driver's value o against the vendor's v"""
+    if o == v:
+        return "equal"
+    if o is None or v is None or name in _INFO_ONLY:
+        return "differs"
+    if isinstance(o, bool) or isinstance(v, bool):
+        return "better" if o else "worse"
+    if isinstance(o, list) and isinstance(v, list):
+        if all(isinstance(x, str) for x in o + v):
+            so, sv = set(o), set(v)
+            return "worse" if so < sv else ("better" if sv < so else "differs")
+        if len(o) == len(v) and all(isinstance(x, (int, float)) for x in o + v):
+            if name.endswith("Range") and len(o) == 2:
+                if o[0] >= v[0] and o[1] <= v[1]:
+                    return "worse"
+                if o[0] <= v[0] and o[1] >= v[1]:
+                    return "better"
+                return "differs"
+            if all(a <= b for a, b in zip(o, v)):
+                return "worse"
+            if all(a >= b for a, b in zip(o, v)):
+                return "better"
+        return "differs"
+    if not isinstance(o, (int, float)) or not isinstance(v, (int, float)):
+        return "differs"
+    if name in _LOWER_BETTER or name.startswith("min") or name.endswith("Granularity"):
+        return "worse" if o > v else "better"
+    if name.startswith("max") or name in _HIGHER_BETTER:
+        return "worse" if o < v else "better"
+    return "differs"
+
+
+def _member_map(features):
+    m = {}
+    for key, val in features.items():
+        struct, _, member = key.rpartition(".")
+        e = m.setdefault(member, {"value": False, "structs": []})
+        if val is True:
+            e["value"] = True
+            e["structs"].append(struct)
+    return m
+
+
+def diff_vulkan(o, v):
+    """open view o against vendor view v"""
+    om, vm = _member_map(o.get("features", {})), _member_map(v.get("features", {}))
+    missing = [{"member": m, "structs": e["structs"], "open": om.get(m, {}).get("value", None)}
+               for m, e in vm.items() if e["value"] and not om.get(m, {}).get("value")]
+    extra = [{"member": m, "structs": e["structs"]} for m, e in om.items() if e["value"] and not vm.get(m, {}).get("value")]
+    missing.sort(key=lambda x: (x["structs"][0], x["member"]))
+    extra.sort(key=lambda x: (x["structs"][0], x["member"]))
+    lw, lb, ld = [], [], []
+    for name in sorted(set(o.get("limits", {})) | set(v.get("limits", {}))):
+        ov, vv = o.get("limits", {}).get(name), v.get("limits", {}).get(name)
+        c = limit_cmp(name, ov, vv)
+        row = {"name": name, "open": ov, "vendor": vv}
+        {"worse": lw, "better": lb, "differs": ld}.get(c, []).append(row)
+    fo, fv = o.get("formats", {}), v.get("formats", {})
+    fmissing, ffewer = [], []
+    for fmt, feats in sorted(fv.items()):
+        if not any(feats.values()):
+            continue
+        of = fo.get(fmt)
+        if not of or not any(of.values()):
+            fmissing.append(fmt)
+            continue
+        for tiling in ("optimal", "linear", "buffer"):
+            lack = [f for f in feats.get(tiling, []) if f not in of.get(tiling, [])]
+            if lack:
+                ffewer.append({"format": fmt, "tiling": tiling, "missing": lack})
+    return {"api": [o.get("api_version"), v.get("api_version")],
+            "features_missing": missing, "features_extra": extra,
+            "extensions_missing": sorted(set(v.get("extensions", {})) - set(o.get("extensions", {}))),
+            "extensions_extra": sorted(set(o.get("extensions", {})) - set(v.get("extensions", {}))),
+            "limits_worse": lw, "limits_better": lb, "limits_differ": ld,
+            "formats_missing": fmissing, "formats_fewer": ffewer}
+
+
+def _api_tuple(s):
+    return tuple(int(x) for x in re.findall(r"\d+", s or "")[:2]) if s else (0, 0)
+
+
+def _req_check(req):
+    kind, _, arg = req.partition(":")
+    if kind not in ("ext", "feat", "limit", "fmt", "api", "bit") or not arg:
+        raise ValueError("bad requirement %r" % req)
+    if kind == "limit" and not re.match(r"^\w+(>=|<=|==|>|<)-?[\d.]+$", arg):
+        raise ValueError("bad limit requirement %r" % req)
+    if kind == "fmt" and len(arg.split(":")) != 3:
+        raise ValueError("bad format requirement %r" % req)
+    if kind == "bit" and not re.match(r"^\w+:\w+$", arg):
+        raise ValueError("bad bit requirement %r" % req)
+    return kind, arg
+
+
+def _vk_value(vk, name):
+    """a limit or property by member name: VkPhysicalDeviceLimits, any properties struct, else the first graphics
+    queue family (timestampValidBits lives there)"""
+    if name in vk.get("limits", {}):
+        return vk["limits"][name]
+    for k, x in vk.get("properties", {}).items():
+        if k.rpartition(".")[2] == name:
+            return x
+    for qf in vk.get("queue_families", []):
+        p = qf.get("VkQueueFamilyProperties", qf)
+        if "VK_QUEUE_GRAPHICS_BIT" in p.get("queueFlags", []):
+            return p.get(name)
+    return None
+
+
+def req_eval(req, vk):
+    """one requirement against a normalized Vulkan view: ext:NAME | feat:member | limit:NAME>=N | api:1.3 |
+    fmt:VK_FORMAT_X:<optimal/linear/buffer>:VK_FORMAT_FEATURE_..._BIT | bit:member:FLAG_BIT (a flag list contains
+    the flag); "a|b" = either. True/False, None without a view."""
+    alts = [_req_check(a) for a in req.split("|")]
+    if not vk or "extensions" not in vk:
+        return None
+    return any(_req_one(kind, arg, vk) for kind, arg in alts)
+
+
+def _req_one(kind, arg, vk):
+    if kind == "ext":
+        return arg in vk["extensions"]
+    if kind == "feat":
+        return any(val is True for k, val in vk["features"].items() if k.rpartition(".")[2] == arg)
+    if kind == "api":
+        return _api_tuple(vk.get("api_version")) >= _api_tuple(arg)
+    if kind == "fmt":
+        fmt, tiling, flag = arg.split(":")
+        return flag in vk.get("formats", {}).get(fmt, {}).get(tiling, [])
+    if kind == "bit":
+        member, flag = arg.split(":")
+        val = _vk_value(vk, member)
+        return isinstance(val, list) and flag in val
+    m = re.match(r"^(\w+)(>=|<=|==|>|<)(-?[\d.]+)$", arg)
+    name, op, num = m.group(1), m.group(2), float(m.group(3))
+    val = _vk_value(vk, name)
+    if isinstance(val, list) and val and all(isinstance(x, str) and x.startswith("VK_SAMPLE_COUNT_") for x in val):
+        val = max(int(re.search(r"(\d+)", x).group(1)) for x in val)
+    if not isinstance(val, (int, float)) or isinstance(val, bool):
+        return False
+    return {">=": val >= num, "<=": val <= num, "==": val == num, ">": val > num, "<": val < num}[op]
+
+
+# ------------------------------------------------------------------------------------------------ knowledge
+# Every Mesa flag a gate of the open stack fails on, mapped through gallium's st (src/mesa/state_tracker/
+# st_extensions.c) and zink (src/gallium/drivers/zink/zink_screen.c) to what the Vulkan driver must report.
+# Line numbers are Mesa 26.1.8. class: limit = the Vulkan driver reports a number below the gate and the mechanism
+# exists (hours); project = a Vulkan feature/extension the pvr driver does not implement (size in `size`);
+# hardware = the vendor stack does not have it either; mesa = gated inside Mesa/zink, not by the Vulkan driver.
+# ddk_gles: what in the vendor's GLES proves the hardware can do it (gles_evidence: es:X.Y | glesext:NAME |
+# glesint:GL_MAX_...>=N). The mapping was traced through the 26.1.8 source on 2026-09-10.
+_XFB = ["ext:VK_EXT_transform_feedback", "feat:transformFeedback", "limit:maxTransformFeedbackBuffers>=1"]
+_UBO = ["limit:maxUniformBufferRange>=16384", "limit:maxPerStageDescriptorUniformBuffers>=13"]
+_FS_ATOMICS = ["feat:fragmentStoresAndAtomics", "limit:maxPerStageDescriptorStorageBuffers>=2"]
+_STORAGE_IMAGES = ["feat:shaderStorageImageExtendedFormats", "feat:shaderStorageImageWriteWithoutFormat",
+                   "limit:maxPerStageDescriptorStorageImages>=1"]
+_ES3_COMPAT = _UBO + ["limit:maxPerStageDescriptorSamplers>=16", "limit:maxPerStageDescriptorSampledImages>=16"] + [
+    "fmt:VK_FORMAT_%s:optimal:VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT" % f
+    for f in ("R8G8B8A8_UNORM", "R8G8B8A8_SRGB", "R16_UNORM", "R16G16_UNORM", "R16_SNORM", "R16G16_SNORM")]
+_COMPUTE = ["limit:maxComputeWorkGroupInvocations>=1024"] + _STORAGE_IMAGES + _FS_ATOMICS
+_ES31_COMPAT = _ES3_COMPAT + _COMPUTE + [
+    "fmt:VK_FORMAT_D24_UNORM_S8_UINT:optimal:VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT"
+    "|fmt:VK_FORMAT_D32_SFLOAT_S8_UINT:optimal:VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT",
+    "limit:framebufferNoAttachmentsSampleCounts>=4"]
+_RGB32_TBO = ["fmt:VK_FORMAT_R32G32B32_%s:buffer:VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT" % t
+              for t in ("SFLOAT", "UINT", "SINT")]
+_VOTE = ["api:1.2|ext:VK_EXT_shader_subgroup_vote",
+         "bit:subgroupSupportedOperations:VK_SUBGROUP_FEATURE_VOTE_BIT|bit:supportedOperations:VK_SUBGROUP_FEATURE_VOTE_BIT"
+         "|ext:VK_EXT_shader_subgroup_vote",
+         "bit:subgroupSupportedStages:VK_SHADER_STAGE_COMPUTE_BIT|bit:supportedStages:VK_SHADER_STAGE_COMPUTE_BIT"
+         "|ext:VK_EXT_shader_subgroup_vote"]
+
+GL_FLAG_NEEDS = {
+    "EXT_transform_feedback": {
+        "needs": _XFB, "class": "project", "ddk_gles": "es:3.0",
+        "size": "VK_EXT_transform_feedback: XFB buffer/counter binding, Begin/End with pause/resume, XFB SPIR-V "
+                "decorations, XFB queries; gates GL 3.0 and ES 3.0, and ARB_transform_feedback2/3/instanced and "
+                "ARB_enhanced_layouts come with it",
+        "source": "st_extensions.c:1128 EXT_CAP(EXT_transform_feedback, max_stream_output_buffers); zink_screen.c:952-954 "
+                  "= have_EXT_transform_feedback ? maxTransformFeedbackBuffers : 0; zink_device_info.py:175-179 "
+                  "(extension listed and transformFeedback true); absent from pvr_physical_device.c:125-206"},
+    "ARB_uniform_buffer_object": {
+        "needs": _UBO, "class": "limit", "ddk_gles": "es:3.0",
+        "size": "one reported limit, 12 -> 13 per stage; gates GL 3.1 and ES 3.0",
+        "source": "st_extensions.c:190-195 (MaxUniformBlockSize >= 16384), 263-267 (MaxUniformBlocks = "
+                  "max_const_buffers - 1, the default block), 323-327 (every stage >= 12), 448-449; zink_screen.c:609-615 "
+                  "max_const_buffers = MIN2(maxPerStageDescriptorUniformBuffers, 32); pvr_physical_device.c:582 = 12"},
+    "ARB_blend_func_extended": {
+        "needs": ["feat:dualSrcBlend", "limit:maxFragmentDualSrcAttachments>=1"], "class": "project",
+        "ddk_gles": "glesext:GL_EXT_blend_func_extended|glesint:GL_MAX_DUAL_SOURCE_DRAW_BUFFERS>=1",
+        "size": "dual-source blending (SRC1 blend factors, fragment output index 1); gates GL 3.3",
+        "source": "st_extensions.c:158-160, 1523-1525; zink_screen.c:876-878 = dualSrcBlend ? "
+                  "maxFragmentDualSrcAttachments : 0; pvr_physical_device.c:223 false"},
+    "ARB_timer_query": {
+        "needs": ["limit:timestampValidBits>=1"], "class": "project", "ddk_gles": "glesext:GL_EXT_disjoint_timer_query",
+        "size": "timestamp queries (vkCmdWriteTimestamp) and timestampValidBits > 0 on the graphics queue; gates GL 3.3",
+        "source": "st_extensions.c:1093 EXT_CAP(ARB_timer_query, query_timestamp); zink_screen.c:984 = "
+                  "timestamp_valid_bits > 0, 1859-1866 (first graphics queue family); pvr_physical_device.c:1206 = 0"},
+    "ARB_vertex_type_2_10_10_10_rev": {
+        "needs": ["fmt:VK_FORMAT_%s_PACK32:buffer:VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT" % f for f in (
+            "A2B10G10R10_UNORM", "A2R10G10B10_UNORM", "A2B10G10R10_SNORM", "A2R10G10B10_SNORM",
+            "A2B10G10R10_USCALED", "A2R10G10B10_USCALED", "A2B10G10R10_SSCALED", "A2R10G10B10_SSCALED")],
+        "class": "project", "ddk_gles": "es:3.0",
+        "size": "vertex fetch of the eight packed 2_10_10_10 formats (zink has no fallback for packed formats); "
+                "ES 3.0 proves the RGBA-order ones, the BGRA order is a fetch swizzle; gates GL 3.3",
+        "source": "st_extensions.c:1015-1023 vertex_mapping (all 8 required, 696-697), applied at 1194-1196; "
+                  "zink_screen.c:1444-1452 bufferFeatures & VERTEX_BUFFER_BIT; zink_format.c:12-13"},
+    "ARB_tessellation_shader": {
+        "needs": ["feat:tessellationShader", "ext:VK_KHR_maintenance2"], "class": "project",
+        "ddk_gles": "es:3.2|glesext:GL_EXT_tessellation_shader|glesext:GL_OES_tessellation_shader",
+        "size": "the TCS/TES stages and their limits (all 0 today); gates GL 4.0 and ES 3.2",
+        "source": "st_extensions.c:1354-1357; zink_screen.c:515-519 (tess caps 0 unless tessellationShader && "
+                  "KHR_maintenance2); pvr_physical_device.c:221 false"},
+    "ARB_texture_buffer_object_rgb32": {
+        "needs": _RGB32_TBO, "class": "project",
+        "ddk_gles": "es:3.2|glesext:GL_EXT_texture_buffer|glesext:GL_OES_texture_buffer",
+        "size": "96-bit three-component uniform texel buffers (SFLOAT/UINT/SINT); gates GL 4.0, OES_texture_buffer needs it",
+        "source": "st_extensions.c:1028-1034 tbo_rgb32 (all 3), 1573-1585; zink_screen.c:994, 1460-1462"},
+    "ARB_transform_feedback2": {
+        "needs": _XFB, "class": "project", "ddk_gles": "es:3.0",
+        "size": "nothing beyond VK_EXT_transform_feedback (pause/resume through its counter buffers); gates GL 4.0",
+        "source": "st_extensions.c:1094 EXT_CAP(ARB_transform_feedback2, stream_output_pause_resume); zink_screen.c:955-956"},
+    "ARB_transform_feedback3": {
+        "needs": _XFB, "class": "project", "ddk_gles": "es:3.0",
+        "size": "nothing beyond VK_EXT_transform_feedback; gates GL 4.0",
+        "source": "st_extensions.c:1095 EXT_CAP(ARB_transform_feedback3, stream_output_interleave_buffers); zink_screen.c:955-956"},
+    "ARB_transform_feedback_instanced": {
+        "needs": _XFB, "class": "project", "ddk_gles": "es:3.0",
+        "size": "nothing: ARB_transform_feedback2 + ARB_draw_instanced (always on under zink); gates GL 4.2",
+        "source": "st_extensions.c:1532-1535; zink_screen.c:955-956, 964"},
+    "ARB_viewport_array": {
+        "needs": ["feat:multiViewport", "limit:maxViewports>=16"], "class": "project",
+        "ddk_gles": "glesext:GL_OES_viewport_array|glesext:GL_NV_viewport_array|glesint:GL_MAX_VIEWPORTS>=16",
+        "size": "multiViewport: per-primitive viewport index, 16 viewports and scissors (1 today); gates GL 4.1",
+        "source": "st_extensions.c:1633-1646; zink_screen.c:1023-1024; pvr_physical_device.c:234 false, 652 = 1"},
+    "ARB_shader_atomic_counters": {
+        "needs": _FS_ATOMICS, "class": "project",
+        "ddk_gles": "glesint:GL_MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS>=1|glesint:GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS>=2",
+        "size": "fragment-stage SSBO stores and atomics (zink gives half the fragment SSBO slots to counters); "
+                "gates GL 4.2 and ES 3.2",
+        "source": "st_extensions.c:273-292, 518-521; zink_screen.c:645-659 (fragment SSBOs 0 without "
+                  "fragmentStoresAndAtomics); pvr_physical_device.c:242 false"},
+    "ARB_ES3_compatibility": {
+        "needs": _ES3_COMPAT, "class": "limit", "ddk_gles": "es:3.0",
+        "size": "ARB_uniform_buffer_object plus 16 samplers/sampled images (met) and six sampled formats for ETC2 "
+                "emulation; gates GL 4.3",
+        "source": "st_extensions.c:1663-1688; zink_screen.c:638-642, 1477-1479"},
+    "ARB_compute_shader": {
+        "needs": _COMPUTE, "class": "project", "ddk_gles": "glesint:GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS>=1024",
+        "size": "1024 compute invocations per workgroup (128 today; ES 3.1 needs only 128) and the "
+                "ARB_shader_atomic_counters work; gates GL 4.3",
+        "source": "st_extensions.c:1699-1712; zink_screen.c:697-699 max_threads_per_block = "
+                  "maxComputeWorkGroupInvocations, 667-672; pvr_physical_device.c:636 = 128"},
+    "ARB_fragment_layer_viewport": {
+        "needs": ["feat:multiViewport", "limit:maxViewports>=16"], "class": "project",
+        "ddk_gles": "glesext:GL_OES_viewport_array|glesint:GL_MAX_VIEWPORTS>=16",
+        "size": "comes with ARB_viewport_array (same st block); gates GL 4.3",
+        "source": "st_extensions.c:1633-1646 (1643); zink_screen.c:1023-1024"},
+    "ARB_robust_buffer_access_behavior": {
+        "needs": ["feat:robustBufferAccess", "feat:robustImageAccess2|feat:robustImageAccess"], "class": "project",
+        "ddk_gles": "glesext:GL_KHR_robust_buffer_access_behavior|glesext:GL_KHR_robustness|glesext:GL_EXT_robustness",
+        "size": "image robustness (robustImageAccess or robustImageAccess2; robustBufferAccess is already true); "
+                "gates GL 4.3, KHR_robustness copies it",
+        "source": "st_extensions.c:1065; zink_screen.c:843-846, 3067-3070; pvr_physical_device.c:216 true, 357 false"},
+    "ARB_shader_storage_buffer_object": {
+        "needs": ["feat:fragmentStoresAndAtomics", "limit:maxPerStageDescriptorStorageBuffers>=1"], "class": "project",
+        "ddk_gles": "glesint:GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS>=1",
+        "size": "fragment-stage SSBO stores and atomics; gates GL 4.3 and ES 3.2",
+        "source": "st_extensions.c:524-551, 284-291; zink_screen.c:645-659; pvr_physical_device.c:242 false"},
+    "ARB_enhanced_layouts": {
+        "needs": _XFB, "class": "project", "ddk_gles": "es:3.0",
+        "size": "nothing beyond VK_EXT_transform_feedback (MaxTransformFeedbackBuffers > 0); gates GL 4.4",
+        "source": "st_extensions.c:1261-1275, 419-422; zink_screen.c:802, 952-954"},
+    "ARB_vertex_type_10f_11f_11f_rev": {
+        "needs": ["fmt:VK_FORMAT_B10G11R11_UFLOAT_PACK32:buffer:VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT"],
+        "class": "project",
+        "size": "vertex fetch of packed 11/11/10 float (no ES equivalent to prove it); gates GL 4.4",
+        "source": "st_extensions.c:1024-1025, 1194-1196; zink_screen.c:1444-1452; zink_format.c:12-13"},
+    "ARB_ES3_1_compatibility": {
+        "needs": _ES31_COMPAT, "class": "project", "ddk_gles": "es:3.1",
+        "size": "no work of its own: ARB_ES3_compatibility + ARB_compute_shader + SSBO + stencil texturing + "
+                "framebuffer_no_attachments; gates GL 4.5 and, through its derivatives, ES 3.2",
+        "source": "st_extensions.c:1754-1770, 964-968, 1654-1658; zink_screen.c:1953-1967, 1309-1311"},
+    "ARB_indirect_parameters": {
+        "needs": ["ext:VK_KHR_draw_indirect_count"], "class": "project",
+        "size": "vkCmdDraw*IndirectCount + the extension string (zink ignores feats12.drawIndirectCount); gates GL 4.6",
+        "source": "st_extensions.c:1057; zink_screen.c:859; pvr_physical_device.c:283 drawIndirectCount false"},
+    "ARB_shader_atomic_counter_ops": {
+        "needs": _FS_ATOMICS, "class": "project",
+        "ddk_gles": "glesint:GL_MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS>=1|glesint:GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS>=2",
+        "size": "comes with ARB_shader_atomic_counters (same st block); gates GL 4.6",
+        "source": "st_extensions.c:518-521; zink_screen.c:645-659"},
+    "ARB_shader_group_vote": {
+        "needs": _VOTE, "class": "project", "ddk_gles": "glesext:GL_EXT_shader_group_vote",
+        "size": "VK_SUBGROUP_FEATURE_VOTE_BIT for compute (with subgroupSize 1 a vote returns its operand); gates GL 4.6",
+        "source": "st_extensions.c:1072; zink_screen.c:827-831; zink_device_info.py:557-567, 632-636; "
+                  "pvr_physical_device.c:717-719 (subgroupSize 1, BASIC only)"},
+    "KHR_blend_equation_advanced": {
+        "needs": ["ext:VK_KHR_dynamic_rendering_local_read"], "class": "project",
+        "ddk_gles": "es:3.2|glesext:GL_KHR_blend_equation_advanced",
+        "size": "VK_KHR_dynamic_rendering_local_read (colour attachments read as inputs in dynamic rendering); zink "
+                "then emulates advanced blending with framebuffer fetch; gates ES 3.2",
+        "source": "st_extensions.c:1619-1624; zink_screen.c:764-768 fbfetch = have_KHR_dynamic_rendering_local_read"},
+    "KHR_robustness": {
+        "needs": ["feat:robustBufferAccess", "feat:robustImageAccess2|feat:robustImageAccess"], "class": "project",
+        "ddk_gles": "es:3.2|glesext:GL_KHR_robustness|glesext:GL_EXT_robustness",
+        "size": "the ARB_robust_buffer_access_behavior work (copied); gates ES 3.2",
+        "source": "st_extensions.c:1747; zink_screen.c:843-846, 3067-3070"},
+    "OES_geometry_shader": {
+        "needs": ["feat:geometryShader", "limit:maxGeometryShaderInvocations>=32"], "class": "project",
+        "ddk_gles": "es:3.2|glesext:GL_EXT_geometry_shader|glesext:GL_OES_geometry_shader",
+        "size": "the geometry stage with >= 32 invocations; gates ES 3.2 (the desktop GL gates never test it)",
+        "source": "st_extensions.c:1359-1364, 401-402; zink_screen.c:521-523, 1114; pvr_physical_device.c:220 false"},
+    "OES_primitive_bounding_box": {
+        "needs": _ES31_COMPAT, "class": "project",
+        "ddk_gles": "es:3.2|glesext:GL_EXT_primitive_bounding_box|glesext:GL_OES_primitive_bounding_box",
+        "size": "no work of its own: follows ARB_ES3_1_compatibility because zink leaves the ESSL level at 0; "
+                "gates ES 3.2",
+        "source": "st_extensions.c:1782-1783, 1203-1204 (caps.essl_feature_level, never set by zink)"},
+    "OES_texture_buffer": {
+        "needs": _STORAGE_IMAGES + _RGB32_TBO, "class": "project",
+        "ddk_gles": "es:3.2|glesext:GL_EXT_texture_buffer|glesext:GL_OES_texture_buffer",
+        "size": "the RGB32 texel-buffer formats (ARB_texture_buffer_object_rgb32); compute storage images are met; "
+                "gates ES 3.2",
+        "source": "st_extensions.c:1587-1591, 1573-1580; zink_screen.c:994, 1004-1005, 667-672"},
+    "OES_texture_cube_map_array": {
+        "needs": _ES31_COMPAT + ["feat:geometryShader", "limit:maxGeometryShaderInvocations>=32", "feat:imageCubeArray"],
+        "class": "project",
+        "ddk_gles": "es:3.2|glesext:GL_EXT_texture_cube_map_array|glesext:GL_OES_texture_cube_map_array",
+        "size": "cube arrays already work (imageCubeArray true); Mesa ties the flag to OES_geometry_shader and "
+                "ARB_ES3_1_compatibility; gates ES 3.2",
+        "source": "st_extensions.c:1772-1775, 1085; zink_screen.c:992"},
+}
+
+# the gl_constants terms of the gates, keyed by the constant (each is compared against one threshold)
+CONST_NEEDS = {
+    "MaxTextureSize": {
+        "needs": ["limit:maxImageDimension1D>=16384", "limit:maxImageDimension2D>=16384"], "class": "limit",
+        "ddk_gles": "glesint:GL_MAX_TEXTURE_SIZE>=16384", "size": "texture size 16384 (4096 today); gates GL 4.1",
+        "source": "st_extensions.c:124-125; zink_screen.c:935-937 MIN3(maxImageDimension1D, 2D, 16384); "
+                  "pvr_physical_device.c:567-568"},
+    "MaxRenderbufferSize": {
+        "needs": ["limit:maxImageDimension1D>=16384", "limit:maxImageDimension2D>=16384"], "class": "limit",
+        "ddk_gles": "glesint:GL_MAX_RENDERBUFFER_SIZE>=16384", "size": "follows MaxTextureSize; gates GL 4.1",
+        "source": "st_extensions.c:136, 145-147; zink_screen.c:935-937"},
+    "MaxCubeTextureLevels": {
+        "needs": ["limit:maxImageDimensionCube>=16384"], "class": "limit",
+        "ddk_gles": "glesint:GL_MAX_CUBE_MAP_TEXTURE_SIZE>=16384", "size": "cube maps 16384; gates GL 4.1",
+        "source": "st_extensions.c:132-134; zink_screen.c:940-941; pvr_physical_device.c:570"},
+    "Max3DTextureLevels": {
+        "needs": ["limit:maxImageDimension3D>=2048"], "class": "limit",
+        "ddk_gles": "glesint:GL_MAX_3D_TEXTURE_SIZE>=2048", "size": "3D textures 2048 (256 today); gates GL 4.1",
+        "source": "st_extensions.c:127-129; zink_screen.c:938-939; pvr_physical_device.c:569"},
+    "MaxArrayTextureLayers": {
+        "needs": ["limit:maxImageArrayLayers>=2048"], "class": "limit",
+        "ddk_gles": "glesint:GL_MAX_ARRAY_TEXTURE_LAYERS>=2048", "size": "2048 array layers (256 today); gates GL 4.1",
+        "source": "st_extensions.c:138-139; zink_screen.c:958; pvr_physical_device.c:571"},
+    "Program[MESA_SHADER_VERTEX].MaxUniformBlocks": {
+        "needs": ["limit:maxPerStageDescriptorUniformBuffers>=15"], "class": "limit",
+        "ddk_gles": "glesint:GL_MAX_VERTEX_UNIFORM_BLOCKS>=14", "size": "14 vertex uniform blocks; gates GL 4.3",
+        "source": "st_extensions.c:263-267; zink_screen.c:613-615"},
+}
+
+def _vk_items():
+    """every Vulkan requirement the gates depend on: its declared class (limit = the driver reports a number below
+    the gate and the mechanism exists; project = something to implement, even when it reads like a limit, e.g.
+    timestampValidBits) and the GLES fact that proves the hardware has it, for this item alone (second reviewer
+    pass: a flag-level "ES 3.2" proved items ES never requires). None = nothing in GLES proves it."""
+    it = {}
+
+    def put(reqs, cls, gles):
+        for r in reqs:
+            it[r] = {"class": cls, "gles": gles}
+
+    vfmt = "fmt:VK_FORMAT_%s_PACK32:buffer:VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT"
+    put(_XFB, "project", "es:3.0")                                   # transform feedback is core ES 3.0
+    put(["limit:maxUniformBufferRange>=16384"], "limit", "es:3.0|glesint:GL_MAX_UNIFORM_BLOCK_SIZE>=16384")
+    put(["limit:maxPerStageDescriptorUniformBuffers>=13"], "limit", "es:3.0|glesint:GL_MAX_VERTEX_UNIFORM_BLOCKS>=12")
+    put(["limit:maxPerStageDescriptorUniformBuffers>=15"], "limit", "glesint:GL_MAX_VERTEX_UNIFORM_BLOCKS>=14")
+    put(["feat:fragmentStoresAndAtomics"], "project", "glesint:GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS>=1")
+    put(["limit:maxPerStageDescriptorStorageBuffers>=1"], "limit", "glesint:GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS>=1")
+    put(["limit:maxPerStageDescriptorStorageBuffers>=2"], "limit", "glesint:GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS>=2")
+    put(["feat:shaderStorageImageExtendedFormats", "feat:shaderStorageImageWriteWithoutFormat"], "project", None)
+    put(["limit:maxPerStageDescriptorStorageImages>=1"], "limit", "es:3.1")
+    put(["limit:maxPerStageDescriptorSamplers>=16", "limit:maxPerStageDescriptorSampledImages>=16"], "limit",
+        "es:3.0|glesint:GL_MAX_TEXTURE_IMAGE_UNITS>=16")
+    put(["fmt:VK_FORMAT_%s:optimal:VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT" % f for f in ("R8G8B8A8_UNORM", "R8G8B8A8_SRGB")],
+        "project", "es:3.0")
+    put(["fmt:VK_FORMAT_%s:optimal:VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT" % f
+         for f in ("R16_UNORM", "R16G16_UNORM", "R16_SNORM", "R16G16_SNORM")], "project", "glesext:GL_EXT_texture_norm16")
+    put(["limit:maxComputeWorkGroupInvocations>=1024"], "project", "glesint:GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS>=1024")
+    put([_ES31_COMPAT[-2]], "project", "es:3.0")                     # sampled depth/stencil texture
+    put(["limit:framebufferNoAttachmentsSampleCounts>=4"], "limit", "es:3.1|glesint:GL_MAX_FRAMEBUFFER_SAMPLES>=4")
+    put(_RGB32_TBO, "project", "es:3.2|glesext:GL_EXT_texture_buffer|glesext:GL_OES_texture_buffer")
+    put(_VOTE[:1], "project", None)
+    put(_VOTE[1:], "project", "glesext:GL_EXT_shader_group_vote")
+    put(["feat:dualSrcBlend"], "project", "glesext:GL_EXT_blend_func_extended")
+    put(["limit:maxFragmentDualSrcAttachments>=1"], "project", "glesint:GL_MAX_DUAL_SOURCE_DRAW_BUFFERS>=1")
+    # a timer-query extension may count 0 bits: only the counter bits prove timestamps
+    put(["limit:timestampValidBits>=1"], "project", "glesint:GL_QUERY_COUNTER_BITS_TIMESTAMP>=1")
+    # ES 3.0 has the 2_10_10_10 vertex types in RGBA order (normalized and not); no GLES has the BGRA order
+    put([vfmt % ("A2B10G10R10_" + t) for t in ("UNORM", "SNORM", "USCALED", "SSCALED")], "project", "es:3.0")
+    put([vfmt % ("A2R10G10B10_" + t) for t in ("UNORM", "SNORM", "USCALED", "SSCALED")], "project", None)
+    put(["fmt:VK_FORMAT_B10G11R11_UFLOAT_PACK32:buffer:VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT"], "project", None)
+    put(["feat:tessellationShader"], "project",
+        "es:3.2|glesext:GL_EXT_tessellation_shader|glesext:GL_OES_tessellation_shader")
+    put(["ext:VK_KHR_maintenance2"], "project", None)
+    put(["feat:multiViewport", "limit:maxViewports>=16"], "project", "glesint:GL_MAX_VIEWPORTS>=16")
+    put(["feat:robustBufferAccess"], "project", "glesext:GL_KHR_robust_buffer_access_behavior")
+    put(["feat:robustImageAccess2|feat:robustImageAccess"], "project", None)    # GLES robustness says nothing on images
+    put(["ext:VK_KHR_draw_indirect_count"], "project", None)
+    put(["ext:VK_KHR_dynamic_rendering_local_read"], "project",
+        "glesext:GL_EXT_shader_framebuffer_fetch|glesext:GL_EXT_shader_framebuffer_fetch_non_coherent")
+    put(["feat:geometryShader"], "project", "es:3.2|glesext:GL_EXT_geometry_shader|glesext:GL_OES_geometry_shader")
+    put(["limit:maxGeometryShaderInvocations>=32"], "project", "glesint:GL_MAX_GEOMETRY_SHADER_INVOCATIONS>=32")
+    put(["feat:imageCubeArray"], "project", "es:3.2|glesext:GL_EXT_texture_cube_map_array")
+    put(["limit:maxImageDimension1D>=16384", "limit:maxImageDimension2D>=16384"], "limit",
+        "glesint:GL_MAX_TEXTURE_SIZE>=16384")
+    put(["limit:maxImageDimensionCube>=16384"], "limit", "glesint:GL_MAX_CUBE_MAP_TEXTURE_SIZE>=16384")
+    put(["limit:maxImageDimension3D>=2048"], "limit", "glesint:GL_MAX_3D_TEXTURE_SIZE>=2048")
+    put(["limit:maxImageArrayLayers>=2048"], "limit", "glesint:GL_MAX_ARRAY_TEXTURE_LAYERS>=2048")
+    return it
+
+
+VK_ITEMS = _vk_items()
+
+# what we know about an item beyond its class (shown in the ranked list)
+VK_ITEM_NOTES = {
+    "limit:maxPerStageDescriptorUniformBuffers>=13":
+        "one reported number (pvr_physical_device.c:582); upstream Mesa cece4db940 (2026-07-31, Imagination) made "
+        "exactly this change; 26.1.8's descriptor code has no per-stage uniform-buffer array",
+    "ext:VK_EXT_transform_feedback":
+        "no pvr code upstream and no merge request (2026-09-10); Rogue has no transform-feedback stage in the open "
+        "driver, so the route is software: Mesa's common src/poly (AGX's geometry/tessellation emulation made "
+        "common by Collabora, 2025-10) is what Asahi's hk uses to expose transform feedback, geometry and "
+        "tessellation on hardware without them; it needs compute and vertex-pipeline buffer writes "
+        "(vertexPipelineStoresAndAtomics is false in the open driver today)",
+}
+
+# What applications and toolkits need. "needs" lists alternatives (any one is enough); inside one alternative "+"
+# joins terms that must all hold: gl:X.Y (compat or core), glcore:X.Y, es:X.Y, glext:MESA_FLAG, vk:X.Y (device API),
+# vkfeat:member, vkext:NAME. Sources: read in the application's code at the version named (research 2026-09-10) or
+# measured on this board.
+APPS = [
+    {"name": "KWin 6.7 compositor (Plasma)", "needs": ["gl:2.0", "es:2.0"],
+     "source": "measured: supportInformation on the open stack = OpenGL 2.1, GLSL 1.20, 'OpenGL 2 Shaders are used'; "
+               "KDE/kwin v6.7.0 src/opengl/eglcontext.cpp", "fallback": "QPainter (software)"},
+    {"name": "Qt 6 Quick / QRhi (plasmashell, KDE apps)", "needs": ["gl:2.1", "es:2.0", "vk:1.0"],
+     "source": "qt/qtbase dev src/gui/rhi/qrhi.cpp + qrhigles2.cpp (instancing, UBOs, float/RGB10 textures only with "
+               "GL 3.0+/ES 3.0+)", "fallback": "none ('Failed to initialize graphics backend')"},
+    {"name": "GTK 4.22 Vulkan renderer (first choice on Wayland)",
+     "needs": ["vk:1.0+vkext:VK_KHR_swapchain+vkext:VK_EXT_image_drm_format_modifier+vkext:VK_EXT_external_memory_dma_buf"],
+     "source": "GNOME/gtk 4.22.4 gdk/gdkvulkancontext.c, gsk/gskrenderer.c (dmabuf import to be picked first; "
+               "swapchain-only Vulkan is a later fallback)", "fallback": "GL renderer, Vulkan without dmabuf, Cairo"},
+    {"name": "GTK 4.22 GL renderer", "needs": ["gl:3.3", "es:3.0"],
+     "source": "GNOME/gtk 4.22.4 gdk/gdkglversionprivate.h, gsk/gpu/gskgldevice.c ('GLES 2 is not supported')",
+     "fallback": "the next renderer"},
+    {"name": "Firefox 155 WebRender on the GPU", "needs": ["gl:3.0", "es:3.0"],
+     "source": "mozilla-firefox widget/gtk/GfxInfo.cpp (FEATURE_FAILURE_OPENGL_LESS_THAN_3), gfx/thebes/gfxPlatform.cpp",
+     "fallback": "software WebRender"},
+    {"name": "WebGL 2 (Firefox; Chromium via ANGLE on GLES)", "needs": ["es:3.0"],
+     "source": "mozilla-firefox dom/canvas/WebGL2Context.cpp; google/angle renderer/gl/renderergl_utils.cpp",
+     "fallback": "WebGL 1 only"},
+    {"name": "Chromium / Electron, ANGLE on desktop GL", "needs": ["gl:3.2"],
+     "source": "google/angle renderer/gl/renderergl_utils.cpp ('Desktop GL below 3.2 is not supported')",
+     "fallback": "no WebGL (SwiftShader fallback off by default), software compositing"},
+    {"name": "Chromium, ANGLE on Vulkan: ES 3.0 / WebGL 2",
+     "needs": ["vk:1.1+vkext:VK_EXT_transform_feedback+vkext:VK_EXT_provoking_vertex",
+               "vk:1.1+vkfeat:vertexPipelineStoresAndAtomics+vkext:VK_EXT_provoking_vertex"],
+     "source": "google/angle renderer/vulkan/vk_renderer.cpp (transform feedback: the extension or vertex-stage "
+               "stores; also >= 12 UBOs per stage)", "fallback": "ES 2.0 / WebGL 1"},
+    {"name": "mpv vo=gpu-next (libplacebo)",
+     "needs": ["gl:3.0", "es:3.0", "vk:1.2+vkfeat:hostQueryReset+vkfeat:timelineSemaphore"],
+     "source": "haasn/libplacebo v7.360.1 src/opengl/context.c (GL/GLES >= 3), src/vulkan/context.c (Vulkan 1.2 + "
+               "hostQueryReset + timelineSemaphore)", "fallback": "vo=gpu"},
+    {"name": "mpv vo=gpu, display of hardware-decoded frames", "needs": ["gl:2.1", "es:2.0"],
+     "source": "mpv-player/mpv video/out/opengl/common.c, video/out/hwdec/dmabuf_interop_gl.c (EGL dma-buf import + "
+               "GL_OES_EGL_image)", "fallback": "no GPU display of decoded frames"},
+    {"name": "Kodi (GLES build)", "needs": ["es:2.0"],
+     "source": "xbmc/xbmc windowing/wayland/WinSystemWaylandEGLContextGLES.cpp", "fallback": "exits"},
+    {"name": "SuperTuxKart 1.5 modern renderer",
+     "needs": ["gl:3.1+glext:ARB_instanced_arrays+glext:ARB_vertex_type_2_10_10_10_rev+glext:ARB_explicit_attrib_location",
+               "es:3.0"],
+     "source": "measured: 'Using the fixed pipeline' at GL 2.1 / ES 2.0 (docs/SPEED-2026-09-10.md); "
+               "supertuxkart/stk-code 1.5 src/graphics/central_settings.cpp", "fallback": "fixed-function pipeline"},
+    {"name": "Godot 4 Compatibility renderer", "needs": ["gl:3.3", "es:3.0"],
+     "source": "godotengine/godot-docs about/system_requirements.rst", "fallback": "alert, exit"},
+    {"name": "Godot 4 Forward+ / Mobile (Vulkan)", "needs": ["vk:1.0+vkfeat:imageCubeArray+vkfeat:independentBlend"],
+     "source": "godotengine/godot drivers/vulkan/rendering_device_driver_vulkan.cpp", "fallback": "Compatibility renderer"},
+    {"name": "SDL3 2D renderer", "needs": ["es:2.0", "gl:2.1"],
+     "source": "libsdl-org/SDL src/render/SDL_render.c (GLES2 backend)", "fallback": "the next backend"},
+    {"name": "SDL3 GPU API (Vulkan)",
+     "needs": ["vk:1.0+vkfeat:independentBlend+vkfeat:imageCubeArray+vkfeat:sampleRateShading"],
+     "source": "libsdl-org/SDL src/gpu/vulkan/SDL_gpu_vulkan.c", "fallback": "none"},
+    {"name": "Luanti opengl3 driver (default; ogles2 needs ES 2.0)", "needs": ["gl:3.2"],
+     "source": "luanti-org/luanti irr/src/OpenGL3/DriverGL3.cpp", "fallback": "video_driver=ogles2 by hand"},
+    {"name": "RetroArch glcore driver", "needs": ["glcore:3.2", "es:3.0"],
+     "source": "libretro/RetroArch gfx/drivers/gl3.c", "fallback": "gl (GLES2) or vulkan driver"},
+    {"name": "Xonotic 0.8.6 (DarkPlaces)", "needs": ["gl:2.0"],
+     "source": "xonotic/darkplaces xonotic-v0.8.6 vid_shared.c", "fallback": "-"},
+    {"name": "Blender (GL backend)", "needs": ["gl:4.3"],
+     "source": "blender/blender source/blender/gpu/opengl/gl_backend.cc", "fallback": "'Platform Unsupported'"},
+    {"name": "Blender (Vulkan backend)",
+     "needs": ["vk:1.1+vkfeat:geometryShader+vkfeat:multiViewport+vkfeat:fragmentStoresAndAtomics+vkfeat:dualSrcBlend"
+               "+vkfeat:imageCubeArray+vkfeat:drawIndirectFirstInstance+vkfeat:dynamicRendering+vkfeat:timelineSemaphore"
+               "+vkfeat:bufferDeviceAddress"],
+     "source": "blender/blender source/blender/gpu/vulkan/vk_backend.cc", "fallback": "'Platform Unsupported'"},
+    {"name": "DXVK 3.x (Direct3D 9-11 through FEX/box64)",
+     "needs": ["vk:1.3+vkfeat:geometryShader+vkfeat:textureCompressionBC+vkfeat:shaderInt16+vkfeat:shaderInt64"
+               "+vkfeat:fragmentStoresAndAtomics+vkfeat:robustBufferAccess2+vkfeat:nullDescriptor+vkfeat:depthClipEnable"
+               "+vkfeat:dualSrcBlend+vkfeat:multiViewport+vkfeat:sampleRateShading+vkfeat:imageCubeArray"],
+     "source": "doitsujin/dxvk src/dxvk/dxvk_device_info.cpp (hard requirements; transform feedback optional but "
+               "D3D10/11 stream output fails without it)", "fallback": "no device"},
+    {"name": "VKD3D-Proton (Direct3D 12)",
+     "needs": ["vk:1.3+vkfeat:descriptorBindingSampledImageUpdateAfterBind+vkfeat:shaderDrawParameters+vkfeat:nullDescriptor"],
+     "source": "HansKristian-Work/vkd3d-proton README.md (Vulkan 1.3, full descriptor indexing, robustness2, "
+               "push descriptors)", "fallback": "no device"},
+]
+
+_NEED_KINDS = {"gl": "ver", "glcore": "ver", "es": "ver", "vk": "ver", "vkfeat": "id", "vkext": "id", "glext": "id"}
+
+
+def parse_need(alt):
+    """one alternative of an APPS entry -> [(kind, arg)] terms that must all hold"""
+    terms = []
+    for t in alt.split("+"):
+        kind, _, arg = t.strip().partition(":")
+        rx = {"ver": r"^\d+\.\d+$", "id": r"^\w+$"}.get(_NEED_KINDS.get(kind))
+        if not rx or not re.match(rx, arg):
+            raise ValueError("bad need %r" % alt)
+        terms.append((kind, arg))
+    return terms
+
+
+def app_meets(needs, versions, vk, flags=None, fixed=()):
+    """True when any alternative of `needs` holds for a stack with these GL versions, this Vulkan view and these
+    Mesa flags (glext terms; None = unknown = not met). `fixed`: Vulkan requirement strings to treat as met (the
+    simulation of a fix)"""
+    def ok(kind, arg):
+        if kind in ("gl", "glcore", "es"):
+            want = gl_version_number(arg)
+            have = {"gl": max(versions.get("compat") or 0, versions.get("core") or 0),
+                    "glcore": versions.get("core") or 0, "es": versions.get("es") or 0}[kind]
+            return have >= want
+        if kind == "vk":
+            return bool(vk) and "api_version" in vk and _api_tuple(vk.get("api_version")) >= _api_tuple(arg)
+        if kind == "vkfeat":
+            return "feat:" + arg in fixed or req_eval("feat:" + arg, vk) is True
+        if kind == "vkext":
+            return "ext:" + arg in fixed or req_eval("ext:" + arg, vk) is True
+        return bool(flags) and _val(flags.get(arg)) is True
+    return any(all(ok(k, a) for k, a in parse_need(alt)) for alt in needs)
+
+
+def gles_evidence(spec, versions, exts, ints=None):
+    """does the vendor's GLES prove a feature: es:X.Y (its GLES version), glesext:NAME (in its extension list) or
+    glesint:GL_MAX_...>=N (a glGetIntegerv limit of its ES context); "a|b" = either. None without a spec, and None
+    when the data an alternative needs was not recorded (no ES version, no limits, the enum not probed) and no
+    other alternative proves it: missing data is unknown, never absent"""
+    if not spec:
+        return None
+    found, unknown = False, False
+    for alt in spec.split("|"):
+        kind, _, arg = alt.partition(":")
+        if kind == "es":
+            if versions.get("es") is None:
+                unknown = True
+            else:
+                found = found or versions["es"] >= gl_version_number(arg)
+        elif kind == "glesext":
+            if exts is None:
+                unknown = True
+            else:
+                found = found or arg in set(exts)
+        elif kind == "glesint":
+            m = re.match(r"^(GL_\w+)>=(\d+)$", arg)
+            if not m:
+                raise ValueError("bad GLES evidence %r" % spec)
+            if ints is None or m.group(1) not in ints:
+                unknown = True
+            else:
+                v = ints[m.group(1)]
+                found = found or (bool(v) and v[0] >= int(m.group(2)))
+        else:
+            raise ValueError("bad GLES evidence %r" % spec)
+    if found:
+        return True
+    return None if unknown else False
+
+
+CLASS_COST = {"limit": 1, "project": 10, "unknown": 50, "unmapped": 100, "hardware": 1000}
+
+
+def _const_term(t):
+    m = re.match(r"^consts->(\S+) (>=|<=|==|!=|>|<) (\d+)$", t)
+    return (m.group(1), int(m.group(3))) if m else None
+
+
+def _versions_of(reached):
+    return {"compat": gl_version_number(reached.get("gl_compat")), "core": gl_version_number(reached.get("gl_core")),
+            "es": gl_version_number(reached.get("es"))}
+
+
+def rank_actions(gates, flags, consts, ovk, vvk, vendor_versions, vendor_exts, vendor_ints=None, needs=None,
+                 const_needs=None, apps=None, items=None):
+    """the ranked, actionable list: Vulkan-level items grouped into milestones (version steps), each milestone the
+    step with the most applications unlocked per unit of cost that is not reached yet, its new items cheapest
+    first, every item with its vendor evidence, its class and the versions reached once it (and everything
+    before it) is fixed"""
+    needs = GL_FLAG_NEEDS if needs is None else needs
+    const_needs = CONST_NEEDS if const_needs is None else const_needs
+    apps = APPS if apps is None else apps
+    flags0 = {k: _val(v) for k, v in flags.items()}
+    consts0 = {k: _val(v) for k, v in consts.items()}
+    base = evaluate_gates(gates, flags0, consts0)
+    terms = {}
+    for key in ("es", "gl_compat", "gl_core"):
+        for row in base[key]:
+            for t in row["fails"] + row["unknown"]:
+                k = _flag_of(t) or t
+                if k not in terms:
+                    c = _const_term(t)
+                    terms[k] = {"text": t, "const": c, "knowledge": const_needs.get(c[0]) if c else needs.get(k)}
+    users = {}
+    for k, t in terms.items():
+        for r in (t["knowledge"] or {}).get("needs", []):
+            users.setdefault(r, []).append(k)
+
+    def satisfied(req, fixed):
+        return req in fixed or req_eval(req, ovk) is True
+
+    def simulate(fixed):
+        f, c = dict(flags0), dict(consts0)
+        for k, t in terms.items():
+            if t["knowledge"] and all(satisfied(r, fixed) for r in t["knowledge"]["needs"]):
+                if t["const"]:
+                    c[t["const"][0]] = t["const"][1]
+                else:
+                    f[k] = True
+        return evaluate_gates(gates, f, c), f
+
+    def items_for(k, fixed):
+        know = terms[k]["knowledge"]
+        if not know:
+            return ["unmapped:" + terms[k]["text"]]
+        return [r for r in know["needs"] if not satisfied(r, fixed)]
+
+    cls_cache = {}
+
+    def classify(req):
+        if req in cls_cache:
+            return cls_cache[req]
+        if req.startswith("unmapped:"):
+            res = {"class": "unmapped", "vendor_vulkan": None, "vendor_gles": []}
+        else:
+            # the item's own declared class and its own GLES proof (second reviewer pass: not the GL flag's)
+            vv = req_eval(req, vvk)
+            table = VK_ITEMS if items is None else items
+            item = table.get(req) or {"class": "limit" if {a.partition(":")[0] for a in req.split("|")} == {"limit"}
+                                      else "project", "gles": None}
+            spec = item.get("gles")
+            g = gles_evidence(spec, vendor_versions, vendor_exts, vendor_ints)
+            if vv is True or g:
+                cls = item["class"]
+            elif spec and g is None:
+                cls = "unknown"               # the vendor's GLES data is missing: never call that absent
+            elif g is False or vv is False:
+                cls = "hardware"
+            else:
+                cls = "unknown"
+            res = {"class": cls, "vendor_vulkan": vv, "vendor_gles": [spec] if g else []}
+        cls_cache[req] = res
+        return res
+
+    def needed_for(key, step, fixed):
+        out = []
+        for r in base[key]:
+            if gl_version_number(r["step"]) > gl_version_number(step):
+                break
+            if r["value"] is True:
+                continue
+            for t in r["fails"] + r["unknown"]:
+                for it in items_for(_flag_of(t) or t, fixed):
+                    if it not in out:
+                        out.append(it)
+        return out
+
+    def gained_apps(sim, fixed, before):
+        ev, f = sim
+        vers = _versions_of(ev["reached"])
+        return [a["name"] for a in apps if a["name"] not in before and app_meets(a["needs"], vers, ovk, f, fixed)]
+
+    fixed = []
+    met = {a["name"] for a in apps if app_meets(a["needs"], _versions_of(base["reached"]), ovk, flags0)}
+    remaining = [(key, row["step"]) for key in ("es", "gl_compat") for row in base[key] if row["value"] is not True]
+    milestones = []
+    while remaining:
+        best = None
+        # only the lowest missing step of each API is a candidate: the list advances one version at a time and
+        # never lumps several steps into one milestone because a later one unlocks an application
+        cands = []
+        for k2 in ("es", "gl_compat"):
+            ks = [s2 for k3, s2 in remaining if k3 == k2]
+            if ks:
+                cands.append((k2, min(ks, key=gl_version_number)))
+        for key, step in cands:
+            need = needed_for(key, step, set(fixed))
+            cost = sum(CLASS_COST[classify(r)["class"]] for r in need)
+            gained = gained_apps(simulate(set(fixed) | set(need)), set(fixed) | set(need), met)
+            score = (-len(gained) / max(cost, 1), cost, gl_version_number(step), key != "es")
+            if best is None or score < best[0]:
+                best = (score, key, step, need, gained)
+        _, key, step, need, gained = best
+        mitems = []                           # not "items": that is the item table classify() reads
+        for r in sorted(need, key=lambda r: (CLASS_COST[classify(r)["class"]], r)):
+            fixed.append(r)
+            mitems.append(dict(classify(r), req=r, reached_after=simulate(set(fixed))[0]["reached"],
+                               terms=users.get(r) or [r[len("unmapped:"):]]))
+        now, _f = simulate(set(fixed))
+        done = {k2: {x["step"]: x["value"] for x in now[k2]} for k2 in ("es", "gl_compat")}
+        milestones.append({"step": _step_label(key, step), "key": key, "version": step, "items": mitems,
+                           "reached": now["reached"], "unlocks": gained, "complete": done[key][step] is True})
+        met |= set(gained)
+        remaining = [(k2, s2) for k2, s2 in remaining if done[k2][s2] is not True and (k2, s2) != (key, step)]
+    return {"milestones": milestones, "base_reached": base["reached"], "terms": terms}
+
+
+# the GPU clock/voltage envelope as validated so far (docs/GPU-TQ-FAULT-2026-09-07.md, docs/SPEED-2026-09-10.md)
+CLOCK_ENVELOPE = [
+    ("600 MHz @ 800 mV", "validated", "clock-ceiling matrix (16 cases, 0 HWR), 2026-09-07"),
+    ("1008 MHz @ 800 mV", "validated", "matrix 0 HWR on the DDK; the open stack's pinned clock since 2026-09-09 "
+                                       "(15-min soak, 0 resets / 0 timeouts)"),
+    ("1200 MHz @ 800 mV", "FAILS", "deterministic, computed-looking GPU faults (the 09-07 'DDK bug' was this)"),
+    ("1200 MHz @ 920 mV", "untested", "Item D; clock-ceiling.sh on the DDK boot first"),
+]
+
+
+# ------------------------------------------------------------------------------------------------ collection
+def session_env(run=run_cmd, read=read_file, listdir=listdir):
+    """the environment of the logged-in desktop, from the session KWin's own command line (--socket,
+    --xwayland-display, --xwayland-xauthority: /proc/<pid>/cmdline is readable even with KWin's capabilities);
+    None when only the greeter runs. Never guesses between several xauth files: a stale one from an earlier
+    login would lose every X11 client"""
+    rc, out, _ = run(["pgrep", "-x", "kwin_wayland"])
+    for pid in out.split():
+        st = read("/proc/%s/status" % pid) or ""
+        m = re.search(r"^Uid:\s+(\d+)", st, re.M)
+        if not m or int(m.group(1)) < 1000:
+            continue
+        rt = "/run/user/%s" % m.group(1)
+        argv = (read("/proc/%s/cmdline" % pid) or "").split("\0")
+        arg = {a: argv[i + 1] for i, a in enumerate(argv[:-1])
+               if a in ("--socket", "--xwayland-display", "--xwayland-xauthority")}
+        env = {"XDG_RUNTIME_DIR": rt, "WAYLAND_DISPLAY": arg.get("--socket", "wayland-0"),
+               "DISPLAY": arg.get("--xwayland-display", ":0")}
+        xa = [f for f in listdir(rt) if f.startswith("xauth_")]
+        if "--xwayland-xauthority" in arg:
+            env["XAUTHORITY"] = arg["--xwayland-xauthority"]
+        elif len(xa) == 1:
+            env["XAUTHORITY"] = "%s/%s" % (rt, xa[0])
+        return env
+    return None
+
+
+def _vulkan_gpu_index(summary):
+    gpus, cur = [], None
+    for line in summary.splitlines():
+        m = re.match(r"^GPU(\d+):", line.strip())
+        if m:
+            cur = {"index": int(m.group(1))}
+            gpus.append(cur)
+        elif cur is not None and "deviceType" in line:
+            cur["type"] = line.split("=")[-1].strip()
+    for g in gpus:
+        if "CPU" not in g.get("type", ""):
+            return g["index"]
+    return gpus[0]["index"] if gpus else 0
+
+
+def _tail(s, n=800):
+    return (s or "").strip()[-n:]
+
+
+def collect_view(name, env, run=run_cmd, session=None, tmp=None, override_probe=True, expect_renderer=None):
+    """capabilities of one view: vulkaninfo, eglinfo, glxinfo -l, the EGL probe (and its override pass), plus the
+    stderr tail of each. expect_renderer: a string the view's GL renderer must contain (zink for zink-on-ddk);
+    when no renderer does, the view is marked as a fallback (Mesa falls back to llvmpipe silently, exit 0) and
+    the report ignores its numbers"""
+    v = {"view": name, "env": dict(env), "stderr": {}}
+    senv = dict(session or {})
+    tmpdir = tmp or tempfile.mkdtemp(prefix="a7a-gpu-gap-")
+    rc, out, err = run(["vulkaninfo", "--summary"], env=env, timeout=60)
+    idx = _vulkan_gpu_index(out)
+    v["vulkan_gpu"] = idx
+    for f in os.listdir(tmpdir):
+        if f.startswith("VP_VULKANINFO"):
+            os.unlink(os.path.join(tmpdir, f))
+    rc, out, err = run(["vulkaninfo", "--json=%d" % idx], env=env, cwd=tmpdir, timeout=120)
+    files = sorted(f for f in os.listdir(tmpdir) if f.startswith("VP_VULKANINFO") and f.endswith(".json"))
+    if files:
+        v["vulkan_file"] = files[0]
+        try:
+            with open(os.path.join(tmpdir, files[0])) as f:
+                v["vulkan"] = normalize_vulkan(json.load(f))
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
+            v["vulkan"] = {"error": "unreadable %s: %s: %s" % (files[0], type(e).__name__, e)}
+    else:
+        v["vulkan"] = {"error": "vulkaninfo --json=%d rc=%d: %s" % (idx, rc, (err or out).strip()[-400:])}
+    v["stderr"]["vulkaninfo"] = _tail(err)
+    rc, out, err = run(["eglinfo"], env=dict(env, **senv), timeout=120)
+    v["eglinfo"] = parse_eglinfo(out)
+    v["eglinfo"]["rc"] = rc
+    v["stderr"]["eglinfo"] = _tail(err)
+    if session and session.get("DISPLAY"):
+        rc, out, err = run(["glxinfo", "-l"], env=dict(env, **senv), timeout=60)
+        v["glxinfo"] = parse_glxinfo(out) if rc == 0 else {"error": "glxinfo rc=%d: %s" % (rc, err.strip()[-300:])}
+        v["stderr"]["glxinfo"] = _tail(err)
+    else:
+        v["glxinfo"] = {"error": "no X session (glxinfo needs the DISPLAY/XAUTHORITY of a logged-in desktop)"}
+    v["probe"] = {}
+    passes = [("normal", {})] + ([("override", OVERRIDE_ENV)] if override_probe else [])
+    for label, extra in passes:
+        rc, out, err = run([sys.executable, SELF, "probe"], env=dict(env, **extra), timeout=120)
+        p = parse_probe_output(out, rc, err)
+        v["stderr"]["probe_" + label] = _tail(err)
+        for c in p.get("contexts", []):
+            c["label"] = label
+        if label == "override":
+            p["note"] = ("diagnostic: %s set for this probe only, so that Mesa lists every extension flag it computed "
+                         "and every limit enum is legal; not what applications see" % " ".join(
+                             "%s=%s" % kv for kv in extra.items()))
+        v["probe"][label] = p
+    rends = {c.get("renderer") for c in v["probe"].get("normal", {}).get("contexts", []) if c.get("ok")}
+    rends |= {prof.get("renderer") for pl in v["eglinfo"].get("platforms", []) for prof in (pl.get("gl") or {}).values()}
+    v["renderers"] = sorted(r for r in rends if r)
+    v["expect_renderer"] = expect_renderer
+    if expect_renderer and not any(re.search(expect_renderer, r) for r in v["renderers"]):
+        v["fallback"] = "no renderer matching /%s/; got: %s" % (expect_renderer, "; ".join(v["renderers"]) or "none")
+    return v
+
+
+# which renderer GTK 4 creates for a real window on this stack (GTK decides at runtime: Vulkan with dma-buf import,
+# then GL >= 3.3 / ES >= 3.0, then Vulkan without dma-buf, then Cairo): measured, not predicted
+GTK4_PROBE = r'''
+import json
+import gi
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib
+res = {"gtk": "%d.%d.%d" % (Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version())}
+Gtk.init()
+w = Gtk.Window(title="a7a-gpu-gap GTK probe")
+w.set_default_size(160, 90)
+w.present()
+loop = GLib.MainLoop()
+def done():
+    r = w.get_renderer()
+    res["renderer"] = r.__gtype__.name if r is not None else None
+    w.destroy()
+    loop.quit()
+    return False
+GLib.timeout_add(1500, done)
+GLib.timeout_add(10000, loop.quit)
+loop.run()
+print(json.dumps(res))
+'''
+
+
+def collect_gtk4(env, session, run=run_cmd):
+    if not session:
+        return {"error": "no desktop session (the GTK probe opens a window on the logged-in desktop)"}
+    t = 40
+    rc, out, err = run([sys.executable, "-c", GTK4_PROBE], env=dict(env, **session), timeout=t)
+    for line in reversed(out.strip().splitlines()):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                break
+    # run_cmd ends a timeout's stderr with the command line, i.e. this whole script: say what happened instead
+    if rc == 124:
+        return {"error": "rc=124: timed out after %d s" % t}
+    if rc == 125:
+        return {"error": "rc=125: did not exit after the kill (D state?)"}
+    return {"error": "rc=%d: %s" % (rc, (err or out).strip()[-300:])}
+
+
+def gtk_error_summary(err):
+    """one line for the report from a gtk4 error: "rc=N: <stderr tail>" keeps the tail's last line (a traceback's
+    exception), rc 124/125 say what happened (older snapshots kept the probe script as a timeout's tail), any other
+    text ("<ExceptionType>: <message>" from snapshot, "no desktop session ...") keeps its first line"""
+    lines = [ln.strip() for ln in str(err).splitlines() if ln.strip()]
+    if not lines:
+        return "no error text"
+    rc = lines[0].split(":", 1)[0] if lines[0].startswith("rc=") else ""
+    if rc == "rc=124":
+        return "rc=124: timed out"
+    if rc == "rc=125":
+        return "rc=125: did not exit after the kill (D state?)"
+    if rc and len(lines) > 1:
+        return "%s: %s" % (rc, lines[-1])
+    return lines[0]
+
+
+def collect_system(run=run_cmd, read=read_file, listdir=listdir):
+    s = {}
+    d = read(GPU + "/driver") or ""
+    s["driver"] = d[2:] if d.startswith("->") else None
+    s["stack"] = {"powervr": "open", "pvrsrvkm": "ddk"}.get(s["driver"], "none")
+    rc, out, _ = run(["uname", "-r"])
+    s["kernel"] = out.strip() or None
+    s["runtime_pm"] = {"control": (read(GPU + "/power/control") or "").strip() or None,
+                       "status": (read(GPU + "/power/runtime_status") or "").strip() or None}
+    rc, out, _ = run(["sudo", "-n", "cat", "/sys/kernel/debug/clk/clk_summary"])
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 5 and f[4].isdigit():
+            if f[0] == "gpu0":
+                s["gpu_clock_mhz"] = int(f[4]) // 1000000
+            elif f[0] == "pll-gpu":
+                s["pll_gpu_mhz"] = int(f[4]) // 1000000
+    for r in listdir("/sys/class/regulator"):
+        base = "/sys/class/regulator/" + r
+        if (read(base + "/name") or "").strip().endswith("dcdc4"):
+            uv = (read(base + "/microvolts") or "").strip()
+            if uv.isdigit():
+                s["dcdc4_mv"] = int(uv) // 1000
+    clk = read_be32(DT_GPU + "/clk_rate")
+    if clk:
+        s["dt_clk_rate_mhz"] = clk[0] // 1000000
+    acr = read_be32(DT_GPU + "/assigned-clock-rates")
+    if acr:
+        s["dt_assigned_clock_rates_mhz"] = [x // 1000000 for x in acr]
+    rc, out, _ = run(["rpm", "-q", "mesa-dri-drivers", "mesa-vulkan-drivers", "mesa-libEGL", "mesa-pvr-a7a",
+                      "kernel-a7a", "kernel-a7apvr", "vulkan-tools", "egl-utils", "glx-utils", "glmark2"])
+    s["packages"] = [l.strip() for l in out.splitlines() if l.strip() and "not installed" not in l]
+    ddk = [f for f in listdir("/opt/pvr/lib") if f.startswith("libsrv_um.so.")]
+    if ddk:
+        s["ddk_version"] = ddk[0][len("libsrv_um.so."):]
+    temps = {}
+    for z in listdir("/sys/class/thermal"):
+        if z.startswith("thermal_zone"):
+            t, v = read("/sys/class/thermal/%s/type" % z), read("/sys/class/thermal/%s/temp" % z)
+            if t and v and v.strip().lstrip("-").isdigit():
+                temps[t.strip()] = int(v) / 1000
+    s["temps_c"] = temps
+    return s
+
+
+def ddk_vulkan_only_env(tmpdir, libdir="/opt/pvr/lib", icd=DDK_ENV["VK_ICD_FILENAMES"], run=run_cmd,
+                        sysdirs=("/usr/lib64", "/lib64")):
+    """VK_ICD_FILENAMES + a library directory holding the DDK's Vulkan ICD and exactly the libraries it needs from
+    `libdir`, linked under the names they are asked for: its link-time dependencies (ldd) and what it opens at
+    run time (the dynamic loader's own trace, LD_DEBUG=libs, of a vulkaninfo on the DDK). So Fedora's zink drives
+    the DDK's Vulkan driver while GL, EGL and the Vulkan loader stay Fedora's. A whitelist, and never a library
+    Fedora ships itself: /opt/pvr/lib also holds libraries staged from the Debian card (tools/stage-extras.sh)
+    that would shadow Fedora's inside Fedora's Mesa"""
+    farm = os.path.join(tmpdir, "ddk-vulkan-libs")
+    os.makedirs(farm, exist_ok=True)
+    try:
+        lib = json.load(open(icd))["ICD"]["library_path"]
+    except (OSError, ValueError, KeyError, TypeError):
+        lib = "libVK_IMG.so"
+    src = lib if os.path.isabs(lib) else os.path.join(libdir, lib)
+    links = {os.path.basename(lib): src}
+    base = libdir.rstrip("/")
+
+    def fedora_has(name):
+        return any(os.path.exists(os.path.join(d, name)) for d in sysdirs)
+
+    rc, out, _ = run(["ldd", src], env={"LD_LIBRARY_PATH": libdir}, timeout=30)
+    for line in out.splitlines():
+        m = re.match(r"^\s*(\S+) => (\S+)", line)
+        if m and os.path.dirname(m.group(2)) == base and not fedora_has(m.group(1)):
+            links[m.group(1)] = m.group(2)
+    rc, out, err = run(["vulkaninfo", "--summary"],
+                       env={"LD_DEBUG": "libs", "VK_ICD_FILENAMES": icd, "LD_LIBRARY_PATH": libdir}, timeout=60)
+    for m in re.finditer(r"file=(\S+) \[0\];\s+(?:needed|dynamically loaded) by", (err or "") + (out or "")):
+        name = os.path.basename(m.group(1))
+        if os.path.exists(os.path.join(base, name)) and not fedora_has(name):
+            links.setdefault(name, os.path.join(base, name))
+    for name, target in links.items():
+        dst = os.path.join(farm, name)
+        if not os.path.lexists(dst):
+            os.symlink(target, dst)
+    return {"VK_ICD_FILENAMES": icd, "LD_LIBRARY_PATH": farm, "MESA_LOADER_DRIVER_OVERRIDE": "zink"}
+
+
+class ThermalSampler(threading.Thread):
+    def __init__(self, read=read_file, period=2.0):
+        super().__init__(daemon=True)
+        self.read, self.period, self.samples, self.stop = read, period, [], threading.Event()
+
+    def sample(self):
+        t = {}
+        for z in listdir("/sys/class/thermal"):
+            if z.startswith("thermal_zone"):
+                ty, v = self.read("/sys/class/thermal/%s/type" % z), self.read("/sys/class/thermal/%s/temp" % z)
+                if ty and v and v.strip().lstrip("-").isdigit():
+                    t[ty.strip()] = int(v) / 1000
+        f = {}
+        for cpu in ("cpu0", "cpu6"):
+            v = self.read("/sys/devices/system/cpu/%s/cpufreq/scaling_cur_freq" % cpu)
+            if v and v.strip().isdigit():
+                f[cpu] = int(v) // 1000
+        return {"t": round(time.time(), 1), "temps": t, "mhz": f}
+
+    def run(self):
+        while not self.stop.is_set():
+            self.samples.append(self.sample())
+            self.stop.wait(self.period)
+
+    def summary(self):
+        mx, mn = {}, {}
+        for s in self.samples:
+            for k, v in s["temps"].items():
+                mx[k] = max(mx.get(k, v), v)
+            for k, v in s["mhz"].items():
+                mn[k] = min(mn.get(k, v), v)
+        return {"samples": len(self.samples), "max_temp_c": mx, "min_cpu_mhz": mn}
+
+
+def _throttle_lines(run):
+    rc, out, _ = run(["sudo", "-n", "dmesg"])
+    return sum(1 for l in out.splitlines() if re.search(r"thermal|throttl|cpufreq.*limit", l, re.I))
+
+
+def collect_bench(stack, view_env, session, run=run_cmd, sizes=BENCH_SIZES, reps=3, full=False, on_progress=None):
+    """glmark2-es2 at the same sizes on both stacks (build + texture, median of reps after a discarded warm-up),
+    plus the whole suite off-screen and windowed when full=True; thermal samples all the way through.
+    on_progress(res) after every client/size and every full run (snapshot writes the file each time)"""
+    progress = on_progress or (lambda _res: None)
+    clients = ([("wayland", ["glmark2-es2-wayland"]), ("x11", ["glmark2-es2"]), ("offscreen", ["glmark2-es2", "--off-screen"])]
+               if stack == "open" else [("x11", ["glmark2-es2"]), ("offscreen", ["glmark2-es2", "--off-screen"])])
+    env = dict(view_env, **(session or {}))
+    th = ThermalSampler()
+    t0 = _throttle_lines(run)
+    th.start()
+    res = {"stack": stack, "sizes": list(sizes), "reps": reps, "clients": {}, "full": {}}
+    try:
+        for cname, cmd in clients:
+            for size in sizes:
+                run(cmd + ["-s", size, "-b", "build:duration=2"], env=env, timeout=120)       # warm-up, discarded
+                runs = []
+                for _ in range(reps):
+                    rc, out, err = run(cmd + ["-s", size, "-b", "build:duration=3", "-b", "texture:duration=3"],
+                                       env=env, timeout=180)
+                    r = parse_glmark2(out)
+                    r["rc"] = rc
+                    if rc != 0 and not r["scenes"]:
+                        r["errors"].append((err or out).strip()[-300:])
+                    runs.append(r)
+                med = {sc: median([next((x[2] for x in r["scenes"] if x[0] == sc), None) for r in runs])
+                       for sc in ("build", "texture")}
+                res["clients"].setdefault(cname, {})[size] = {"median_fps": med, "runs": runs,
+                                                              "renderer": runs[0]["renderer"] if runs else None}
+                progress(res)
+        if full:
+            native = "wayland" if stack == "open" else "x11"
+            for cname, cmd in clients:
+                if cname not in (native, "offscreen"):
+                    continue
+                rc, out, err = run(cmd + ["-s", sizes[0]], env=env, timeout=900)
+                r = parse_glmark2(out)
+                r["rc"] = rc
+                res["full"][cname] = r
+                progress(res)
+    finally:
+        th.stop.set()
+        th.join(5)
+    res["thermal"] = th.summary()
+    res["thermal"]["throttle_lines_during"] = _throttle_lines(run) - t0
+    return res
+
+
+def snapshot(args):
+    sysinfo = collect_system()
+    session = session_env()
+    snap = {"schema": 1, "tool": "a7a-gpu-gap", "tool_version": TOOL_VERSION,
+            "taken": datetime.now().isoformat(timespec="seconds"), "host": os.uname().nodename,
+            "stack": sysinfo["stack"], "system": sysinfo, "session": bool(session), "views": {}}
+    out = args.out or "a7a-gpu-caps-%s-%s.json" % (sysinfo["stack"], datetime.now().strftime("%Y%m%d-%H%M"))
+    tmp = tempfile.mkdtemp(prefix="a7a-gpu-gap-")
+    if sysinfo["stack"] == "open":
+        views = [("open", lambda: {}, True)]
+    elif sysinfo["stack"] == "ddk":
+        views = [("ddk", lambda: dict(DDK_ENV), False), ("fedora-mesa", lambda: {}, True),
+                 ("zink-on-ddk", lambda: ddk_vulkan_only_env(tmp), True)]
+    else:
+        views = [("fedora-mesa", lambda: {}, True)]
+    # the vendor stack is a reboot away: one failing view or bench must not cost the rest, and the file is
+    # rewritten after every stage
+    for name, mkenv, ovr in views:
+        if args.views and name not in args.views.split(","):
+            continue
+        env = {}
+        try:
+            env = mkenv()
+            print("== view %s %s" % (name, " ".join("%s=%s" % kv for kv in env.items())), file=sys.stderr)
+            d = os.path.join(tmp, name)
+            os.makedirs(d, exist_ok=True)
+            v = collect_view(name, env, session=session, tmp=d, override_probe=ovr,
+                             expect_renderer=EXPECT_RENDERER.get(name))
+            if name == "zink-on-ddk":
+                v["farm"] = sorted(listdir(env.get("LD_LIBRARY_PATH", "")))
+        except Exception as e:
+            v = {"view": name, "error": "%s: %s" % (type(e).__name__, e)}
+        # the GTK probe on its own: its failure must not replace the view
+        try:
+            v["gtk4"] = collect_gtk4(env, session)
+        except Exception as e:
+            v["gtk4"] = {"error": "%s: %s" % (type(e).__name__, e)}
+        snap["views"][name] = v
+        _write_json(snap, out)
+    if args.bench:
+        def progress(res):
+            snap["bench"] = res
+            _write_json(snap, out)
+
+        try:
+            if not session:
+                snap["bench"] = {"error": "no logged-in desktop session: --bench needs one"}
+            else:
+                benv = DDK_ENV if sysinfo["stack"] == "ddk" else {}
+                print("== bench (%s)" % ("build+texture x%d%s" % (args.reps, ", full suite" if args.bench_full else "")),
+                      file=sys.stderr)
+                snap["bench"] = collect_bench(sysinfo["stack"], benv, session, reps=args.reps, full=args.bench_full,
+                                              sizes=tuple(args.sizes.split(",")), on_progress=progress)
+        except Exception as e:
+            snap["bench"] = dict(snap.get("bench") or {}, error="%s: %s" % (type(e).__name__, e))
+    try:
+        snap["system_after"] = {"temps_c": collect_system()["temps_c"]}
+    except Exception as e:
+        snap["system_after"] = {"error": "%s: %s" % (type(e).__name__, e)}
+    _write_json(snap, out)
+    print(out)
+    return 0
+
+
+def _write_json(obj, path):
+    part = path + ".part"
+    with open(part, "w") as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(part, path)
+
+
+# ------------------------------------------------------------------------------------------------ the EGL probe
+GL_INTS = [
+    ("GL_MAX_TEXTURE_SIZE", 0x0D33, 1), ("GL_MAX_3D_TEXTURE_SIZE", 0x8073, 1),
+    ("GL_MAX_CUBE_MAP_TEXTURE_SIZE", 0x851C, 1), ("GL_MAX_ARRAY_TEXTURE_LAYERS", 0x88FF, 1),
+    ("GL_MAX_RENDERBUFFER_SIZE", 0x84E8, 1), ("GL_MAX_COLOR_ATTACHMENTS", 0x8CDF, 1), ("GL_MAX_DRAW_BUFFERS", 0x8824, 1),
+    ("GL_MAX_SAMPLES", 0x8D57, 1), ("GL_MAX_INTEGER_SAMPLES", 0x9110, 1),
+    ("GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS", 0x8B4C, 1), ("GL_MAX_TEXTURE_IMAGE_UNITS", 0x8872, 1),
+    ("GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS", 0x8B4D, 1), ("GL_MAX_VERTEX_UNIFORM_BLOCKS", 0x8A2B, 1),
+    ("GL_MAX_FRAGMENT_UNIFORM_BLOCKS", 0x8A2D, 1), ("GL_MAX_UNIFORM_BLOCK_SIZE", 0x8A30, 1),
+    ("GL_MAX_UNIFORM_BUFFER_BINDINGS", 0x8A2F, 1), ("GL_MAX_VERTEX_ATTRIB_STRIDE", 0x82E5, 1),
+    ("GL_MAX_VERTEX_ATTRIBS", 0x8869, 1), ("GL_MAX_VARYING_COMPONENTS", 0x8B4B, 1),
+    ("GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS", 0x8C8B, 1), ("GL_MAX_TRANSFORM_FEEDBACK_BUFFERS", 0x8E70, 1),
+    ("GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS", 0x90EB, 1), ("GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS", 0x90DB, 1),
+    ("GL_MAX_COMPUTE_ATOMIC_COUNTER_BUFFERS", 0x8264, 1), ("GL_MAX_COMPUTE_IMAGE_UNIFORMS", 0x91BC, 1),
+    ("GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS", 0x90DD, 1), ("GL_MAX_IMAGE_UNITS", 0x8F38, 1),
+    ("GL_MAX_TEXTURE_MAX_ANISOTROPY", 0x84FF, 1), ("GL_MAX_VIEWPORTS", 0x825B, 1), ("GL_MAX_VIEWPORT_DIMS", 0x0D3A, 2),
+    ("GL_MAX_CLIP_PLANES", 0x0D32, 1), ("GL_MAX_GEOMETRY_OUTPUT_VERTICES", 0x8DE0, 1),
+    ("GL_MAX_TESS_GEN_LEVEL", 0x8E7E, 1), ("GL_MAX_FRAMEBUFFER_LAYERS", 0x9317, 1),
+    ("GL_MAX_TEXTURE_BUFFER_SIZE", 0x8C2B, 1),
+    # the vendor's GLES proves with these what an extension list cannot (gles_evidence "glesint:")
+    ("GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS", 0x90DA, 1), ("GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS", 0x90D6, 1),
+    ("GL_MAX_FRAGMENT_ATOMIC_COUNTER_BUFFERS", 0x92D0, 1), ("GL_MAX_FRAGMENT_ATOMIC_COUNTERS", 0x92D6, 1),
+    ("GL_MAX_FRAGMENT_IMAGE_UNIFORMS", 0x90CE, 1), ("GL_MAX_GEOMETRY_SHADER_INVOCATIONS", 0x8E5A, 1),
+    ("GL_MAX_DUAL_SOURCE_DRAW_BUFFERS", 0x88FC, 1), ("GL_MAX_PATCH_VERTICES", 0x8E7D, 1),
+    ("GL_MAX_COMBINED_UNIFORM_BLOCKS", 0x8A2E, 1), ("GL_MAX_COMPUTE_UNIFORM_BLOCKS", 0x91BB, 1),
+    ("GL_MAX_COMPUTE_SHARED_MEMORY_SIZE", 0x8262, 1), ("GL_MAX_FRAMEBUFFER_WIDTH", 0x9315, 1),
+    ("GL_MAX_FRAMEBUFFER_HEIGHT", 0x9316, 1), ("GL_MAX_FRAMEBUFFER_SAMPLES", 0x9318, 1),
+    ("GL_MAX_COLOR_TEXTURE_SAMPLES", 0x910E, 1), ("GL_MAX_DEPTH_TEXTURE_SAMPLES", 0x910F, 1),
+    ("GL_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS", 0x8C8A, 1),
+    ("GL_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS", 0x8C80, 1),
+    ("GL_MAX_VERTEX_OUTPUT_COMPONENTS", 0x9122, 1), ("GL_MAX_FRAGMENT_INPUT_COMPONENTS", 0x9125, 1),
+    ("GL_MAX_SHADER_STORAGE_BLOCK_SIZE", 0x90DE, 1), ("GL_MAX_TEXTURE_LOD_BIAS", 0x84FD, 1),
+]
+
+
+def parse_probe_output(out, rc, err):
+    """the probe's JSON lines -> {"platform", "egl", "contexts": [...], "error" when anything went wrong}. One line
+    per context, flushed as it is made: a crash in a later context, or stray stdout from a vendor library, loses
+    nothing that came before. The single-document form of the first version is read too."""
+    res = {"egl": {}, "contexts": []}
+    done = False
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if "context" in obj:
+            res["contexts"].append(obj["context"])
+        elif "contexts" in obj:
+            res["contexts"].extend(obj["contexts"])
+            res["egl"] = obj.get("egl", {})
+            if obj.get("error"):
+                res["error"] = obj["error"]
+            done = True
+        elif obj.get("done"):
+            done = True
+        else:
+            for k in ("platform", "egl", "error"):
+                if k in obj:
+                    res[k] = obj[k]
+    if not done or rc != 0:
+        res["error"] = "%sprobe rc=%s%s: %s" % ((res["error"] + "; ") if res.get("error") else "", rc,
+                                                "" if done else " (incomplete)", _tail(err, 400))
+    return res
+
+
+def probe_main():
+    """JSON lines on stdout: the EGL surfaceless display facts, then one line per context kind (es, compat, core)
+    with its version strings, extension list and GL_INTS (None = the query was rejected in that context), then
+    {"done": true}; parse_probe_output reads them"""
+    import ctypes as C
+    EGL_NONE, EGL_EXTENSIONS, EGL_VENDOR, EGL_VERSION, EGL_CLIENT_APIS = 0x3038, 0x3055, 0x3053, 0x3054, 0x308D
+    EGL_PLATFORM_SURFACELESS_MESA, EGL_OPENGL_API, EGL_OPENGL_ES_API = 0x31DD, 0x30A2, 0x30A0
+    MAJOR, MINOR, PROFILE = 0x3098, 0x30FB, 0x30FD
+    GL_VENDOR, GL_RENDERER, GL_VERSION, GL_SLV, GL_EXTS, GL_NUM_EXTS = 0x1F00, 0x1F01, 0x1F02, 0x8B8C, 0x1F03, 0x821D
+    res = {"platform": "surfaceless", "egl": {}}
+
+    def emit(obj):
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+    def done():
+        emit(res)
+        emit({"done": True})
+        return 0
+
+    try:
+        egl = C.CDLL("libEGL.so.1")
+    except OSError as e:
+        res["error"] = "libEGL.so.1: %s" % e
+        return done()
+    vp = C.c_void_p
+    egl.eglGetProcAddress.restype, egl.eglGetProcAddress.argtypes = vp, [C.c_char_p]
+    egl.eglQueryString.restype, egl.eglQueryString.argtypes = C.c_char_p, [vp, C.c_int]
+    egl.eglInitialize.restype, egl.eglInitialize.argtypes = C.c_uint, [vp, C.POINTER(C.c_int), C.POINTER(C.c_int)]
+    egl.eglBindAPI.restype, egl.eglBindAPI.argtypes = C.c_uint, [C.c_uint]
+    egl.eglCreateContext.restype, egl.eglCreateContext.argtypes = vp, [vp, vp, vp, C.POINTER(C.c_int)]
+    egl.eglMakeCurrent.restype, egl.eglMakeCurrent.argtypes = C.c_uint, [vp, vp, vp, vp]
+    egl.eglDestroyContext.restype, egl.eglDestroyContext.argtypes = C.c_uint, [vp, vp]
+    egl.eglTerminate.restype, egl.eglTerminate.argtypes = C.c_uint, [vp]
+    egl.eglGetError.restype = C.c_int
+    ce = egl.eglQueryString(None, EGL_EXTENSIONS)
+    res["egl"]["client_extensions"] = (ce or b"").decode(errors="replace").split()
+    addr = egl.eglGetProcAddress(b"eglGetPlatformDisplayEXT")
+    if not addr:
+        res["error"] = "no eglGetPlatformDisplayEXT"
+        return done()
+    get_display = C.CFUNCTYPE(vp, C.c_uint, vp, vp)(addr)
+    dpy = get_display(EGL_PLATFORM_SURFACELESS_MESA, None, None)
+    ma, mi = C.c_int(), C.c_int()
+    if not dpy or not egl.eglInitialize(dpy, C.byref(ma), C.byref(mi)):
+        res["error"] = "surfaceless eglInitialize failed (0x%x)" % egl.eglGetError()
+        return done()
+    for k, e in (("vendor", EGL_VENDOR), ("version", EGL_VERSION), ("client_apis", EGL_CLIENT_APIS),
+                 ("extensions", EGL_EXTENSIONS)):
+        s = (egl.eglQueryString(dpy, e) or b"").decode(errors="replace")
+        res["egl"][k] = s.split() if k == "extensions" else s
+    qd = egl.eglGetProcAddress(b"eglGetDisplayDriverName")
+    if qd:
+        name = C.CFUNCTYPE(C.c_char_p, vp)(qd)(dpy)
+        res["egl"]["driver"] = (name or b"").decode()
+
+    def gl(name, restype, argtypes):
+        a = egl.eglGetProcAddress(name.encode())
+        return C.CFUNCTYPE(restype, *argtypes)(a) if a else None
+
+    # GLES first: a GLES-only vendor stack that dies on a desktop-GL request must leave its ES context behind
+    emit({"platform": "surfaceless", "egl": res["egl"]})
+    # the highest ES first: a vendor EGL that answers a 2.0 request with exactly 2.0 rejects every ES 3 limit query
+    specs = [("es", EGL_OPENGL_ES_API, [[MAJOR, 3, MINOR, 2], [MAJOR, 3, MINOR, 1], [MAJOR, 3, MINOR, 0], [MAJOR, 2]]),
+             ("compat", EGL_OPENGL_API, [[]]),
+             ("core", EGL_OPENGL_API, [[MAJOR, 3, MINOR, 2, PROFILE, 1], [MAJOR, 3, MINOR, 1]])]
+    for api, bind, attempts in specs:
+        c = {"api": api, "ok": False}
+        if not egl.eglBindAPI(bind):
+            c["error"] = "eglBindAPI failed (0x%x)" % egl.eglGetError()
+            emit({"context": c})
+            continue
+        ctx = None
+        for attrs in attempts:
+            arr = (C.c_int * (len(attrs) + 1))(*attrs, EGL_NONE)
+            ctx = egl.eglCreateContext(dpy, None, None, arr)
+            if ctx:
+                c["requested"] = attrs
+                break
+        if not ctx:
+            c["error"] = "eglCreateContext failed (0x%x)" % egl.eglGetError()
+            emit({"context": c})
+            continue
+        if not egl.eglMakeCurrent(dpy, None, None, ctx):
+            c["error"] = "eglMakeCurrent failed (0x%x)" % egl.eglGetError()
+            egl.eglDestroyContext(dpy, ctx)
+            emit({"context": c})
+            continue
+        get_string = gl("glGetString", C.c_char_p, [C.c_uint])
+        get_stringi = gl("glGetStringi", C.c_char_p, [C.c_uint, C.c_uint])
+        get_integerv = gl("glGetIntegerv", None, [C.c_uint, C.POINTER(C.c_int)])
+        get_error = gl("glGetError", C.c_uint, [])
+
+        def s(e):
+            v = get_string(e)
+            return v.decode(errors="replace") if v else None
+
+        c.update(ok=True, vendor=s(GL_VENDOR), renderer=s(GL_RENDERER), version=s(GL_VERSION), sl_version=s(GL_SLV))
+        for _ in range(16):
+            if not get_error():
+                break
+        buf = (C.c_int * 4)()
+        mask = None
+        if api != "es":
+            get_integerv(0x9126, buf)              # GL_CONTEXT_PROFILE_MASK, GL 3.2+
+            mask = None if get_error() else buf[0]
+        c["requested_api"], c["api"] = api, actual_api(api, c["version"], mask)
+        n = None
+        if get_stringi and (gl_version_number(c["version"]) or 0) >= 30:
+            get_integerv(GL_NUM_EXTS, buf)
+            n = buf[0] if not get_error() else None
+        if n:
+            c["extensions"] = [x.decode(errors="replace") for x in (get_stringi(GL_EXTS, i) for i in range(n)) if x]
+        else:
+            c["extensions"] = (s(GL_EXTS) or "").split()
+        ints = {}
+        for name, enum, count in GL_INTS:
+            for _ in range(16):
+                if not get_error():
+                    break
+            buf = (C.c_int * 4)()
+            get_integerv(enum, buf)
+            ints[name] = None if get_error() else list(buf[:count])
+        # timestamp counter bits, only where a timer query exists: a listed timer extension may still count 0 bits,
+        # and a dispatch stub for a missing function reads back 0 without an error
+        ext = set(c["extensions"])
+        bits = None
+        if ("GL_EXT_disjoint_timer_query" in ext if c["api"] == "es"
+                else "GL_ARB_timer_query" in ext or (gl_version_number(c["version"]) or 0) >= 33):
+            get_queryiv = gl("glGetQueryivEXT" if c["api"] == "es" else "glGetQueryiv", None,
+                             [C.c_uint, C.c_uint, C.POINTER(C.c_int)])
+            if get_queryiv:
+                for _ in range(16):
+                    if not get_error():
+                        break
+                qb = (C.c_int * 1)()
+                get_queryiv(0x8E28, 0x8864, qb)            # GL_TIMESTAMP, GL_QUERY_COUNTER_BITS
+                bits = None if get_error() else [qb[0]]
+        ints["GL_QUERY_COUNTER_BITS_TIMESTAMP"] = bits
+        c["ints"] = ints
+        egl.eglMakeCurrent(dpy, None, None, None)
+        egl.eglDestroyContext(dpy, ctx)
+        emit({"context": c})
+    # no eglTerminate: the process exits anyway, and a vendor EGL that crashes in its teardown must not cost data
+    emit({"done": True})
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ report
+def primary_view(snap, name):
+    """the named view of a snapshot; a missing one is an error, never a silent substitute (a vendor file recorded
+    with --views fedora-mesa would otherwise make lavapipe "the DDK")"""
+    views = snap.get("views", {})
+    if name not in views:
+        raise ValueError("the snapshot has no %r view (it has: %s)" % (name, ", ".join(views) or "none"))
+    return name, views[name]
+
+
+_SOFTWARE = re.compile(r"llvmpipe|softpipe|swrast|SwiftShader", re.I)
+
+
+def platform_is_software(p):
+    """an eglinfo platform served by a software rasterizer (eglinfo's "Device #1" on this board is llvmpipe)"""
+    if (p.get("egl") or {}).get("driver") in ("swrast", "kms_swrast"):
+        return True
+    if "EGL_MESA_device_software" in (p.get("device_extensions") or []):
+        return True
+    return any(_SOFTWARE.search(prof.get("renderer") or "") for prof in (p.get("gl") or {}).values())
+
+
+def _view_sources(view):
+    """(kind, api, version string, extensions, source label) of every GL context a view recorded. Software
+    platforms and a software glxinfo only count when the whole view is software (a GPU view must not borrow
+    llvmpipe's extensions)"""
+    if view.get("fallback"):
+        return []                     # not the stack the view is named after (zink fell back to llvmpipe, ...)
+    plats = [p for p in (view.get("eglinfo") or {}).get("platforms", []) if p.get("gl")]
+    hw = [p for p in plats if not platform_is_software(p)]
+    probe = [c for c in probe_contexts(view.get("probe")) if c.get("ok")]
+    software_view = not hw and (not probe or all(_SOFTWARE.search(c.get("renderer") or "") for c in probe))
+    out = []
+    for c in probe:
+        if _SOFTWARE.search(c.get("renderer") or "") and not software_view:
+            continue
+        n = gl_version_number(c.get("version"))
+        out.append(("probe", c["api"], c.get("version"), c.get("extensions", []), c.get("label", "normal"),
+                    "%s probe %s %d.%d" % (c.get("label", "normal"), c["api"], *divmod(n or 0, 10))))
+    for p in (plats if software_view else hw):
+        for api, prof in p["gl"].items():
+            n = gl_version_number(prof.get("version"))
+            out.append(("eglinfo", api, prof.get("version"), prof.get("extensions", []), "normal",
+                        "eglinfo %s %s %d.%d" % (p["name"], api, *divmod(n or 0, 10))))
+    g = view.get("glxinfo") or {}
+    for api in ("compat", "core", "es"):
+        prof = g.get(api)
+        if not prof:
+            continue
+        rend = prof.get("renderer") or (g.get("compat") or {}).get("renderer") or ""
+        if _SOFTWARE.search(rend) and not software_view:
+            continue
+        n = gl_version_number(prof.get("version"))
+        out.append(("glxinfo", api, prof.get("version"), prof.get("extensions", []), "normal",
+                    "glxinfo %s %d.%d" % (api, *divmod(n or 0, 10))))
+    return out
+
+
+def view_versions(view):
+    """highest GL compat / GL core / GLES version the view's GPU contexts report (no override), with the strings"""
+    out = {"compat": None, "core": None, "es": None}
+    strings = {"compat": None, "core": None, "es": None}
+    for kind, api, s, _ext, label, _src in _view_sources(view):
+        if label != "normal":
+            continue
+        n = gl_version_number(s)
+        if n and (out[api] is None or n > out[api]):
+            out[api], strings[api] = n, s
+    return out, strings
+
+
+def view_contexts(view):
+    """every GL context of a view with its extension list, for observe_flags"""
+    return [{"api": api, "version": gl_version_number(s), "extensions": ext, "source": src}
+            for _kind, api, s, ext, _label, src in _view_sources(view)]
+
+
+def _step_label(key, step):
+    return {"gl_compat": "OpenGL %s (compatibility)", "gl_core": "OpenGL %s (core)", "es": "OpenGL ES %s"}[key] % step
+
+
+def _yn(v):
+    return {True: "yes", False: "**no**", None: "?"}[v]
+
+
+def _fmt(v):
+    if isinstance(v, list):
+        return ", ".join(str(x).replace("VK_SAMPLE_COUNT_", "").replace("_BIT", "") for x in v)
+    return str(v)
+
+
+def _flag_of(term):
+    m = re.match(r"^extensions->(\w+)$", term)
+    return m.group(1) if m else None
+
+
+def render_report(open_snap, vendor_snap, gates, title="GPU gap report", open_file=None, vendor_file=None,
+                  notes=None, gates_file=None, open_view="open", vendor_view="ddk"):
+    L = []
+    w = L.append
+    on, ov = primary_view(open_snap, open_view)
+    vn, vv = primary_view(vendor_snap, vendor_view)
+    ovk, vvk = ov.get("vulkan") or {}, vv.get("vulkan") or {}
+    ext_table = gates["ext_table"]
+    g = gates["gates"]
+    flags = observe_flags(ext_table, view_contexts(ov))
+    consts = consts_from_probe(ov.get("probe"), ov.get("glxinfo"))
+    ev = evaluate_gates(g, flags, consts)
+    over, ostr = view_versions(ov)
+    vver, vstr = view_versions(vv)
+    diff = diff_vulkan(ovk, vvk) if "extensions" in ovk and "extensions" in vvk else None
+
+    w("# %s" % title)
+    w("")
+    w("Generated by `tools/board/a7a-gpu-gap report` (a7a-gpu-tools) from `%s` (open stack) and `%s` (vendor boot). "
+      "Mesa's version gates: Mesa %s `src/mesa/main/version.c` (sha256 `%s`), extracted verbatim by `a7a-gpu-gap gates`%s. "
+      "Do not edit the generated sections by hand: change the tool or the notes file and re-run."
+      % (open_file or "open snapshot", vendor_file or "vendor snapshot", gates.get("mesa_version"),
+         (gates.get("version_c_sha256") or "")[:16], " into `%s`" % gates_file if gates_file else ""))
+    w("")
+    for label, snap in (("open", open_snap), ("vendor", vendor_snap)):
+        s = snap.get("system", {})
+        w("- **%s snapshot** %s on %s: kernel `%s`, driver `%s`, GPU %s MHz @ %s mV (pll-gpu %s MHz), runtime PM %s, "
+          "session %s%s" % (label, snap.get("taken", "?"), snap.get("host", "?"), s.get("kernel"), s.get("driver"),
+                            s.get("gpu_clock_mhz", "?"), s.get("dcdc4_mv", "?"), s.get("pll_gpu_mhz", "?"),
+                            "/".join(str(x) for x in (s.get("runtime_pm") or {}).values()) or "?",
+                            "logged in" if snap.get("session") else "none",
+                            ", DDK %s" % s["ddk_version"] if s.get("ddk_version") and label == "vendor" else ""))
+    w("")
+
+    # ---- summary
+    w("## Summary")
+    w("")
+    w("| | GL compat | GL core | GLES | Vulkan |")
+    w("|---|---|---|---|---|")
+    for name, view, snap in [(on, ov, open_snap)] + [(n, x, vendor_snap) for n, x in vendor_snap.get("views", {}).items()]:
+        vr, vs = view_versions(view)
+        vk = view.get("vulkan") or {}
+        if view.get("fallback"):
+            w("| **%s** (reference) | fell back, not used: %s | | | |" % (name, view["fallback"]))
+            continue
+        w("| **%s**%s | %s | %s | %s | %s |" % (
+            name, " (primary)" if name in (on, vn) else " (reference)",
+            vs["compat"] or "-", vs["core"] or "-", vs["es"] or "-",
+            "%s %s (%s)" % (vk.get("api_version"), vk.get("device_name"), vk.get("driver_info") or vk.get("driver_name"))
+            if "api_version" in vk else vk.get("error", "-")))
+    w("")
+    nxt = []
+    for key in ("es", "gl_compat"):
+        for row in ev[key]:
+            if row["value"] is not True:
+                nxt.append((key, row))
+                break
+    for key, row in nxt:
+        terms = row["fails"] + ["%s (unobservable)" % u for u in row["unknown"]]
+        w("- Next step for the open stack: **%s** fails on %s." % (
+            _step_label(key, row["step"]),
+            ", ".join("`%s`" % t for t in terms) if terms else "the previous step (%s)" % row["blocked_by"]))
+    if diff:
+        w("- Vulkan, DDK against the open driver: %d features the DDK has and the open driver lacks, %d extensions, "
+          "%d limits lower on the open driver, %d formats missing, %d formats with fewer features."
+          % (len(diff["features_missing"]), len(diff["extensions_missing"]), len(diff["limits_worse"]),
+             len(diff["formats_missing"]), len(diff["formats_fewer"])))
+    w("")
+
+    # ---- ranked actions
+    # a vendor view that fell back (llvmpipe instead of the DDK) proves nothing: its limits are not vendor evidence
+    ves = [c for c in probe_contexts(vv.get("probe")) if c.get("ok") and c.get("api") == "es"
+           and c.get("label", "normal") == "normal" and not vv.get("fallback")]
+    # no ES context recorded for the vendor = no data (unknown), not "no extensions" / "no limits"
+    vints = ves[0].get("ints") if ves else None
+    vexts = sorted({e for _k, api, _s, ext, label, _src in _view_sources(vv) if api == "es" and label == "normal"
+                    for e in ext}) or None
+    ra = rank_actions(g, flags, consts, ovk, vvk if "extensions" in vvk else None, vver, vexts, vints)
+    w("## Ranked actions")
+    w("")
+    w("Milestones in the order that unlocks the most applications (table below) per unit of work: a limit counts 1, "
+      "a feature 10, an item the vendor stack does not prove 1000. Every item is a Vulkan requirement the open "
+      "driver fails today. *Vendor* = what proves the hardware has it: the DDK's own Vulkan driver, else its GLES "
+      "(version, extension or limit). *After* = the versions Mesa's gates give once this item and every item "
+      "above it are fixed (simulated with the same gate evaluation).")
+    w("")
+    labels = {"limit": "config/limit (hours)", "project": "missing feature with hardware support: a project",
+              "hardware": "hardware-absent per the vendor stack: skip", "unknown": "no vendor data",
+              "unmapped": "not mapped to a Vulkan item"}
+    n = 0
+    for m in ra["milestones"]:
+        w("### %s%s" % (m["step"], "" if m["complete"] else " (not complete with these items: see unmapped terms)"))
+        w("")
+        if m["unlocks"]:
+            w("Unlocks: %s." % ", ".join(m["unlocks"]))
+            w("")
+        for it in m["items"]:
+            n += 1
+            evid = "DDK Vulkan %s" % _yn(it["vendor_vulkan"])
+            if it["vendor_gles"]:
+                evid += "; DDK GLES proves it (%s)" % ", ".join("`%s`" % x for x in it["vendor_gles"])
+            sizes = sorted({(ra["terms"][t]["knowledge"] or {}).get("size", "") for t in it["terms"]
+                            if t in ra["terms"]} - {""})
+            aft = it["reached_after"]
+            w("%d. `%s`: **%s**. Vendor: %s. Needed by %s. After: GL %s, GLES %s.%s%s"
+              % (n, it["req"], labels[it["class"]], evid, ", ".join("`%s`" % t for t in it["terms"]),
+                 aft["gl_compat"] or "-", aft["es"] or "-",
+                 (" " + VK_ITEM_NOTES[it["req"]] + ".") if it["req"] in VK_ITEM_NOTES else "",
+                 (" Scope: " + " / ".join(sizes) + ".") if sizes else ""))
+        w("")
+    if not ra["milestones"]:
+        w("Every GL and GLES step Mesa knows is reached.")
+        w("")
+
+    # ---- gates
+    w("## The Mesa version gates on the open stack")
+    w("")
+    w("Every step Mesa %s computes, evaluated against the open stack's flags (extension strings of every context "
+      "eglinfo, glxinfo and the probe opened, plus the override probe's full flag list) and limits (glGetIntegerv). "
+      "`?` = not observable. Reached: GL compat **%s**, GL core **%s**, GLES **%s** (the version strings say %s / %s / %s)."
+      % (gates.get("mesa_version"), ev["reached"]["gl_compat"] or "-", ev["reached"]["gl_core"] or "none",
+         ev["reached"]["es"] or "-", ostr["compat"] or "-", ostr["core"] or "none", ostr["es"] or "-"))
+    w("")
+    for key in ("es", "gl_compat", "gl_core"):
+        rows = [r for r in ev[key] if r["value"] is not True]
+        if not rows:
+            continue
+        w("| %s step | own terms that fail | unobservable | also blocked by |" % {"es": "GLES", "gl_compat": "GL compat", "gl_core": "GL core"}[key])
+        w("|---|---|---|---|")
+        for r in rows:
+            w("| %s | %s | %s | %s |" % (r["step"], "<br>".join("`%s`" % t for t in r["fails"]) or "-",
+                                         "<br>".join("`%s`" % t for t in r["unknown"]) or "-", r["blocked_by"] or "-"))
+        w("")
+    w("Limits the gates read (open stack):")
+    w("")
+    for name in gate_consts(g):
+        c = consts.get(name, {})
+        w("- `%s` = %s (%s)" % (name, c.get("value"), c.get("evidence", "not measured")))
+    w("")
+
+    # ---- Vulkan
+    w("## Vulkan: the DDK against the open driver")
+    w("")
+    if not diff:
+        w("No Vulkan data on one side: open `%s`, vendor `%s`." % (ovk.get("error", "ok"), vvk.get("error", "ok")))
+    else:
+        w("API version: open %s, DDK %s." % tuple(diff["api"]))
+        w("")
+        w("### Features true on the DDK, false on the open driver (%d)" % len(diff["features_missing"]))
+        w("")
+        w("| feature | reported in |")
+        w("|---|---|")
+        for f in diff["features_missing"]:
+            w("| `%s` | %s |" % (f["member"], ", ".join(f["structs"])))
+        w("")
+        w("### Extensions the DDK has and the open driver lacks (%d)" % len(diff["extensions_missing"]))
+        w("")
+        w(", ".join("`%s`" % e for e in diff["extensions_missing"]) or "none")
+        w("")
+        w("### Limits lower on the open driver (%d)" % len(diff["limits_worse"]))
+        w("")
+        w("| limit | open | DDK |")
+        w("|---|---|---|")
+        for r in diff["limits_worse"]:
+            w("| `%s` | %s | %s |" % (r["name"], _fmt(r["open"]), _fmt(r["vendor"])))
+        w("")
+        w("### Formats")
+        w("")
+        w("Formats the DDK supports and the open driver does not list at all (%d): %s"
+          % (len(diff["formats_missing"]), ", ".join("`%s`" % f.replace("VK_FORMAT_", "") for f in diff["formats_missing"]) or "none"))
+        w("")
+        if diff["formats_fewer"]:
+            w("| format | tiling | features only the DDK has |")
+            w("|---|---|---|")
+            for r in diff["formats_fewer"]:
+                w("| `%s` | %s | %s |" % (r["format"].replace("VK_FORMAT_", ""), r["tiling"],
+                                          ", ".join(x.replace("VK_FORMAT_FEATURE_", "").replace("_BIT", "") for x in r["missing"])))
+            w("")
+        w("### The other direction (the open driver has, the DDK does not)")
+        w("")
+        w("Features: %s." % (", ".join("`%s`" % f["member"] for f in diff["features_extra"]) or "none"))
+        w("")
+        w("Extensions: %s." % (", ".join("`%s`" % e for e in diff["extensions_extra"]) or "none"))
+        w("")
+        w("Limits higher on the open driver: %s." % (", ".join("`%s` %s vs %s" % (r["name"], _fmt(r["open"]), _fmt(r["vendor"]))
+                                                             for r in diff["limits_better"]) or "none"))
+        w("")
+        if diff["limits_differ"]:
+            w("Limits that differ without a better/worse direction: %s." % ", ".join(
+                "`%s` %s vs %s" % (r["name"], _fmt(r["open"]), _fmt(r["vendor"])) for r in diff["limits_differ"]))
+            w("")
+
+    # ---- apps
+    w("## What applications need")
+    w("")
+    unlock_at = {a: m["step"] for m in ra["milestones"] for a in m["unlocks"]}
+
+    def missing(needs, versions, vk, fl):
+        """the unmet terms of the alternative closest to being met"""
+        best = None
+        for alt in needs:
+            miss = ["%s:%s" % t for t in parse_need(alt) if not app_meets(["%s:%s" % t], versions, vk, fl)]
+            if best is None or len(miss) < len(best):
+                best = miss
+        return best or []
+
+    w("| application / toolkit | needs (any of) | open stack | vendor DDK | open stack gets it at | source |")
+    w("|---|---|---|---|---|---|")
+    for a in APPS:
+        needs = " or ".join(" + ".join("%s %s" % t for t in parse_need(n)) for n in a["needs"])
+        mo, mv = app_meets(a["needs"], over, ovk, flags), app_meets(a["needs"], vver, vvk)
+        if mo:
+            at = "-"
+        elif a["name"] in unlock_at:
+            at = unlock_at[a["name"]]
+        else:
+            at = "not in the ranked items; still missing: %s" % ", ".join(
+                "`%s`" % x for x in missing(a["needs"], over, ovk, flags))
+        w("| %s | %s | %s | %s | %s | %s |" % (a["name"], needs, _yn(mo), _yn(mv), at, a["source"]))
+    w("")
+    gviews = [(on, ov)] + [(n, x) for n, x in vendor_snap.get("views", {}).items() if n != on or x is not ov]
+
+    def gtk_txt(x):
+        g2 = x.get("gtk4") or {}
+        if x.get("fallback"):
+            return "not a measurement of this view (it fell back)"
+        if "renderer" in g2:
+            return "GTK %s %s" % (g2.get("gtk"), g2.get("renderer"))
+        if "error" not in g2:
+            return "not measured"
+        return "GTK probe failed: %s" % gtk_error_summary(g2["error"])
+
+    if any(x.get("gtk4") for _n, x in gviews):
+        w("Measured on this board, a real GTK window per view (`a7a-gpu-gap` asks GTK which renderer it created): %s."
+          % "; ".join("%s: %s" % (n, gtk_txt(x)) for n, x in gviews))
+        w("")
+
+    # ---- envelope
+    w("## Hardware envelope")
+    w("")
+    ob, vb = open_snap.get("bench") or {}, vendor_snap.get("bench") or {}
+    if ob.get("clients") or vb.get("clients"):
+        w("glmark2-es2, median fps of %s runs after a discarded warm-up (build / texture scenes). Renderer = what "
+          "glmark2 itself reported, so a silent software fallback shows." % (ob.get("reps") or vb.get("reps")))
+        w("")
+        w("| stack | client | size | build | texture | renderer |")
+        w("|---|---|---|---|---|---|")
+        for label, b in (("open", ob), ("DDK", vb)):
+            for cname, sizes in (b.get("clients") or {}).items():
+                for size, r in sizes.items():
+                    m = r.get("median_fps", {})
+                    w("| %s | %s | %s | %s | %s | %s |" % (label, cname, size, m.get("build"), m.get("texture"),
+                                                           (r.get("renderer") or "?")[:60]))
+        w("")
+        fulls = [(label, c, r) for label, b in (("open", ob), ("DDK", vb)) for c, r in (b.get("full") or {}).items()]
+        if fulls:
+            w("Whole glmark2 suite at %s: %s." % ((ob or vb).get("sizes", ["?"])[0], "; ".join(
+                "%s %s score %s" % (label, c, r.get("score")) for label, c, r in fulls)))
+            w("")
+        # the ratio, only where both stacks ran the same client at the same size
+        pairs = []
+        for cname, sizes in (vb.get("clients") or {}).items():
+            for size, r in sizes.items():
+                om = (((ob.get("clients") or {}).get(cname) or {}).get(size) or {}).get("median_fps") or {}
+                vm = r.get("median_fps") or {}
+                parts = ["%s %.1fx" % (sc, vm[sc] / om[sc]) for sc in ("build", "texture") if om.get(sc) and vm.get(sc)]
+                if parts:
+                    pairs.append("%s %s: %s" % (cname, size, ", ".join(parts)))
+        for cname, r in (vb.get("full") or {}).items():
+            oscore = ((ob.get("full") or {}).get(cname) or {}).get("score")
+            if oscore and r.get("score"):
+                pairs.append("whole suite %s: %.1fx" % (cname, r["score"] / oscore))
+        if pairs:
+            w("The vendor stack against the open stack, same client and size: %s." % "; ".join(pairs))
+            w("")
+        for label, b in (("open", ob), ("DDK", vb)):
+            th = b.get("thermal")
+            if th:
+                w("- Thermals during the %s bench (%d samples): max %s; lowest CPU clocks %s; thermal/throttle kernel "
+                  "lines during the run: %s." % (label, th.get("samples", 0),
+                                                ", ".join("%s %.0f C" % kv for kv in sorted(th.get("max_temp_c", {}).items())),
+                                                ", ".join("%s %d MHz" % kv for kv in sorted(th.get("min_cpu_mhz", {}).items())),
+                                                th.get("throttle_lines_during")))
+        w("")
+    else:
+        w("No bench data in the snapshots (`a7a-gpu-gap snapshot --bench` inside a logged-in desktop).")
+        w("")
+    w("GPU clock/voltage envelope (validated on this board):")
+    w("")
+    w("| pair | status | evidence |")
+    w("|---|---|---|")
+    for pair, status, evd in CLOCK_ENVELOPE:
+        w("| %s | %s | %s |" % (pair, status, evd))
+    w("")
+
+    # ---- reference views
+    refs = [(n, x) for n, x in vendor_snap.get("views", {}).items() if n != vn]
+    if refs:
+        w("## Reference views on the vendor boot")
+        w("")
+        for n, x in refs:
+            if x.get("fallback"):
+                w("- **%s**: fell back, so none of its numbers are used: %s." % (n, x["fallback"]))
+                continue
+            vr, vs = view_versions(x)
+            vk = x.get("vulkan") or {}
+            w("- **%s** (%s): GL compat %s, GL core %s, GLES %s; Vulkan %s." % (
+                n, " ".join("%s=%s" % kv for kv in (x.get("env") or {}).items()) or "no overrides",
+                vs["compat"] or "-", vs["core"] or "-", vs["es"] or "-",
+                "%s %s" % (vk.get("api_version"), vk.get("device_name")) if "api_version" in vk else vk.get("error", "-")))
+        w("")
+
+    # ---- method
+    w("## Method and caveats")
+    w("")
+    w("- A flag counts as present when any context lists one of its extension strings, as absent only when a context "
+      "in which Mesa would list it (extensions_table.h: API column and minimum version) does not; otherwise it is "
+      "`?`. The override probe (`MESA_GL_VERSION_OVERRIDE=4.6COMPAT MESA_GLES_VERSION_OVERRIDE=3.2`, set for that "
+      "probe process only) exists to make every flag observable; it is a read of Mesa's internal state, never a "
+      "capability claim, and nothing an application runs uses it.")
+    w("- The vendor DDK is not Mesa: its GL/GLES versions come from its own version strings, and \"DDK says yes\" "
+      "for a Vulkan item comes from the DDK's own Vulkan driver (pvr-run).")
+    w("- Mesa's gates are Mesa %s's; zink's mapping of Vulkan to GL (GL_FLAG_NEEDS in the tool) cites the 26.1.8 "
+      "source lines it was read from." % gates.get("mesa_version"))
+    w("")
+    if notes:
+        w(notes.rstrip())
+        w("")
+    return "\n".join(L)
+
+
+def report(args):
+    here = os.path.dirname(SELF)
+    gates_file = args.gates or next((p for p in (os.path.join(here, "a7a-gpu-gap-mesa-26.1.8-gates.json"),
+                                                 "/usr/local/share/a7a-gpu-gap/a7a-gpu-gap-mesa-26.1.8-gates.json")
+                                     if os.path.exists(p)), None)
+    if not gates_file:
+        print("no gates file (a7a-gpu-gap gates --mesa-src <mesa tree>)", file=sys.stderr)
+        return 1
+    gates = json.load(open(gates_file))
+    o, v = json.load(open(args.open)), json.load(open(args.vendor))
+    notes = open(args.notes).read() if args.notes else None
+    try:
+        md = render_report(o, v, gates, title=args.title, open_file=args.open, vendor_file=args.vendor, notes=notes,
+                           gates_file=os.path.basename(gates_file), open_view=args.open_view,
+                           vendor_view=args.vendor_view)
+    except ValueError as e:
+        print("a7a-gpu-gap report: %s" % e, file=sys.stderr)
+        return 1
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(md + "\n")
+        print(args.out)
+    else:
+        print(md)
+    return 0
+
+
+def gates_cmd(args):
+    import hashlib
+    vc = os.path.join(args.mesa_src, "src/mesa/main/version.c")
+    et = os.path.join(args.mesa_src, "src/mesa/main/extensions_table.h")
+    vtext, etext = open(vc).read(), open(et).read()
+    g = parse_version_gates(vtext)
+    table = parse_ext_table(etext)
+    used = gate_flags(g)
+    missing = [f for f in used if f not in table]
+    if missing:
+        print("flags in the gates without an extensions_table.h row: %s" % ", ".join(missing), file=sys.stderr)
+    ver = open(os.path.join(args.mesa_src, "VERSION")).read().strip() if os.path.exists(
+        os.path.join(args.mesa_src, "VERSION")) else None
+    out = {"mesa_version": ver, "version_c_sha256": hashlib.sha256(vtext.encode()).hexdigest(),
+           "extensions_table_sha256": hashlib.sha256(etext.encode()).hexdigest(),
+           "gates": g, "ext_table": {f: table[f] for f in used if f in table}}
+    dst = args.out or "a7a-gpu-gap-mesa-%s-gates.json" % ver
+    with open(dst, "w") as f:
+        json.dump(out, f, indent=1, sort_keys=True)
+        f.write("\n")
+    print(dst)
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="a7a-gpu-gap", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="modes: snapshot (on the board), report (anywhere), gates (from a Mesa tree)")
+    sub = ap.add_subparsers(dest="mode", required=True)
+    s = sub.add_parser("snapshot", help="record the booted stack's capabilities into a JSON file")
+    s.add_argument("--out", help="output file (default a7a-gpu-caps-<stack>-<stamp>.json here)")
+    s.add_argument("--views", help="comma list of views to record (default: all of this boot)")
+    s.add_argument("--bench", action="store_true", help="glmark2-es2 + thermals (needs the logged-in desktop)")
+    s.add_argument("--bench-full", action="store_true", help="also the whole glmark2 suite (~5 min per client)")
+    s.add_argument("--reps", type=int, default=3)
+    s.add_argument("--sizes", default=",".join(BENCH_SIZES))
+    r = sub.add_parser("report", help="diff an open-stack and a vendor snapshot into a markdown report")
+    r.add_argument("--open", required=True)
+    r.add_argument("--vendor", required=True)
+    r.add_argument("--gates", help="gates JSON (default: next to this script or /usr/local/share/a7a-gpu-gap)")
+    r.add_argument("--notes", help="markdown appended verbatim (hand-written results)")
+    r.add_argument("--title", default="GPU gap report")
+    r.add_argument("--out")
+    r.add_argument("--open-view", default="open", help="the view of --open to compare (default open)")
+    r.add_argument("--vendor-view", default="ddk",
+                   help="the view of --vendor to compare (default ddk; 'open' compares two open-stack snapshots)")
+    gp = sub.add_parser("gates", help="extract the version gates + extension table rows from a Mesa source tree")
+    gp.add_argument("--mesa-src", required=True)
+    gp.add_argument("--out")
+    sub.add_parser("probe", help=argparse.SUPPRESS)
+    a = ap.parse_args(argv)
+    return {"snapshot": snapshot, "report": report, "gates": gates_cmd, "probe": lambda _a: probe_main()}[a.mode](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,37 @@
+#!/bin/bash
+# a7a-var-dirs [--dry-run]: create the directories under /var that installed packages own and that are not there, with
+# the owner and mode the package records.
+# Why: every a7a-fedora image until 2026-11-15 was built without Fedora's /var (it lives in a subvolume of its own in
+# Fedora's image and was not copied). systemd-tmpfiles rebuilds the skeleton at every boot, but nothing rebuilds what
+# only a package's payload creates: /var/lib/logrotate (logrotate.service failed and no log was ever rotated: 822 MB of
+# /var/log/messages on the working card), /var/lib/plocate, /var/lib/rpm-state (package scriptlets write there). A
+# system installed from such an image still lacks them: 45 on the working card after two months of updates.
+# Run once as root on such a system (or by tools/master-image.sh inside an image made from one). Creates, never
+# changes: a path that exists is left as it is, whatever it is. Ghost entries and /var/run, /var/lock (links into the
+# tmpfs /run) are not touched. Links that packages own under /var and that are missing are made as well (/var/mail ->
+# spool/mail). Prints one line per directory or link and a count; exit 0 unless one could not be made.
+# Tests: tests/test_var_dirs.py (rpm and install faked on PATH, A7A_VAR_DIRS_ROOT = a scratch root).
+set -u
+ROOT=${A7A_VAR_DIRS_ROOT:-}
+DRY=0; [ "${1:-}" = --dry-run ] && DRY=1
+made=0; failed=0
+while read -r mode flags user group path; do
+  [ -n "$path" ] || continue
+  [ -e "$ROOT$path" ] || [ -L "$ROOT$path" ] && continue
+  perm=${mode: -4}      # rpm prints a directory's mode as 40755, 41777, 42755: the last four digits are what chmod takes
+  if [ "$DRY" = 1 ]; then echo "would create $path ($perm $user:$group)"; made=$((made + 1)); continue; fi
+  if install -d -m "$perm" -o "$user" -g "$group" "$ROOT$path"; then echo "created $path ($perm $user:$group)"; made=$((made + 1))
+  else echo "could NOT create $path ($perm $user:$group)" >&2; failed=$((failed + 1)); fi
+done < <(rpm -qa --qf '[%{FILEMODES:octal} %{FILEFLAGS} %{FILEUSERNAME} %{FILEGROUPNAME} %{FILENAMES}\n]' 2>/dev/null \
+           | awk '$1 ~ /^0?4[0-7][0-7][0-7][0-7]$/ && $2 < 64 && $5 ~ /^\/var\// && $5 !~ /^\/var\/(run|lock)(\/|$)/ && NF == 5' | LC_ALL=C sort -u -k5,5)
+# the links: rpm prints their mode as 120777
+while read -r mode flags path target; do
+  [ -n "$target" ] || continue
+  [ -e "$ROOT$path" ] || [ -L "$ROOT$path" ] && continue
+  if [ "$DRY" = 1 ]; then echo "would link $path -> $target"; made=$((made + 1)); continue; fi
+  if ln -s "$target" "$ROOT$path"; then echo "linked $path -> $target"; made=$((made + 1))
+  else echo "could NOT link $path -> $target" >&2; failed=$((failed + 1)); fi
+done < <(rpm -qa --qf '[%{FILEMODES:octal} %{FILEFLAGS} %{FILENAMES} %{FILELINKTOS}\n]' 2>/dev/null \
+           | awk '$1 ~ /^0?12[0-7][0-7][0-7][0-7]$/ && $2 < 64 && $3 ~ /^\/var\// && $3 !~ /^\/var\/(run|lock)(\/|$)/ && NF == 4' | LC_ALL=C sort -u -k3,3)
+echo "a7a-var-dirs: $made $([ "$DRY" = 1 ] && echo "would be created" || echo "created")$([ "$failed" = 0 ] || echo ", $failed failed")"
+[ "$failed" = 0 ]

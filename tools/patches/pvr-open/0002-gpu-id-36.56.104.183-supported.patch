@@ -1,0 +1,27 @@
+drm/imagination: mark BXM-4-64 MC1 36.56.104.183 (Allwinner A733) as supported (a7a-fedora)
+
+Upstream master's support table (1c21f240fbc1 "Warn or error on unsupported hardware") lists 36.52.104.182 and
+36.53.104.796 only; anything else fails the probe with -ENODEV unless powervr.exp_hw_support=1 is set, which
+also prints an "unsupported hardware" warning. The A733's core has its firmware in linux-firmware
+(rogue_36.56.104.183_v1.fw, Fedora ships it) and its device entry in Mesa 26.2, so "supported" is the honest
+state; a modprobe.d line would be one more file every image and RPM has to carry.
+
+--- a/drivers/gpu/drm/imagination/pvr_device.c
++++ b/drivers/gpu/drm/imagination/pvr_device.c
+@@ -533,6 +533,9 @@
+ 	case PVR_PACKED_BVNC(33, 15, 11, 3):
+ 	case PVR_PACKED_BVNC(36, 52, 104, 182):
+ 	case PVR_PACKED_BVNC(36, 53, 104, 796):
++	/* a7a: BXM-4-64 MC1 in the Allwinner A733 (Radxa Cubie A7A/A7Z). Its firmware
++	 * rogue_36.56.104.183_v1.fw is in linux-firmware and Mesa 26.2 lists the device. */
++	case PVR_PACKED_BVNC(36, 56, 104, 183):
+ 		return PVR_GPU_SUPPORTED;
+ 
+ 	default:
+--- a/drivers/gpu/drm/imagination/pvr_drv.c
++++ b/drivers/gpu/drm/imagination/pvr_drv.c
+@@ -1537,3 +1537,4 @@
+ MODULE_FIRMWARE("powervr/rogue_33.15.11.3_v1.fw");
+ MODULE_FIRMWARE("powervr/rogue_36.52.104.182_v1.fw");
+ MODULE_FIRMWARE("powervr/rogue_36.53.104.796_v1.fw");
++MODULE_FIRMWARE("powervr/rogue_36.56.104.183_v1.fw"); /* a7a: Allwinner A733 */

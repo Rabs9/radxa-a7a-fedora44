@@ -1,0 +1,19 @@
+# /usr/lib/systemd/user/a7a-voice.service (a7a-board-tools): the voice-command listener (tools/board/a7a-voice), in
+# the owner's graphical session, so the commands it runs reach the desktop. Off until `a7a-voice on` (the panel's Voice
+# tab) enables it. Not set up yet, it writes that for the panel and exits 0, so it does not start again and again.
+# A failure that stays (models gone, no microphone) stops it after 4 starts in 2 minutes (the default limit, 5 in
+# 10 s, never trips with 5 s between starts and 9 s of model loading); `a7a-voice on` resets that.
+[Unit]
+Description=Voice commands (a7a-voice)
+After=pipewire.service wireplumber.service graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=4
+
+[Service]
+ExecStart=/usr/local/bin/a7a-voice listen
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

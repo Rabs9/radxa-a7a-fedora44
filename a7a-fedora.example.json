@@ -1,0 +1,9 @@
+{
+  "_comment": "a7a-fedora overrides (Config.load): copy to a7a-fedora.json (ignored by git) and edit. Nothing defaults to a real device: the serial port, card and board are named here or on the command line.",
+  "serial_port": "/dev/ttyACM0",
+  "serial_baud": 115200,
+  "board_user": "radxa",
+  "board_host": "radxa-cubie-a7a.local",
+  "board_tailscale": "",
+  "ssh_identity": "~/.ssh/a7a_key"
+}

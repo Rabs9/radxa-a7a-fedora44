@@ -1,0 +1,22 @@
+#!/bin/sh
+# /usr/local/bin/plasma-keyboard (a7a-gpu-tools): the login screen's on-screen keyboard on Fedora's Mesa. The greeter's
+# KWin starts it (plasma-login-kwin_wayland.service: --inputmethod plasma-keyboard) as the first "plasma-keyboard" on
+# its PATH, /usr/local/bin before /usr/bin, and hands it its own environment: on a DDK boot the DDK's libraries
+# (/run/a7a/greeter-kwin.env, a7a-gpu-session) and no render node for clients. The keyboard then had no EGL ("EGL not
+# available", "QRhiGles2: Failed to create temporary context") and aborted, four or five times per boot until KWin
+# gave up (2026-11-18). Like the greeter's own UI (plasma-login-fedora-mesa.conf): Fedora's Mesa, which draws in
+# software where it gets no render node. Only for the login screen's user; everyone else gets the keyboard unchanged.
+# It relies on that PATH order (systemd's default for user managers, Plasma Login's DefaultPath): with another order
+# KWin starts /usr/bin/plasma-keyboard directly and only the crash loop comes back.
+ENV_FILE=/run/a7a/greeter-kwin.env
+if [ "$(id -un 2>/dev/null)" = plasmalogin ]; then
+  # everything the greeter's KWin took from its DDK file except KWin's own settings, then the names that file has had
+  if [ -r "$ENV_FILE" ]; then
+    for v in $(sed -n 's/^[[:space:]]*\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$ENV_FILE"); do
+      case "$v" in KWIN_*) ;; *) unset "$v" ;; esac
+    done
+  fi
+  unset LIBGL_DRIVERS_PATH MESA_LOADER_DRIVER_OVERRIDE VK_ICD_FILENAMES
+  export LD_LIBRARY_PATH=/usr/lib64
+fi
+exec /usr/bin/plasma-keyboard "$@"

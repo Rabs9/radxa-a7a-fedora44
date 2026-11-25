@@ -1,0 +1,31 @@
+# tools/master-remove.list: packages of the card that an image for other people does without.
+# The compressed image must stay under 2 GiB (one file of a GitHub release). The card is the owner's working system
+# and carries what he installed to bring the board up, and Fedora's image carries what a general-purpose desktop
+# brings: 13 GiB together. tools/master-image.sh removes the groups below with dnf, inside the image, one transaction
+# per line: "<what it is>|<package names or globs>". Whatever is here can be installed again with dnf.
+# A group whose removal would take out any package the image is about (the desktop, the GPU stack, the a7a packages,
+# networking, Firefox, dnf itself: the GUARD list in master-image.sh) stops the build instead of being removed;
+# dependencies nothing else needs go with their group (dnf's clean_requirements_on_remove).
+# 2026-11-16, measured on a copy: 13.0 GiB -> 7.4 GiB, 2128 MiB as .xz before the last two lines and the SDK's
+# .git directory (630 MiB compressed, half of it history) were dealt with.
+
+# -- what the owner installed to bring the board up
+the game and its data|supertuxkart supertuxkart-data
+compilers and build tools|llvm-static llvm llvm-devel clang* gcc gcc-c++ cpp cmake compiler-rt gdb strace perf apitrace meson ninja-build libstdc++-devel glibc-devel kernel-headers vulkan-headers
+development files|*-devel *-static
+benchmarks and test tools (glmark2 stays: a7a-clock soak runs it)|sysbench stress-ng fio memtester iperf3 vkmark weston
+cloud client libraries|python3-botocore python3-boto3 python3-s3transfer
+containers|podman buildah skopeo
+
+# -- what Fedora's image brings and this board has no use for
+U-Boot images for other boards|uboot-images-armv8
+firmware of other hardware|qcom-firmware qcom-wwan-firmware nvidia-gpu-firmware amd-gpu-firmware intel-gpu-firmware iwlwifi-*-firmware iwlegacy-firmware bcm2*-firmware tiwilink-firmware intel-audio-firmware cirrus-audio-firmware nxpwireless-firmware libertas-firmware amd-ucode-firmware
+Fedora's own kernel (this board boots the a7a kernels)|kernel kernel-core kernel-modules kernel-modules-core
+the SELinux troubleshooter (the a7a kernels run without SELinux: its applet failed at every login, 2026-11-17)|setroubleshoot setroubleshoot-server setroubleshoot-plugins
+
+# -- what a desktop can do without until somebody wants it back
+geodata grids|proj-data-?? proj-data-eur
+LibreOffice and Java|libreoffice* java-*-openjdk*
+extra wallpapers|plasma-workspace-wallpapers
+browser language packs|firefox-langpacks
+KDE mail and calendar (PIM) with its database|akonadi* kmail korganizer kaddressbook kontact mariadb*

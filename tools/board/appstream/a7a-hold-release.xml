@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- a7a-board-tools: keeps Discover from offering the next Fedora release (2026-11-17: "Fedora 45" was offered and one
+     click away). The images are tested on one Fedora release; a release upgrade replaces the desktop, the graphics
+     stack and the libraries the board's GPU glue was built against, untested. Discover finds the newer release in the
+     operating-system component of fedora-appstream-metadata (/usr/share/metainfo/org.fedoraproject.fedora.metainfo.xml);
+     this catalog entry takes that component out of AppStream's pool. Updates within the release are not affected.
+     Remove this file and refresh AppStream's cache (appstreamcli refresh, forced) to see the offer again. -->
+<components version="1.0" origin="a7a-hold-release">
+  <component merge="remove-component">
+    <id>org.fedoraproject.fedora</id>
+  </component>
+</components>

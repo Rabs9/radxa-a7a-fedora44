@@ -1,0 +1,39 @@
+U-Boot SPL 2018.07 (Aug 23 2026 - 10:00:00 +0000)
+DRAM: 8192 MiB
+U-Boot 2018.07 (Aug 23 2026 - 10:00:00 +0000) Allwinner Technology
+CPU:   Allwinner A733 (SUN60IW2P1)
+Model: Radxa Cubie A7A
+Hit any key to stop autoboot:  0
+Scanning mmc 0:3...
+Found /boot/extlinux/extlinux.conf
+Retrieving file: /boot/extlinux/extlinux.conf
+a7a-fedora
+1:	Fedora 44 KDE, Linux 6.6.98+ (overclocked DTB)
+2:	Fedora 44 KDE, Linux 6.6.98+, single user, no desktop
+Enter choice: @@CHOICE@@
+1:	Fedora 44 KDE, Linux 6.6.98+ (overclocked DTB)
+Retrieving file: /boot/vmlinuz-6.6.98+
+Retrieving file: /usr/lib/linux-image-6.6.98+/allwinner/sun60i-a733-cubie-a7a.dtb
+## Flattened Device Tree blob at 4fa00000
+Starting kernel ...
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x412fd050]
+[    0.000000] Linux version 6.6.98+ (a7a@a7a-fedora) (aarch64-linux-gnu-gcc (GCC) 16.1.1, GNU ld 2.45) #1 SMP PREEMPT Sun Sep  6 22:40:00 UTC 2026
+[    0.000000] Machine model: Radxa Cubie A7A
+[    1.204100] VFS: Mounted root (ext4 filesystem) readonly on device 179:3.
+[    1.210000] Run /sbin/init as init process
+[    2.500000] systemd[1]: systemd 259.5-1.fc44 running in system mode
+Welcome to Fedora Linux 44 (KDE Plasma Desktop Edition)!
+[  OK  ] Reached target sysinit.target - System Initialization.
+[  OK  ] Reached target multi-user.target - Multi-User System.
+[  OK  ] Reached target graphical.target - Graphical Interface.
+a7a-firstboot: 2026-09-07T03:22:22+00:00 kernel 6.6.98+ on Radxa Cubie A7A
+cpu max: 2016000 / 3000000
+root: /dev/mmcblk0p3 ext4
+net: lo UNKNOWN;end0 UP;wlan0 DOWN;
+gpu node: card0 renderD128  npu: /dev/vipcore
+modules: 41  failed units: 0
+
+Fedora Linux 44 (KDE Plasma Desktop Edition)
+Kernel 6.6.98+ on aarch64 (ttyAS0)
+
+radxa-cubie-a7a login: @@PROMPT@@

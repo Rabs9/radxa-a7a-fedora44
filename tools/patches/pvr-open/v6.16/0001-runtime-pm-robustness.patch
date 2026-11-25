@@ -1,0 +1,118 @@
+--- a/drivers/gpu/drm/imagination/pvr_fw_startstop.c	2026-09-09 11:50:06.153342826 -0400
++++ b/drivers/gpu/drm/imagination/pvr_fw_startstop.c	2026-09-09 13:25:04.119810564 -0400
+@@ -2,6 +2,7 @@
+ /* Copyright (c) 2023 Imagination Technologies Ltd. */
+ 
+ #include "pvr_device.h"
++#include <drm/drm_print.h>
+ #include "pvr_fw.h"
+ #include "pvr_fw_meta.h"
+ #include "pvr_fw_startstop.h"
+@@ -219,8 +220,10 @@
+ 	 */
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE, sidekick_idle_mask,
+ 				sidekick_idle_mask, POLL_TIMEOUT_USEC);
+-	if (err)
++	if (err) {
++		drm_warn(from_pvr_device(pvr_dev), "pvr_fw_stop: idle poll at line %d failed (%d)\n", __LINE__, err);
+ 		return err;
++	}
+ 
+ 	/* Unset MTS DM association with threads. */
+ 	pvr_cr_write32(pvr_dev, ROGUE_CR_MTS_INTCTX_THREAD0_DM_ASSOC,
+@@ -240,14 +243,18 @@
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_BIF_STATUS_MMU, 0,
+ 				ROGUE_CR_BIF_STATUS_MMU_MASKFULL,
+ 				POLL_TIMEOUT_USEC);
+-	if (err)
++	if (err) {
++		drm_warn(from_pvr_device(pvr_dev), "pvr_fw_stop: idle poll at line %d failed (%d)\n", __LINE__, err);
+ 		return err;
++	}
+ 
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_BIFPM_STATUS_MMU, 0,
+ 				ROGUE_CR_BIFPM_STATUS_MMU_MASKFULL,
+ 				POLL_TIMEOUT_USEC);
+-	if (err)
++	if (err) {
++		drm_warn(from_pvr_device(pvr_dev), "pvr_fw_stop: idle poll at line %d failed (%d)\n", __LINE__, err);
+ 		return err;
++	}
+ 
+ 	if (!PVR_HAS_FEATURE(pvr_dev, xt_top_infrastructure)) {
+ 		err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_BIF_READS_EXT_STATUS, 0,
+@@ -260,14 +267,18 @@
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_BIFPM_READS_EXT_STATUS, 0,
+ 				ROGUE_CR_BIFPM_READS_EXT_STATUS_MASKFULL,
+ 				POLL_TIMEOUT_USEC);
+-	if (err)
++	if (err) {
++		drm_warn(from_pvr_device(pvr_dev), "pvr_fw_stop: idle poll at line %d failed (%d)\n", __LINE__, err);
+ 		return err;
++	}
+ 
+ 	err = pvr_cr_poll_reg64(pvr_dev, ROGUE_CR_SLC_STATUS1, 0,
+ 				ROGUE_CR_SLC_STATUS1_MASKFULL,
+ 				POLL_TIMEOUT_USEC);
+-	if (err)
++	if (err) {
++		drm_warn(from_pvr_device(pvr_dev), "pvr_fw_stop: idle poll at line %d failed (%d)\n", __LINE__, err);
+ 		return err;
++	}
+ 
+ 	/*
+ 	 * Wait for SLC to signal IDLE.
+@@ -277,8 +288,10 @@
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SLC_IDLE,
+ 				ROGUE_CR_SLC_IDLE_MASKFULL,
+ 				ROGUE_CR_SLC_IDLE_MASKFULL, POLL_TIMEOUT_USEC);
+-	if (err)
++	if (err) {
++		drm_warn(from_pvr_device(pvr_dev), "pvr_fw_stop: idle poll at line %d failed (%d)\n", __LINE__, err);
+ 		return err;
++	}
+ 
+ 	/*
+ 	 * Wait for Sidekick/Jones to signal IDLE except for the Garten Wrapper.
+@@ -287,8 +300,10 @@
+ 	 */
+ 	err = pvr_cr_poll_reg32(pvr_dev, ROGUE_CR_SIDEKICK_IDLE, sidekick_idle_mask,
+ 				sidekick_idle_mask, POLL_TIMEOUT_USEC);
+-	if (err)
++	if (err) {
++		drm_warn(from_pvr_device(pvr_dev), "pvr_fw_stop: idle poll at line %d failed (%d)\n", __LINE__, err);
+ 		return err;
++	}
+ 
+ 	if (pvr_dev->fw_dev.processor_type == PVR_FW_PROCESSOR_TYPE_META) {
+ 		err = pvr_meta_cr_read32(pvr_dev, META_CR_TxVECINT_BHALT, &reg_value);
+--- a/drivers/gpu/drm/imagination/pvr_power.c	2026-09-09 11:50:06.154342840 -0400
++++ b/drivers/gpu/drm/imagination/pvr_power.c	2026-09-09 13:25:04.120115215 -0400
+@@ -112,6 +112,10 @@
+ {
+ 	int err;
+ 
++	/* a7a: the flag lives in the FW heap and survives a power-off, so without this the boot wait below
++	 * returns on the previous life's value before the restarted firmware has actually booted. */
++	WRITE_ONCE(pvr_dev->fw_dev.fwif_sysinit->firmware_started, false);
++
+ 	err = pvr_fw_start(pvr_dev);
+ 	if (err)
+ 		return err;
+@@ -248,8 +252,15 @@
+ 
+ 	if (pvr_dev->fw_dev.booted) {
+ 		err = pvr_power_fw_disable(pvr_dev, false);
+-		if (err)
++		if (err) {
++			/* a7a: the firmware has already powered its units down when the host's idle polls fail;
++			 * returning the error leaves runtime PM believing the GPU is active while the firmware
++			 * is half dead (every later job "locks up": docs/OPEN-STACK-WEDGE-2026-09-09.md). Restart it. */
++			drm_warn(drm_dev, "runtime suspend aborted (%d): restarting the firmware\n", err);
++			if (pvr_power_fw_enable(pvr_dev))
++				drm_err(drm_dev, "firmware restart after aborted suspend failed\n");
+ 			goto err_drm_dev_exit;
++		}
+ 	}
+ 
+ 	clk_disable_unprepare(pvr_dev->mem_clk);

@@ -1,0 +1,268 @@
+#!/bin/bash
+# a7a-gpu-session apply|status|greeter: put the desktop session config in line with the GPU stack that booted.
+#   apply    what a7a-gpu-session.service runs before the display manager: read which driver is bound to the GPU
+#            (powervr = open stack, pvrsrvkm = vendor DDK) and apply the matching session config, only the parts
+#            that differ (a boot with the right config touches nothing, a hand-edited pvr.conf survives).
+#   status   read-only: the bound driver, the config found on disk, whether they match (exit 1 on a mismatch,
+#            2 when the stack cannot be told). a7a-gpu-check and the emulator read it.
+#   greeter  only what depends on the KWin that is installed (below): what a7a-gpu-tools' package trigger runs when
+#            kwin is updated in a running system, so that the next logout does not end at a black screen.
+# Why: the desktop only works when the session config matches the kernel. Open-stack kernel: KWin must NOT have the
+# DDK drop-in and wants cap_sys_nice (5.5x compositor throughput). DDK kernel: KWin needs `pvr-desktop on`'s drop-in
+# (LD_LIBRARY_PATH=/opt/pvr/lib, GLES) and the cap stripped, or the loader ignores the drop-in and KWin lands on
+# llvmpipe, where every EGLImage fails (EGL_BAD_ALLOC = black screen). Until 2026-09-10 prepare616.sh/backtoddk.sh
+# switched the config by hand before a reboot, and a login on the wrong kernel was a black screen. Now the boot decides.
+# The two configs (docs/PACKAGING-2026-09-09.md, "Item B follow-ups"):
+#   ddk   pvr.conf drop-in (pvr-desktop on), no software.conf, kwin_wayland without cap_sys_nice, a7a-kwin-nocap.path
+#         enabled and running (re-strips the cap after a kwin update); plus pvr-wl (below) when mesa-img-a7a is installed
+#   open  no pvr.conf, no software.conf, cap_sys_nice restored, the nocap units disabled, no `pvr-desktop all`
+#         ld.so.conf (it would put the DDK's EGL in front of Mesa for every process), no pvr-wl entry
+#   software (pvr-desktop off: KWin on QPainter) when the GPU device is there but no driver bound in time: the only
+#         config that shows a desktop without a GPU (KWin + llvmpipe cannot create EGL images here)
+# pvr-wl (docs/DDK-WAYLAND-2026-09-10.md): mesa-img-a7a installs Imagination's Mesa glue built WITH the Wayland platform
+# in /opt/pvr-wl. With the ddk config the unit writes /etc/ld.so.conf.d/00-a7a-pvr-wl.conf (/opt/pvr-wl/lib + its ddk/
+# links to the seven closed libraries the glue loads) and runs ldconfig, so every process, capability-bearing ones
+# included, gets that libEGL/libGLESv2/libgbm in front of glvnd's: Wayland and X11 EGL/GLES clients on the GPU without
+# any per-app setting. Desktop-GL-only clients lose llvmpipe (the DDK has no desktop GL). The entry is correct only on a
+# proven DDK boot: with any other outcome (open, no driver bound, an unexpected driver or kernel) it is removed and the
+# cache rebuilt, so Fedora's Mesa and the a7a Vulkan driver are untouched there; that also holds under the manual
+# marker below (which never writes the entry: one boot without a driver binding under the marker de-activates pvr-wl
+# until the marker goes). KWin keeps its drop-in; the greeter UI keeps Fedora's Mesa through a7a-gpu-tools' static
+# plasma-login.service drop-in (LD_LIBRARY_PATH=/usr/lib64). No Vulkan ICD is installed system-wide: the DDK's Vulkan
+# cannot present (its closed ICD lists no Wayland surface, and X11 swapchains crash in the WSI with Radxa's own build
+# too), so Vulkan on the DDK stays per-app (pvr-run).
+# pvr-wl is OPT-IN (`touch /etc/a7a/pvr-wl.enabled`): Fedora's Qt is built for desktop OpenGL and asks EGL for desktop-GL
+# configs on Wayland, and Firefox asks for a desktop-GL context first; the DDK drop has no desktop GL. Measured on the
+# board 2026-09-10 with the entry active: the Qt Quick logout prompt got no EGL config and quit (logout did not happen;
+# plasmashell after a re-login would be next), Firefox fell back to software. Per-app `pvr-wl-run` (GLES clients,
+# games) needs no entry. Without the marker the entry is removed like on any other stack.
+# Without the GPU device at all (QEMU) the kernel release string decides: -a7apvr. = open (KWin on Fedora's Mesa works
+# there), -a7a. = the software session (the DDK cannot drive a GPU that is not there; until 2026-11-15 this applied the
+# ddk config, which no emulator run ever exercised because every image booted the open-stack kernel by default).
+# KWin and QPainter: the greeter's compositor (a7a-gpu-tools' static drop-in) and the software session run KWin's
+# QPainter backend, KWIN_COMPOSE=Q: dumb buffers, no EGL, the only software path that worked on this display with
+# KWin 6.7. KWin 6.8 has no QPainter backend for real displays any more: with KWIN_COMPOSE=Q it logs "Could not fulfill
+# the requested compositing mode", exits, and the screen stays black while every unit is active (found 2026-11-16 in
+# the emulator with Fedora's updates; a `dnf upgrade` on the board would have ended there). So the capability is read
+# off the library, and where it is gone:
+#   - the greeter's compositor gets /run/a7a/greeter-kwin.env (its drop-in reads that file, and a setting in it wins
+#     over the drop-in's KWIN_COMPOSE=Q): on a DDK boot with the session on the DDK the variables of the session's
+#     pvr.conf (the DDK is the only renderer that draws on this display then; NOT YET RUN ON THE BOARD), otherwise
+#     KWIN_COMPOSE=O2ES, i.e. OpenGL ES on whatever Mesa gives (llvmpipe in the emulator: verified there with KWin 6.8.3);
+#   - a software.conf that still says Q is rewritten (pvr-desktop off writes what this KWin has).
+# With QPainter present nothing of this exists and nothing changes: no env file, the drop-ins as they were.
+# Escape hatch for experiments: `touch /etc/a7a/gpu-session.manual` and apply leaves the session config alone.
+# Helpers this script calls must never open a login session (sudo -u, su, systemctl --user -M user@, any PAM path):
+# the unit runs before systemd-user-sessions.service, and logind would wait for a user manager that waits for that
+# very service = a deadlock until the unit times out (pvr-desktop learned this 2026-09-10; it now reloads only the
+# user managers that are already running, with `systemctl reload user@<uid>.service`).
+# Tests: tests/test_gpu_session.py (A7A_GPU_SESSION_ROOT = a fake root; systemctl/setcap/getcap/pvr-desktop/ldconfig
+# faked on PATH).
+set -u
+umask 022   # the ld.so.conf.d entry is a %ghost %attr(0644) of mesa-img-a7a; a hand `sudo` run must not write 0600
+ROOT=${A7A_GPU_SESSION_ROOT:-}
+GPU=$ROOT/sys/bus/platform/devices/1800000.gpu
+DROP=$ROOT/etc/systemd/user/plasma-kwin_wayland.service.d
+KWIN=$ROOT/usr/bin/kwin_wayland
+MANUAL=$ROOT/etc/a7a/gpu-session.manual
+LDCONF=$ROOT/etc/ld.so.conf.d/00-pvr.conf
+WLCONF=$ROOT/etc/ld.so.conf.d/00-a7a-pvr-wl.conf
+WLON=$ROOT/etc/a7a/pvr-wl.enabled
+WLGL=$ROOT/opt/pvr-wl/lib/libGL.so.1
+KWINLIB=$ROOT/usr/lib64/libkwin.so.6
+GREETER=$ROOT/run/a7a/greeter-kwin.env
+REL=${A7A_KERNEL_RELEASE:-$(uname -r)}
+# udev loads the driver from the DT compatible about 2.5 s after coldplug (board, 2026-09-10); the device node exists
+# from early boot, so the binding is waited for. status never waits.
+WAIT=${A7A_GPU_SESSION_WAIT:-30}
+say() { echo "a7a-gpu-session: $*"; }
+
+# sysfs: <device>/driver is a symlink whose last component is the driver name (readlink without -f: the target
+# need not resolve, e.g. from a chroot or a test root)
+driver() { local d; d=$(readlink "$GPU/driver" 2>/dev/null) && [ -n "$d" ] && basename "$d"; }
+stack() {   # sets STACK (open|ddk|nogpu|other|unknown), DRV (bound driver or empty), HOW (a sentence for the journal)
+  local n=0 max=$(( ${WAIT%.*} * 5 ))
+  DRV=""
+  if [ -d "$GPU" ]; then
+    while :; do DRV=$(driver); [ -n "$DRV" ] && break; [ "$n" -ge "$max" ] && break; n=$((n+1)); sleep 0.2; done
+  fi
+  case "$DRV" in
+    powervr) STACK=open; HOW="driver powervr bound"; return ;;
+    pvrsrvkm) STACK=ddk; HOW="driver pvrsrvkm bound"; return ;;
+    "") ;;
+    *) STACK=other; HOW="driver $DRV bound"; return ;;
+  esac
+  if [ -d "$GPU" ]; then STACK=nogpu; HOW="no driver bound to 1800000.gpu within ${WAIT}s"; return; fi
+  HOW="no 1800000.gpu device (not the board?), decided by the release string"
+  case "$REL" in
+    *-a7apvr.*) STACK=open ;;
+    # the vendor flavour without the device: the DDK has nothing to drive, and its session config would leave KWin
+    # without a renderer (an image that boots the DDK kernel by default must still show a desktop in the emulator)
+    *-a7a.*) STACK=nogpu; HOW="no 1800000.gpu device on the vendor-flavour kernel (not the board?)" ;;
+    *) STACK=unknown ;;
+  esac
+}
+
+cap_present() { getcap "$KWIN" 2>/dev/null | grep -q cap_sys_nice; }
+en() { [ "$(systemctl is-enabled "$1" 2>/dev/null)" = enabled ]; }
+act() { systemctl is-active --quiet "$1" 2>/dev/null; }
+nocap_any() { en a7a-kwin-nocap.path || act a7a-kwin-nocap.path || en a7a-kwin-nocap.service || act a7a-kwin-nocap.service; }
+
+# pvr-wl: the entry names the real paths (ld.so reads it), never $ROOT
+wl_conf_text() { printf '%s\n' "# a7a-gpu-session (mesa-img-a7a): the Wayland-capable DDK Mesa and the DDK libraries it loads, only while pvrsrvkm drives the GPU" /opt/pvr-wl/lib /opt/pvr-wl/lib/ddk; }
+# the package layout AND the DDK: -e follows the lib/ddk links, so they must resolve into /opt/pvr (a hand-unpacked
+# tree has no lib/ddk; activating it would leave every client without the closed libraries = software rendering).
+# A libGL.so.1 there is not the package's (mesa-img-a7a has no GLX): a leftover of an early GLX build would enter the
+# cache and shadow glvnd's GLX for every app (reviewer, 2026-09-10), so its presence refuses the activation.
+wl_installed() { [ -e "$ROOT/opt/pvr-wl/lib/libEGL.so.1" ] && [ -e "$ROOT/opt/pvr-wl/lib/ddk/libpvr_dri_support.so" ] && [ -e "$ROOT/opt/pvr-wl/lib/ddk/libsrv_um.so" ] && [ ! -e "$WLGL" ]; }
+wl_want() { [ -f "$DROP/pvr.conf" ] && wl_installed && [ -e "$WLON" ]; }   # the ddk config is on and the owner opted in
+wl_file() { [ -f "$WLCONF" ]; }
+wl_file_ok() { [ "$(cat "$WLCONF" 2>/dev/null)" = "$(wl_conf_text)" ]; }
+# the loader cache, not only the entry: a crash between writing the entry and ldconfig must not leave a stale cache
+wl_cached() { ldconfig -p 2>/dev/null | grep -q ' => /opt/pvr-wl/lib/libEGL\.so\.1$'; }
+wl_state() {   # active | absent | partial(...): the entry and the cache as they are now
+  local f=0 c=0; wl_file && f=1; wl_cached && c=1
+  if [ $f = 1 ] && [ $c = 1 ] && wl_file_ok; then echo active
+  elif [ $f = 0 ] && [ $c = 0 ]; then echo absent
+  else echo "partial(entry=$f$(wl_file_ok && echo ",ok") cache=$c)"; fi
+}
+wl_off() {   # appends to the caller's $changed
+  if wl_file; then rm -f "$WLCONF"; changed="$changed pvr-wl-removed"; fi
+  if wl_cached; then ldconfig && changed="$changed ldconfig"; fi
+}
+
+# -- what depends on the installed KWin ---------------------------------------------------------------------------------
+kwin_qpainter() { grep -qa DrmQPainterBackend "$KWINLIB" 2>/dev/null; }
+sw_stale() {   # a software.conf that asks for a compositing mode this KWin does not have (written before a kwin update)
+  [ -f "$DROP/software.conf" ] || return 1
+  if kwin_qpainter; then ! grep -q '^Environment=KWIN_COMPOSE=Q$' "$DROP/software.conf"; else grep -q 'KWIN_COMPOSE=Q' "$DROP/software.conf"; fi
+}
+greeter_want() {   # the text $GREETER must hold (needs $STACK); nothing = no file: QPainter is there, the static drop-in stands
+  kwin_qpainter && return 0
+  if [ "$STACK" = ddk ] && [ -f "$DROP/pvr.conf" ]; then sed -n 's/^Environment=//p' "$DROP/pvr.conf"
+  else echo "KWIN_COMPOSE=O2ES"; fi
+}
+greeter_apply() {   # appends to the caller's $changed
+  local want; want=$(greeter_want)
+  if [ -z "$want" ]; then
+    if [ -e "$GREETER" ]; then rm -f "$GREETER"; changed="$changed greeter-env-removed"; fi
+  elif [ "$(cat "$GREETER" 2>/dev/null)" != "$want" ]; then
+    mkdir -p "${GREETER%/*}" && printf '%s\n' "$want" > "$GREETER" && changed="$changed greeter-env-written"
+  fi
+}
+greeter_state() {   # static | env (...) | MISSING | stale: one line for status; the first two are fine
+  local want; want=$(greeter_want)
+  if [ -z "$want" ]; then
+    if [ -e "$GREETER" ]; then echo "stale (this KWin has QPainter, $GREETER is left over)"; else echo "static (KWIN_COMPOSE=Q: this KWin has QPainter)"; fi
+  elif [ ! -e "$GREETER" ]; then echo "MISSING (this KWin has no QPainter and $GREETER is not there: no login screen)"
+  elif [ "$(cat "$GREETER")" = "$want" ]; then echo "env ($(tr '\n' ' ' < "$GREETER" | sed 's/ $//'))"
+  else echo "stale ($GREETER is not what the $STACK stack needs)"; fi
+}
+greeter_ok() { case "$(greeter_state)" in static*|env*) return 0 ;; *) return 1 ;; esac; }
+
+config() {   # ddk | software | open | mixed(...): what is on disk now
+  local pvr=0 sw=0 cap=0 nocap=0 ld=0 wl want=absent
+  [ -f "$DROP/pvr.conf" ] && pvr=1; [ -f "$DROP/software.conf" ] && sw=1; cap_present && cap=1; nocap_any && nocap=1; [ -f "$LDCONF" ] && ld=1
+  wl=$(wl_state); wl_want && want=active
+  if [ $pvr = 1 ] && [ $sw = 0 ] && [ $cap = 0 ] && [ $nocap = 1 ] && [ "$wl" = "$want" ]; then echo ddk
+  elif [ $pvr = 0 ] && [ $sw = 1 ] && [ "$wl" = absent ]; then echo software      # pvr-desktop off: KWin on QPainter, works on any kernel
+  elif [ $pvr = 0 ] && [ $sw = 0 ] && [ $cap = 1 ] && [ $nocap = 0 ] && [ $ld = 0 ] && [ "$wl" = absent ]; then echo open
+  else echo "mixed(pvr.conf=$pvr software.conf=$sw cap=$cap nocap=$nocap ld.so=$ld pvr-wl=$wl)"; fi
+}
+matches() { case "$1:$2" in open:open|ddk:ddk|ddk:software|nogpu:software) return 0 ;; *) return 1 ;; esac; }
+
+apply() {
+  local before changed=""
+  stack
+  if [ -e "$MANUAL" ]; then
+    # the manual marker leaves the SESSION config alone, but never the pvr-wl loader entry on a kernel without the
+    # DDK: there it would put the DDK's Mesa in front of Fedora's for every process, KWin included (black screen)
+    [ "$STACK" = ddk ] || wl_off
+    greeter_apply   # not session config: without it a KWin without QPainter shows no login screen at all
+    say "$MANUAL present: leaving the session config alone (config: $(config))${changed:+; done all the same on the $STACK stack:$changed}"
+    return 0
+  fi
+  case "$STACK" in
+    open|ddk) say "kernel $REL: $STACK stack ($HOW)" ;;
+    nogpu) say "kernel $REL: $HOW: software session, the only config that shows a desktop without a GPU" ;;
+    other) wl_off; greeter_apply; say "unexpected GPU driver '$DRV' bound to 1800000.gpu: ${changed:+done:$changed, otherwise }nothing changed"; return 1 ;;
+    *) wl_off; greeter_apply; say "$HOW; kernel $REL is neither -a7apvr. nor -a7a.: ${changed:+done:$changed, otherwise }nothing changed"; return 1 ;;
+  esac
+  before=$(config)
+  if [ "$STACK" = nogpu ]; then
+    wl_off   # first: nothing below may skip it
+    if [ -f "$DROP/pvr.conf" ] || [ ! -f "$DROP/software.conf" ] || sw_stale; then
+      pvr-desktop off >/dev/null 2>&1 || { say "pvr-desktop off failed:$changed"; return 1; }; changed="$changed pvr-desktop=off"
+    fi
+  elif [ "$STACK" = ddk ]; then
+    if [ ! -f "$DROP/pvr.conf" ]; then
+      # pvr-desktop on writes the drop-in, removes software.conf and strips the cap; it refuses without the DDK
+      # userspace under /opt/pvr or without the fdinfo marker: then a QPainter session is the usable choice
+      if pvr-desktop on >/dev/null 2>&1; then changed="$changed pvr-desktop=on"
+      else
+        say "pvr-desktop on refused (DDK userspace under /opt/pvr or the fdinfo marker missing): software session instead of a black screen"
+        pvr-desktop off >/dev/null 2>&1 || { say "pvr-desktop off failed too: nothing changed"; return 1; }
+        changed="$changed pvr-desktop=off"
+      fi
+    elif [ -f "$DROP/software.conf" ]; then rm -f "$DROP/software.conf"; changed="$changed software.conf-removed"; fi
+    if cap_present; then setcap -r "$KWIN" && changed="$changed cap-stripped"; fi
+    if ! en a7a-kwin-nocap.path || ! act a7a-kwin-nocap.path; then
+      systemctl enable --no-reload --now a7a-kwin-nocap.path >/dev/null 2>&1 && changed="$changed nocap-enabled"
+    fi
+    # only with the drop-in in place (pvr-desktop on succeeded: DDK userspace + the fdinfo-fixed pvrsrvkm)
+    if wl_want; then
+      if ! wl_file_ok; then
+        mkdir -p "${WLCONF%/*}"; wl_conf_text > "$WLCONF"; changed="$changed pvr-wl-written"
+        ldconfig && changed="$changed ldconfig"
+      elif ! wl_cached; then ldconfig && changed="$changed ldconfig"; fi
+    else
+      wl_off
+    fi
+  else
+    # the path unit first: setcap changes an xattr, which PathChanged= reports, and the service would strip the cap again
+    if nocap_any; then systemctl disable --no-reload --now a7a-kwin-nocap.path a7a-kwin-nocap.service >/dev/null 2>&1; changed="$changed nocap-disabled"; fi
+    for f in pvr.conf software.conf; do [ -f "$DROP/$f" ] && { rm -f "$DROP/$f"; changed="$changed $f-removed"; }; done
+    if [ -f "$LDCONF" ]; then pvr-desktop none >/dev/null 2>&1 && changed="$changed pvr-desktop=none"; fi
+    wl_off
+    if ! cap_present; then setcap cap_sys_nice+ep "$KWIN" && changed="$changed cap-restored"; fi
+  fi
+  greeter_apply   # after the session config: on the DDK it copies the session's drop-in
+  local after; after=$(config)
+  if [ -n "$changed" ]; then say "applied the $STACK config:$changed (was: $before, now: $after)"
+  else say "$STACK config already in place ($after), nothing changed"; fi
+  matches "$STACK" "$after" || { say "config still does not match the $STACK stack: $after"; return 1; }
+}
+
+greeter() {   # after a kwin update in a running system: the greeter's env, and a software drop-in that went stale
+  local changed=""
+  WAIT=0; stack
+  if sw_stale && [ ! -e "$MANUAL" ]; then
+    pvr-desktop off >/dev/null 2>&1 && changed="$changed pvr-desktop=off"
+  fi
+  greeter_apply
+  say "KWin $(kwin_qpainter && echo "has QPainter" || echo "has no QPainter"), $STACK stack:${changed:- nothing to change} (greeter-kwin: $(greeter_state))"
+  greeter_ok
+}
+
+status() {
+  WAIT=0; stack
+  local c w; c=$(config); w=$(wl_state)
+  echo "kernel: $REL"; echo "driver: ${DRV:-none} ($HOW)"; echo "stack: $STACK"; echo "config: $c"
+  if wl_installed; then
+    if [ -e "$WLON" ]; then echo "pvr-wl: $w (enabled: $WLON)"; else echo "pvr-wl: $w (off: opt-in with $WLON)"; fi
+  elif [ -e "$WLGL" ]; then echo "pvr-wl: $w (refused: a stray libGL.so.1 in /opt/pvr-wl/lib, not from mesa-img-a7a)"
+  else echo "pvr-wl: $w (mesa-img-a7a with resolvable lib/ddk links not installed)"; fi
+  echo "greeter-kwin: $(greeter_state)"
+  [ -e "$MANUAL" ] && echo "manual: yes ($MANUAL)"
+  case "$STACK" in
+    open|ddk|nogpu) if matches "$STACK" "$c" && greeter_ok && ! sw_stale; then echo "match: yes"; return 0; else echo "match: no"; return 1; fi ;;
+    *) echo "match: unknown"; return 2 ;;
+  esac
+}
+
+case "${1:-}" in
+  apply) apply ;;
+  status) status ;;
+  greeter) greeter ;;
+  *) echo "usage: a7a-gpu-session apply|status|greeter" >&2; exit 2 ;;
+esac

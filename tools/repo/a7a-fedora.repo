@@ -1,0 +1,13 @@
+# The board packages of a7a-fedora: its Mesa builds, the A7A Panel and the board tools, signed with
+# /etc/pki/rpm-gpg/RPM-GPG-KEY-a7a-fedora. Package a7a-repo. Discover and `dnf upgrade` take their updates from here.
+# Unreachable (offline, or a Fedora release this project has no packages for): skipped, Fedora's own updates go on.
+# Kernels are not in it: a new kernel comes with a new image.
+[a7a-fedora]
+name=radxa-a7a-fedora44: Radxa Cubie A7A board packages
+baseurl=https://rabs9.github.io/radxa-a7a-fedora44-packages/$releasever/$basearch/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-a7a-fedora
+skip_if_unavailable=True
+metadata_expire=6h

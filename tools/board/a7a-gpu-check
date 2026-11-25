@@ -1,0 +1,211 @@
+#!/bin/bash
+# a7a-gpu-check [--bench]: inventory of the GPU stack on the Radxa Cubie A7A and a pass/warn checklist with hints.
+# Covers both stacks: the open driver (kernel powervr + Mesa) and the vendor DDK (pvrsrvkm + /opt/pvr). Read-only,
+# except --bench which runs two short glmark2 windows inside the logged-in session. Root not required (sudo is used
+# for dmesg/debugfs when available). docs/GPU-ROADMAP-2026-09-09.md, docs/OPEN-STACK-WEDGE-2026-09-09.md.
+BENCH=0; [ "${1:-}" = "--bench" ] && BENCH=1
+S() { sudo -n "$@" 2>/dev/null; }
+# kernel log since boot: journald keeps it after the dmesg ring rotated
+KLOG() { S journalctl -k -b -o cat 2>/dev/null || S dmesg; }
+ok() { printf "  PASS  %s\n" "$*"; }
+warn() { printf "  WARN  %s\n" "$*"; WARNS=$((WARNS+1)); }
+fail() { printf "  FAIL  %s\n" "$*"; FAILS=$((FAILS+1)); }
+info() { printf "  info  %s\n" "$*"; }
+WARNS=0; FAILS=0
+GPU=/sys/bus/platform/devices/1800000.gpu
+DT=/proc/device-tree/soc@3000000/gpu@1800000
+
+echo "== a7a-gpu-check $(date +%F\ %T) on $(hostname), kernel $(uname -r), up $(uptime -p | sed 's/up //')"
+
+echo "-- kernel driver"
+DRV=$(basename "$(readlink -f $GPU/driver 2>/dev/null)" 2>/dev/null)
+case "$DRV" in
+  powervr) ok "GPU bound to the open driver (drm/imagination 'powervr')"; STACK=open ;;
+  pvrsrvkm) ok "GPU bound to the vendor DDK module (pvrsrvkm)"; STACK=ddk ;;
+  "") fail "no driver bound to 1800000.gpu (modules: $(lsmod | grep -oE '^(powervr|pvrsrvkm)' | tr '\n' ' '))"; STACK=none ;;
+  *) warn "GPU bound to unexpected driver '$DRV'"; STACK=other ;;
+esac
+for c in /sys/class/drm/card*; do [ -e "$c/device/driver" ] && info "$(basename $c): $(basename "$(readlink -f $c/device/driver)")"; done
+if [ "$STACK" = open ]; then
+  FW=$(KLOG | grep -a "loaded firmware powervr" | tail -1 | grep -oE "powervr/[^ ]+"); FV=$(KLOG | grep -a "FW version" | tail -1 | grep -oE "v[0-9.]+ \(build [0-9]+[^)]*\)")
+  [ -n "$FW" ] && ok "firmware $FW $FV" || warn "no 'loaded firmware' line in dmesg (ls /lib/firmware/powervr: $(ls /lib/firmware/powervr 2>/dev/null | tr '\n' ' '))"
+  M=$(S sh -c 'for m in /sys/kernel/debug/dri/*; do [ -d "$m/pvr_fw" ] && basename "$m" && break; done')
+  if [ -n "$M" ]; then
+    # upstream-master driver: pvr_fw/trace_mask (group mask, 0x67a = MAIN|CLEANUP|CSW|BIF|PM|POW|HWR); v6.16 graft: pvr_params/fw_trace_mask (groups | TRACE bit)
+    if S test -e /sys/kernel/debug/dri/$M/pvr_fw/trace_mask; then MASK=$(S cat /sys/kernel/debug/dri/$M/pvr_fw/trace_mask); KNOB=pvr_fw/trace_mask; GEN=master; else MASK=$(S cat /sys/kernel/debug/dri/$M/pvr_params/fw_trace_mask); KNOB=pvr_params/fw_trace_mask; GEN=v616; fi
+    info "firmware trace mask $MASK via $KNOB (0 = off; pvrwatch/fwtrace-tail arm it); driver graft: $GEN"
+  else info "no pvr debugfs (root needed, or driver without debugfs)"; fi
+  # without debugfs, tell the generations apart by the module parameter master added (init_fw_trace_mask)
+  [ -n "${GEN:-}" ] || { modinfo -p powervr 2>/dev/null | grep -q '^init_fw_trace_mask' && GEN=master || GEN=v616; }
+fi
+
+echo "-- device tree (gpu node)"
+COMP=$(tr '\0' ' ' < $DT/compatible 2>/dev/null); info "compatible: $COMP"
+case "$STACK:$COMP" in
+  open:*img-rogue*) ok "img,img-rogue present for the open driver" ;;
+  open:*) fail "open driver bound but DT compatible lacks img,img-rogue (?)" ;;
+  ddk:*img,gpu*) ok "img,gpu present for the DDK" ;;
+esac
+CN=$(tr '\0' ' ' < $DT/clock-names 2>/dev/null); info "clock-names: $CN"
+[ "$STACK" = open ] && { echo "$CN" | grep -q "core" && ok "core/sys/mem clock names for the open driver" || fail "open driver needs 'core' in clock-names"; }
+if [ -f $DT/assigned-clock-rates ]; then info "assigned-clock-rates: $(od -An -tu4 --endian=big $DT/assigned-clock-rates | tr -s ' ')"; else [ "$STACK" = open ] && warn "no assigned-clock-rates: the open driver never sets a GPU clock, the boot default applies"; fi
+[ -f $DT/clk_rate ] && info "clk_rate (DDK): $(($(od -An -tu4 --endian=big $DT/clk_rate)/1000000)) MHz"
+[ -f $DT/gpu-supply ] && ok "gpu-supply present" || warn "no gpu-supply in the gpu node"
+
+echo "-- clock and voltage"
+CLK=$(S grep -E "^ +gpu0 " /sys/kernel/debug/clk/clk_summary | awk '{print $5/1000000}'); PLL=$(S grep -E "^ +pll-gpu " /sys/kernel/debug/clk/clk_summary | awk '{print $5/1000000}')
+MV=$(for r in /sys/class/regulator/regulator.*; do n=$(cat $r/name 2>/dev/null); case $n in *dcdc4*) echo $(( $(cat $r/microvolts) / 1000 ));; esac; done | head -1)
+info "gpu0 ${CLK:-?} MHz (pll-gpu ${PLL:-?} MHz), dcdc4 ${MV:-?} mV"
+case "${CLK%.*}:${MV}" in
+  600:800|840:800|1008:800) ok "validated clock/voltage pair" ;;
+  1200:920) warn "1200 MHz @ 920 mV: untested pair (clock-ceiling.sh first)" ;;
+  1200:*) fail "1200 MHz at ${MV} mV: known unstable at 800 mV (computed-looking GPU faults)" ;;
+  *) warn "unvalidated pair ${CLK} MHz @ ${MV} mV (validated: 600/840/1008 @ 800)" ;;
+esac
+
+echo "-- power management"
+if [ -d $GPU/power ]; then
+  CTL=$(cat $GPU/power/control); ST=$(cat $GPU/power/runtime_status)
+  if [ "$STACK" = open ] && [ "${GEN:-}" = master ]; then
+    # upstream-master graft (2026-09-09 evening): runtime power-down soaked clean (docs/UPSTREAM-REGRAFT-2026-09-09.md)
+    [ "$CTL" = auto ] && ok "runtime power-down active (control=auto, status=$ST): the master-graft driver survives GPU power cycles" || warn "runtime power-down disabled (control=on): not needed since the upstream-master graft; the GPU clocks stay on while idle"
+    [ -f /etc/udev/rules.d/90-powervr-no-runtime-suspend.rules ] && warn "udev rule 90-powervr-no-runtime-suspend.rules present: only the v6.16 graft needed it; remove it" || ok "no runtime-suspend udev rule (not needed with the master graft)"
+  elif [ "$STACK" = open ]; then
+    [ "$CTL" = on ] && ok "runtime power-down disabled (control=on): no firmware warm-boot lockups (v6.16 graft)" || warn "runtime power-down active (control=auto): context resets after power cycles seen with the v6.16 graft (udev rule 90-powervr-no-runtime-suspend.rules keeps it on)"
+    [ -f /etc/udev/rules.d/90-powervr-no-runtime-suspend.rules ] && ok "udev rule present" || warn "udev rule missing: control reverts to auto at boot"
+  else info "runtime control=$CTL status=$ST (DDK manages its own power)"; fi
+fi
+
+echo "-- health (dmesg since boot)"
+RS=$(S dmesg | grep -ac "context reset notification"); TO=$(S dmesg | grep -ac "Job timeout"); UF=$(S dmesg | grep -ac "unknown FWCCB"); WA=$(S dmesg | grep -acE "WARNING:.*(pvr_|imagination)"); # A kernel worker waits in D state for a while whenever the SD card is busy (a log-in, an update): the check counted
+# the D-state workers twice two seconds apart and failed on two different busy workers (2026-11-17, 25 s after a
+# log-in: "2 D-state kworkers", gone a few seconds later). Stuck = the SAME worker in D state over 8 seconds.
+dws() { ps -eLo stat,tid,comm | awk '$1 ~ /^D/ && $3 ~ /kworker/ {print $2}' | sort; }
+DS=0; DW=$(dws)
+if [ -n "$DW" ]; then sleep 4; DW=$(comm -12 <(echo "$DW") <(dws)); fi
+if [ -n "$DW" ]; then sleep 4; DW=$(comm -12 <(echo "$DW") <(dws)); fi
+DS=$(echo "$DW" | grep -c . || true)
+DSW=$(for t in $DW; do echo "$(cat /proc/$t/comm 2>/dev/null) in $(cat /proc/$t/wchan 2>/dev/null)"; done | sort | uniq -c | tr -s ' ' | tr '\n' ';')
+[ "$STACK" = open ] && { [ "$RS" = 0 ] && ok "0 context resets" || warn "$RS context resets (reasons: $(S dmesg | grep -aoE 'Reset reason=[0-9]+ \([A-Za-z ]+\)' | sort | uniq -c | tr -s ' ' | tr '\n' ';'))"; [ "$TO" = 0 ] && ok "0 job timeouts" || warn "$TO job timeouts"; [ "$UF" = 0 ] || warn "$UF 'unknown FWCCB command' lines (decoder patch missing?)"; [ "$WA" = 0 ] || warn "$WA driver WARNINGs"; }
+[ "$STACK" = ddk ] && { H=$(S grep -oE "HWR Event Count: +[0-9]+" /sys/kernel/debug/pvr/status | grep -oE "[0-9]+$"); [ "${H:-0}" = 0 ] && ok "0 hardware recoveries (HWR)" || warn "$H hardware recoveries (HWR)"; }
+[ "$DS" = 0 ] && ok "no kernel worker stuck in D state (8 s)" || fail "$DS kernel worker(s) stuck in D state for 8 s (wedge?):$DSW"
+# \bfault: the boot line "iommu: Default domain type: Translated" is not a fault (it matched "fault" inside "Default" until 2026-09-09)
+IO=$(S dmesg | grep -aiE "iommu.*(\bfault|unhandled)" | grep -vc "register iommu fault callback"); [ "${IO:-0}" = 0 ] || warn "$IO IOMMU fault lines (display engine storm?)"
+
+echo "-- userspace (Vulkan / GL)"
+for j in /usr/local/share/vulkan/icd.d/powervr*.json /usr/share/vulkan/icd.d/powervr*.json; do [ -f "$j" ] && info "ICD $j -> $(grep -o '"library_path"[^,]*' $j | cut -d'"' -f4)"; done
+if [ -f /usr/local/share/vulkan/icd.d/powervr_mesa_icd.aarch64.json ]; then
+  strings /usr/local/lib64/libvulkan_powervr_mesa.so 2>/dev/null | grep -q "a7a loadop cache" && ok "a7a-patched Mesa PowerVR driver installed (/usr/local, caches + conformance)" || warn "/usr/local driver present but without the a7a markers"
+  [ -f /usr/share/vulkan/icd.d/powervr_mesa_icd.aarch64.json ] && warn "Fedora's PowerVR ICD is active too (two ICDs; mask it: mv ... .disabled-by-a7a)" || ok "Fedora's PowerVR ICD masked"
+else [ "$STACK" = open ] && warn "no a7a Mesa driver in /usr/local: Fedora's driver needs PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 (tools/mesa/build-pvr-vulkan.sh)"; fi
+if [ "$STACK" = open ]; then
+  DEV=$(env -u PVR_I_WANT_A_BROKEN_VULKAN_DRIVER timeout 20 vulkaninfo --summary 2>/dev/null | grep -m1 deviceName | sed 's/.*= //'); [ -n "$DEV" ] && ok "Vulkan device without any env var: $DEV" || fail "no Vulkan device without the conformance override"
+fi
+[ "$STACK" = ddk ] && { [ -d /opt/pvr/lib ] && ok "DDK userspace under /opt/pvr" || fail "DDK userspace missing (/opt/pvr)"; }
+for f in /etc/environment.d/91-powervr-mesa.conf /etc/profile.d/91-powervr-mesa.sh /etc/systemd/user/plasma-kwin_wayland.service.d/mesa.conf; do [ -f "$f" ] && warn "leftover override $f (not needed with the a7a driver)"; done
+DROP=/etc/systemd/user/plasma-kwin_wayland.service.d
+if [ -f $DROP/pvr.conf ]; then [ "$STACK" = ddk ] && ok "KWin DDK drop-in present (pvr-desktop on)" || warn "KWin DDK drop-in (pvr.conf) present on the open stack: KWin would load /opt/pvr libraries (sudo a7a-gpu-session apply puts the config in line with the kernel)"; fi
+[ -f $DROP/software.conf ] && info "KWin software.conf drop-in present ($(sed -n 's/^Environment=//p' $DROP/software.conf | head -1))"
+CAP=$(getcap /usr/bin/kwin_wayland 2>/dev/null); if [ "$STACK" = open ]; then [ -n "$CAP" ] && ok "kwin_wayland keeps cap_sys_nice ($CAP)" || warn "kwin_wayland has no cap_sys_nice (5x compositor throughput on the open stack; a7a-kwin-nocap units strip it for the DDK)"; else [ -z "$CAP" ] && ok "cap_sys_nice stripped (needed for the DDK's LD_LIBRARY_PATH)" || warn "kwin_wayland has $CAP: the loader ignores LD_LIBRARY_PATH, KWin will miss the DDK"; fi
+
+echo "-- session unit (a7a-gpu-session.service applies the config matching the bound driver at boot)"
+if command -v a7a-gpu-session >/dev/null 2>&1; then
+  SST=$(a7a-gpu-session status 2>/dev/null); SRC=$?
+  SCFG=$(sed -n 's/^config: //p' <<<"$SST"); SSTACK=$(sed -n 's/^stack: //p' <<<"$SST")
+  EN=$(systemctl is-enabled a7a-gpu-session.service 2>/dev/null); RES=$(systemctl show -p Result --value a7a-gpu-session.service 2>/dev/null)
+  [ "$EN" = enabled ] && ok "a7a-gpu-session.service enabled (last run: ${RES:-?})" || warn "a7a-gpu-session.service is '${EN:-missing}': the session config does not follow the kernel at boot (install a7a-gpu-tools)"
+  [ "$EN" != enabled ] || [ "$RES" = success ] || warn "a7a-gpu-session.service last result '$RES' (journalctl -u a7a-gpu-session)"
+  case $SRC in
+    0) ok "session config '$SCFG' matches the $SSTACK stack" ;;
+    1) fail "session config '$SCFG' does not match the $SSTACK stack (sudo a7a-gpu-session apply, or reboot)" ;;
+    *) warn "a7a-gpu-session cannot tell the stack: $(sed -n 's/^driver: //p' <<<"$SST")" ;;
+  esac
+  grep -q "^manual: yes" <<<"$SST" && warn "/etc/a7a/gpu-session.manual present: the unit leaves the session config alone"
+  # the greeter's compositor: KWin 6.8 has no QPainter backend for real displays, and with the setting made for 6.7 it
+  # exits and the login screen stays black (2026-11-16). a7a-gpu-session says which of the two this system is
+  SGR=$(sed -n 's/^greeter-kwin: //p' <<<"$SST")
+  case "$SGR" in
+    static*|env*) ok "greeter compositor: $SGR" ;;
+    "") : ;;      # an a7a-gpu-session from before 2026-11-16
+    *) fail "greeter compositor: $SGR (sudo a7a-gpu-session greeter)" ;;
+  esac
+  # the Wayland-capable DDK Mesa (mesa-img-a7a) as the system EGL/GLES layer on the DDK boot; a stale entry anywhere
+  # else already turns 'match' into a FAIL above
+  PWL=$(sed -n 's/^pvr-wl: //p' <<<"$SST"); [ -n "$PWL" ] && info "pvr-wl (DDK Mesa with Wayland, system-wide on the DDK boot): $PWL"
+  # Item E 1(a): the open stack's GPU interrupt on the big cluster, set by 90-a7a-gpu-irq.rules at the bind and kept
+  # there by a7a-irqbalance-policy (irqbalance moved it back to cpu0 at every boot until 2026-09-10 night)
+  if [ "$STACK" = open ]; then
+    GI=$(awk '$NF ~ /^(gpu|pvr[a-z]*)$/ { sub(/:/, "", $1); print $1; exit }' /proc/interrupts)
+    GE=$(cat "/proc/irq/$GI/effective_affinity_list" 2>/dev/null)
+    case "$GE" in
+      6|7|6-7) ok "GPU interrupt $GI on the big cluster (cpu $GE)" ;;
+      *) warn "GPU interrupt ${GI:-?} on cpu ${GE:-?}, not 6-7 (systemctl show -p ExecStart irqbalance must name --policyscript; sudo a7a-gpu-irq-affinity)" ;;
+    esac
+  fi
+  for u in a7a-gpu-session.service a7a-kwin-nocap.path a7a-kwin-nocap.service; do
+    [ -f /etc/systemd/system/$u ] && [ ! -L /etc/systemd/system/$u ] && [ -f /usr/lib/systemd/system/$u ] && warn "hand copy /etc/systemd/system/$u shadows the packaged unit (remove it, then systemctl daemon-reload)"
+  done
+  for f in /etc/systemd/user/plasma-login-kwin_wayland.service.d/software.conf.rpm{orig,new,save}; do [ -e "$f" ] && warn "leftover $f from the package install (compare, then delete)"; done
+else info "no a7a-gpu-session (a7a-gpu-tools before 2026-09-10): prepare616.sh/backtoddk.sh switch the session config by hand"; fi
+
+echo "-- session"
+K=$(pgrep -u "$(id -u radxa 2>/dev/null || echo 1000)" -x kwin_wayland | head -1)
+if [ -n "$K" ]; then
+  LIBS=$(S grep -oE "/usr/(local/)?lib64/libvulkan_powervr_mesa.so|/opt/pvr/lib/libEGL.so.1|libgallium-[0-9.]+so|llvmpipe|libvulkan_lvp" /proc/$K/maps | sort -u | tr '\n' ' ')
+  info "kwin_wayland pid $K maps: $LIBS"
+  case "$STACK:$LIBS" in
+    open:*local/lib64/libvulkan_powervr_mesa*) ok "compositor renders through the a7a driver" ;;
+    open:*lib64/libvulkan_powervr_mesa*) warn "compositor uses Fedora's PowerVR driver (log out/in after installing the a7a build)" ;;
+    open:*) fail "compositor is not on the PowerVR (software?)" ;;
+    ddk:*/opt/pvr/*) ok "compositor renders through the DDK" ;;
+    ddk:*) fail "compositor is not on the DDK libraries" ;;
+  esac
+  # The compositor on the GPU says nothing about its clients: after the update to KWin 6.8 (2026-11-16) it stayed
+  # on the DDK while every application ran on softpipe, and this check passed. A client names the driver it loaded:
+  # dri/swrast_dri.so is software, dri/pvr_dri.so (or the sunxi-drm alias) is the PowerVR.
+  if [ "$STACK" = ddk ]; then
+    PS=$(pgrep -u "$(id -u radxa 2>/dev/null || echo 1000)" -x plasmashell | head -1)
+    if [ -n "$PS" ]; then
+      DRI=$(S grep -oE "/opt/pvr-wl/lib/dri/[a-z_-]+_dri\.so" /proc/$PS/maps | sort -u | sed 's|.*/||' | tr '\n' ' ')
+      case "$DRI" in
+        *swrast_dri.so*) fail "Wayland applications render in software (plasmashell loaded ${DRI% }): the compositor does not lead its clients to the GPU (KWin 6.8 with a mesa-img-a7a from before 2026-11-16?)" ;;
+        *pvr_dri.so*|*sunxi-drm_dri.so*) ok "Wayland applications render on the PowerVR (plasmashell loaded ${DRI% })" ;;
+        "") warn "plasmashell has no /opt/pvr-wl driver loaded (pvr-wl not active, or the shell has not drawn yet)" ;;
+        *) warn "plasmashell loaded an unexpected driver: $DRI" ;;
+      esac
+    else info "no plasmashell in the session: applications not checked"; fi
+    # X11 programs are a second path: Xwayland draws for them, through glamor when it has a GPU. Under KWin 6.8 it
+    # refuses the device the compositor names ("Main linux-dmabuf device has no render node") in its OWN code,
+    # which the glue's fallback cannot reach: with the line above alone this check said "applications on the
+    # PowerVR" while every X11 program drew on the CPU (reviewer, 2026-11-16).
+    XW=$(pgrep -u "$(id -u radxa 2>/dev/null || echo 1000)" -x Xwayland | head -1)
+    if [ -n "$XW" ]; then
+      XD=$(S grep -oE "/opt/pvr[^ ]*/lib/dri/[a-z_-]+_dri\.so" /proc/$XW/maps | sort -u | sed 's|.*/||' | tr '\n' ' ')
+      # a loaded driver is not a working glamor: Xwayland's own words in this boot's journal count as well
+      XJ=$(S journalctl -b --no-pager -o cat _UID="$(id -u radxa 2>/dev/null || echo 1000)" | grep -cE "EGL setup failed, disabling glamor|Main linux-dmabuf device has no render node" || true)
+      if [ "${XJ:-0}" -gt 0 ]; then warn "X11 programs draw in software: Xwayland says it runs without glamor ($XJ lines in this boot's journal; it loaded ${XD:-no DDK driver}; KWin 6.8 names it a device without a render node)"
+      else case "$XD" in
+        *swrast_dri.so*|"") warn "X11 programs draw in software: Xwayland loaded ${XD:-no DDK driver}" ;;
+        *) ok "X11 programs: Xwayland loaded the DDK driver (${XD% }) and reports no glamor failure in this boot's journal" ;;
+      esac; fi
+    else info "no Xwayland running (it starts with the first X11 program): X11 programs not checked"; fi
+  fi
+  ENVBAD=$(S cat /proc/$K/environ | tr '\0' '\n' | grep -E "^(PVR_I_WANT_A_BROKEN_VULKAN_DRIVER|MESA_LOADER_DRIVER_OVERRIDE|LD_LIBRARY_PATH|XWAYLAND_NO_GLAMOR)=" | tr '\n' ' ')
+  [ "$STACK" = open ] && [ -n "$ENVBAD" ] && warn "compositor environment carries overrides: $ENVBAD"
+else info "no user session running (greeter only)"; fi
+
+if [ $BENCH = 1 ] && [ -n "$K" ]; then
+  echo "-- benchmark (glmark2-es2-wayland build scene, 3 s each; KWin CPU per client frame)"
+  export XDG_RUNTIME_DIR=/run/user/$(stat -c %u /proc/$K) WAYLAND_DISPLAY=wayland-0
+  # A warm-up run per size, discarded: the first client after an idle period pays the GPU's cold boot out of
+  # runtime suspend plus Mesa's load-op/render-state compiles, which reads as ~15 fps instead of ~270 (2026-09-10).
+  for sz in 640x480 1024x600; do
+    timeout 30 glmark2-es2-wayland -s $sz -b build:duration=2 >/dev/null 2>&1
+    c0=$(awk '{print $14+$15}' /proc/$K/stat); out=$(timeout 30 glmark2-es2-wayland -s $sz -b build:duration=3 2>&1 | grep -oE "FPS: [0-9]+"); c1=$(awk '{print $14+$15}' /proc/$K/stat); fps=${out#FPS: }; info "$sz: ${out:-no result}, kwin ~$(( (c1-c0)*10 / (${fps:-0}*3+1) )) ms CPU per frame"
+  done
+  info "reference 2026-09-10 (open stack, a7a driver, clean desktop): 640x480 ~270 fps / 1 ms; 1024x600 ~34 fps / 13 ms"
+  info "more detail: tools/gpu-debug/speed-bench.sh {client|full|threads|idle} (docs/SPEED-2026-09-10.md)"
+fi
+
+echo "== summary: $FAILS fail, $WARNS warn (stack: $STACK)"
+[ $FAILS = 0 ]

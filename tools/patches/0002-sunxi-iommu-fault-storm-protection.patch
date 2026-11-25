@@ -1,0 +1,290 @@
+From: a7a-fedora
+Subject: [PATCH] sunxi-iommu: survive a fault storm, stop the false PM warnings in the fault path
+
+A master that keeps fetching from an unmapped address (2026-09-07: the display
+engine scanning out a KWin buffer that had been unmapped under it) faults on
+every burst. The handler printed three lines and reset the master per fault,
+hundreds of times per millisecond, CPU0 never left interrupt context, the
+console dropped messages, the network died and the board needed a power cycle.
+
+- print full details for the first 8 faults of an instance, then one summary
+  line per second; after 512 faults leave the interrupt line disabled with a
+  message (the faulting master stays on its fault, everything else runs, the
+  state can be read over ssh).
+- the per-master register accessors did pm_runtime_get_if_in_use() + WARN_ON
+  + unconditional pm_runtime_put(): the master device autosuspends 5 s after
+  use, so every fault produced a backtrace and a "Runtime PM usage count
+  underflow!". Only put what was got, no warning.
+- sunxi_iommu_register_unmap_watch(): a client (sunxi-drm) checks every unmap against the buffers a master
+  is still using and the offender is named with a stack trace (diagnosis of a scanout buffer that vanishes
+  under the display engine without its owner freeing it).
+---
+diff --git a/drivers/iommu/sunxi-iommu-v2.c b/drivers/iommu/sunxi-iommu-v2.c
+index edf2ea6..9facf8b 100644
+--- a/drivers/iommu/sunxi-iommu-v2.c
++++ b/drivers/iommu/sunxi-iommu-v2.c
+@@ -288,9 +288,27 @@ struct sunxi_iommu_dev {
+ 	struct reset_control **rst;
+ 	u32 skip_mask;
+ 	struct sunxi_iommu_master_dev *master;
++	/* fault storm protection, per hardware instance: see sunxi_iommu_irq() */
++	unsigned int fault_count[IOMMU_HW_SET_COUNT];
++	unsigned long fault_summary_jiffies[IOMMU_HW_SET_COUNT];
+ };
+ static struct class *distribute_master_cs;
+ 
++/*
++ * Fault storm protection. A master that keeps fetching from an unmapped
++ * address (a scanout buffer freed under the display engine, for example)
++ * faults on every burst; the handler then prints and resets the master
++ * hundreds of times per millisecond, CPU0 never leaves interrupt context,
++ * the console drops messages and the board needs a power cycle. So: full
++ * details for the first SUNXI_IOMMU_FAULT_VERBOSE faults of an instance,
++ * one summary line per second after that, and after SUNXI_IOMMU_STORM_LIMIT
++ * faults the interrupt line is left disabled: the faulting master stays on
++ * its fault, everything else keeps running and the state can be read over
++ * ssh (/proc/sunxi-drm/debug for the display engine).
++ */
++#define SUNXI_IOMMU_FAULT_VERBOSE	8
++#define SUNXI_IOMMU_STORM_LIMIT		512
++
+ /*
+  * sunxi master device which use iommu.
+  */
+@@ -357,11 +375,27 @@ void sunxi_iommu_register_fault_cb(sunxi_iommu_fault_cb cb,
+ }
+ EXPORT_SYMBOL_GPL(sunxi_iommu_register_fault_cb);
+ 
++/*
++ * a7a-fedora unmap watch: a client (sunxi-drm) can veto-check every unmap against the buffers a master is
++ * still using. The watcher returns true when the range overlaps such a buffer; the unmap goes ahead (the
++ * caller owns it as far as the DMA API is concerned) but the offender is named with a stack trace, which
++ * is how a scanout buffer that "vanishes" under the display engine gets attributed.
++ */
++typedef bool (*sunxi_iommu_unmap_watch_cb)(unsigned long iova, size_t size);
++static sunxi_iommu_unmap_watch_cb sunxi_iommu_unmap_watch;
++
++void sunxi_iommu_register_unmap_watch(sunxi_iommu_unmap_watch_cb cb)
++{
++	sunxi_iommu_unmap_watch = cb;
++}
++EXPORT_SYMBOL_GPL(sunxi_iommu_register_unmap_watch);
++
+ static inline u32 sunxi_iommu_read(struct sunxi_iommu_dev *iommu, u32 offset)
+ {
+ 	if (unlikely((offset & (IOMMU_PER_SET_ADDR_SIZE - 1)) >
+ 		     IOMMU_MIC_BASE_OFFSET)) {
+ 		int master_id = 0;
++		int pm = 0;
+ 		u32 read;
+ 		u32 test_offset = offset;
+ 		if (test_offset > IOMMU_PER_SET_ADDR_SIZE) {
+@@ -373,11 +407,17 @@ static inline u32 sunxi_iommu_read(struct sunxi_iommu_dev *iommu, u32 offset)
+ 		if (iommu->skip_mask & (1 << master_id))
+ 			return 0;
+ 
++		/*
++		 * The master device autosuspends 5 s after its last use, so in
++		 * the fault handler get_if_in_use() legitimately returns 0 (the
++		 * power domain itself is held by the master's own driver). Only
++		 * put what was actually got: the old WARN_ON + unconditional put
++		 * printed a backtrace and a "usage count underflow" per fault.
++		 */
+ 		if (iommu->master[master_id].dev)
+-			WARN_ON(pm_runtime_get_if_in_use(
+-					iommu->master[master_id].dev) <= 0);
++			pm = pm_runtime_get_if_in_use(iommu->master[master_id].dev);
+ 		read = readl(iommu->base + offset);
+-		if (iommu->master[master_id].dev)
++		if (pm > 0)
+ 			pm_runtime_put(iommu->master[master_id].dev);
+ 
+ 		return read;
+@@ -391,6 +431,7 @@ static inline void sunxi_iommu_write(struct sunxi_iommu_dev *iommu, u32 offset,
+ 	if (unlikely((offset & (IOMMU_PER_SET_ADDR_SIZE - 1)) >
+ 		     IOMMU_MIC_BASE_OFFSET)) {
+ 		int master_id = 0;
++		int pm = 0;
+ 		u32 test_offset = offset;
+ 		if (test_offset > IOMMU_PER_SET_ADDR_SIZE) {
+ 			test_offset -= IOMMU_PER_SET_ADDR_SIZE;
+@@ -401,12 +442,12 @@ static inline void sunxi_iommu_write(struct sunxi_iommu_dev *iommu, u32 offset,
+ 		if (iommu->skip_mask & (1 << master_id))
+ 			return;
+ 
++		/* see sunxi_iommu_read() */
+ 		if (iommu->master[master_id].dev)
+-			WARN_ON(pm_runtime_get_if_in_use(
+-					iommu->master[master_id].dev) <= 0);
++			pm = pm_runtime_get_if_in_use(iommu->master[master_id].dev);
+ 
+ 		writel(value, iommu->base + offset);
+-		if (iommu->master[master_id].dev)
++		if (pm > 0)
+ 			pm_runtime_put(iommu->master[master_id].dev);
+ 
+ 		return;
+@@ -863,6 +904,12 @@ static size_t sunxi_iommu_unmap(struct iommu_domain *domain, unsigned long iova,
+ 	iova_start = iova & IOMMU_PT_MASK;
+ 	iova_end = SPAGE_ALIGN(iova + size);
+ 
++	if (sunxi_iommu_unmap_watch && sunxi_iommu_unmap_watch(iova, size)) {
++		pr_err("sunxi-iommu: unmap of 0x%lx+0x%zx overlaps a buffer still used by a master, by %s[%d]:\n",
++		       iova, size, current->comm, task_pid_nr(current));
++		dump_stack();
++	}
++
+ 	if (gather->start > iova_start)
+ 		gather->start = iova_start;
+ 	if (gather->end < iova_end)
+@@ -1243,8 +1290,11 @@ static int sunxi_iova_invalid_helper(unsigned long iova)
+ 	return sunxi_pgtable_invalid_helper(sunxi_domain->pgtable, iova);
+ }
+ 
++/* prints of the fault handler: only for the first faults of a storm */
++#define fault_err(fmt, ...) do { if (verbose) pr_err(fmt, ##__VA_ARGS__); } while (0)
++
+ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+-					 int index)
++					 int index, bool verbose)
+ {
+ 	u32 inter_status_reg = 0;
+ 	dma_addr_t addr_reg = 0;
+@@ -1266,7 +1316,7 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 	int_masterid_bitmap = inter_status_reg | l1_pgint_reg | l2_pgint_reg;
+ 
+ 	if (inter_status_reg & (1 << 0)) {
+-		pr_err("%s Invalid Authority\n",
++		fault_err("%s Invalid Authority\n",
+ 		       plat_data->master[index * IOMMU_MIC_MAX_MASTER + 0]);
+ 		addr_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_LOW_ADDR_REG(0));
+@@ -1277,7 +1327,7 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 		data_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_DATA_REG(0));
+ 	} else if (inter_status_reg & (1 << 1)) {
+-		pr_err("%s Invalid Authority\n",
++		fault_err("%s Invalid Authority\n",
+ 		       plat_data->master[index * IOMMU_MIC_MAX_MASTER + 1]);
+ 		addr_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_LOW_ADDR_REG(1));
+@@ -1288,7 +1338,7 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 		data_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_DATA_REG(1));
+ 	} else if (inter_status_reg & (1 << 2)) {
+-		pr_err("%s Invalid Authority\n",
++		fault_err("%s Invalid Authority\n",
+ 		       plat_data->master[index * IOMMU_MIC_MAX_MASTER + 2]);
+ 		addr_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_LOW_ADDR_REG(2));
+@@ -1299,7 +1349,7 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 		data_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_DATA_REG(2));
+ 	} else if (inter_status_reg & (1 << 3)) {
+-		pr_err("%s Invalid Authority\n",
++		fault_err("%s Invalid Authority\n",
+ 		       plat_data->master[index * IOMMU_MIC_MAX_MASTER + 3]);
+ 		addr_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_LOW_ADDR_REG(3));
+@@ -1310,7 +1360,7 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 		data_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_DATA_REG(3));
+ 	} else if (inter_status_reg & (1 << 4)) {
+-		pr_err("%s Invalid Authority\n",
++		fault_err("%s Invalid Authority\n",
+ 		       plat_data->master[index * IOMMU_MIC_MAX_MASTER + 4]);
+ 		addr_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_LOW_ADDR_REG(4));
+@@ -1321,7 +1371,7 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 		data_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_DATA_REG(4));
+ 	} else if (inter_status_reg & (1 << 5)) {
+-		pr_err("%s Invalid Authority\n",
++		fault_err("%s Invalid Authority\n",
+ 		       plat_data->master[index * IOMMU_MIC_MAX_MASTER + 5]);
+ 		addr_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_LOW_ADDR_REG(5));
+@@ -1332,7 +1382,7 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 		data_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_DATA_REG(5));
+ 	} else if (inter_status_reg & (1 << 6)) {
+-		pr_err("%s Invalid Authority\n",
++		fault_err("%s Invalid Authority\n",
+ 		       plat_data->master[index * IOMMU_MIC_MAX_MASTER + 6]);
+ 		addr_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_MIC_INT_ERR_LOW_ADDR_REG(6));
+@@ -1345,7 +1395,7 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 	} else if (inter_status_reg & IOMMU_INT_L1PG_STA_MASK) {
+ 		/*It's OK to prefetch an invalid page, no need to print msg for debug.*/
+ 		if (!(int_masterid_bitmap & (1U << 31)))
+-			pr_err("L1 PageTable Invalid\n");
++			fault_err("L1 PageTable Invalid\n");
+ 		addr_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_INT_ERR_LOW_ADDR7_REG);
+ 		addr_reg |=
+@@ -1356,7 +1406,7 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 					    offset + IOMMU_INT_ERR_DATA7_REG);
+ 	} else if (inter_status_reg & IOMMU_INT_L2PG_STA_MASK) {
+ 		if (!(int_masterid_bitmap & (1U << 31)))
+-			pr_err("L2 PageTable Invalid\n");
++			fault_err("L2 PageTable Invalid\n");
+ 		addr_reg = sunxi_iommu_read(
+ 			iommu, offset + IOMMU_INT_ERR_LOW_ADDR8_REG);
+ 		addr_reg |=
+@@ -1366,13 +1416,14 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ 		data_reg = sunxi_iommu_read(iommu,
+ 					    offset + IOMMU_INT_ERR_DATA8_REG);
+ 	} else
+-		pr_err("sunxi iommu int error!!!\n");
++		fault_err("sunxi iommu int error!!!\n");
+ 
+ 	if (!(int_masterid_bitmap & (1U << 31))) {
+-		sunxi_iova_invalid_helper(addr_reg);
++		if (verbose)
++			sunxi_iova_invalid_helper(addr_reg);
+ 		int_masterid_bitmap &= 0xffff;
+ 		master_id = __ffs(int_masterid_bitmap);
+-		pr_err("Bug is in %s module, invalid address: 0x%llx, data:0x%x, id:0x%x\n",
++		fault_err("Bug is in %s module, invalid address: 0x%llx, data:0x%x, id:0x%x\n",
+ 		       plat_data->master[index * IOMMU_MIC_MAX_MASTER +
+ 					 master_id],
+ 		       addr_reg, data_reg, int_masterid_bitmap);
+@@ -1412,8 +1463,22 @@ static void __dump_int_from_one_instance(struct sunxi_iommu_dev *iommu,
+ static irqreturn_t sunxi_iommu_irq(int irq, void *dev_id)
+ {
+ 	struct sunxi_iommu_dev *iommu = dev_id;
++	int index = irq == iommu->irq[1];
++	unsigned int n = ++iommu->fault_count[index];
++	bool verbose = n <= SUNXI_IOMMU_FAULT_VERBOSE;
++
++	if (!verbose &&
++	    printk_timed_ratelimit(&iommu->fault_summary_jiffies[index], 1000))
++		pr_err("sunxi iommu%d: %u faults so far (details printed for the first %d only)\n",
++		       index, n, SUNXI_IOMMU_FAULT_VERBOSE);
+ 
+-	__dump_int_from_one_instance(iommu, irq == iommu->irq[1]);
++	__dump_int_from_one_instance(iommu, index, verbose);
++
++	if (n == SUNXI_IOMMU_STORM_LIMIT) {
++		pr_err("sunxi iommu%d: fault storm (%u faults): disabling IRQ %d until reboot, the faulting master stays on its fault\n",
++		       index, n, irq);
++		disable_irq_nosync(irq);
++	}
+ 
+ 	return IRQ_HANDLED;
+ }
+diff --git a/include/sunxi-iommu.h b/include/sunxi-iommu.h
+index dde3a29..e2836a5 100644
+--- a/include/sunxi-iommu.h
++++ b/include/sunxi-iommu.h
+@@ -27,6 +27,10 @@ extern void sunxi_iommu_register_fault_cb(sunxi_iommu_fault_cb cb, unsigned int
+ extern void sunxi_enable_device_iommu(unsigned int master_id, bool flag);
+ extern void sunxi_reset_device_iommu(unsigned int master_id);
+ extern struct iommu_domain *global_iommu_domain;
++
++/* a7a-fedora: see sunxi_iommu_register_unmap_watch() in sunxi-iommu-v2.c */
++typedef bool (*sunxi_iommu_unmap_watch_cb)(unsigned long iova, size_t size);
++void sunxi_iommu_register_unmap_watch(sunxi_iommu_unmap_watch_cb cb);
+ ssize_t sunxi_iommu_dump_pgtable(char *buf, size_t buf_len,
+ 					       bool for_sysfs_show);
+ void sunxi_iommu_prevent_hang_enable(int enable);

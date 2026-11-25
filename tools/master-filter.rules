@@ -1,0 +1,195 @@
+# tools/master-filter.rules: what of a card that has been in use does NOT go into an image for other people.
+# Read by tools/master-image.sh (rsync --filter="merge ..." through tools/priv.sh copy-system), which appends the
+# kernels no package owns. rsync filter rules: top to bottom, the first match decides, a leading / is the root of the
+# card's system.
+#   - /dir/*                    the directory stays, empty
+#   + /dir/**/  then  - /dir/** the directories below stay, the files go (their owners and modes are what services
+#                               expect: a /var without its directories was the bug of 2026-11-15)
+# A path that is excluded is never read: nothing of it can be in the new filesystem, not even in its free space.
+# tests/test_master.py runs these rules with the real rsync over a model of the card.
+
+# -- extended attributes in the user namespace are notes on a file: where it was downloaded from, tags, a cache's
+#    request headers. What the system needs is in security.* (file capabilities, labels) and is copied. A rule for
+#    attribute names switches off rsync's own handling of the namespaces, so system.* (ACLs, which -A copies) is named
+-x user.*
+-x system.*
+
+# -- never part of an image
+- /proc/*
+- /sys/*
+- /dev/*
+- /run/*
+- /tmp/*
+- /mnt/*
+- /media/*
+- /srv/*
+- /lost+found
+- /imjournal.state
+- /swapfile
+
+# -- the owner's home and root's. The build makes a fresh home; root keeps the five files of the rootfiles package
+- /home/*/**
++ /root/.bashrc
++ /root/.bash_profile
++ /root/.bash_logout
++ /root/.cshrc
++ /root/.tcshrc
+- /root/**
+
+# -- identity and credentials of this one machine
+- /etc/machine-id
+- /var/lib/dbus/machine-id
+- /etc/ssh/ssh_host_*
+- /etc/NetworkManager/system-connections/*
+- /etc/resolv.conf
+- /etc/cups/printers.conf*
+- /etc/cups/classes.conf*
+- /etc/cups/subscriptions.conf*
+- /etc/cups/ppd/*
+- /etc/cups/ssl/*
+- /etc/iscsi/initiatorname.iscsi
+- /etc/ipsec.d/*.db
+- /etc/ipsec.d/pkcs11.txt
+- /etc/lvm/devices/*
+- /etc/lvm/archive/*
+- /etc/lvm/backup/*
+- /etc/lvm/cache/*
+- /etc/wireguard/*
+- /etc/openvpn/client/*
+- /etc/openvpn/server/*
+- /etc/krb5.keytab
+- /etc/cockpit/ws-certs.d/*
+- /etc/pki/tls/private/*
+- /etc/systemd/system.control/*
+- /etc/*-
+- /var/lib/systemd/random-seed
+- /var/lib/systemd/credential.secret
+- /var/lib/a7a/rootfs-grown
+
+# -- the boot menu's own backups (they name kernels and experiments of this card)
+- /boot/extlinux/extlinux.conf.*
+
+# -- a GRUB menu made on the card names the card's filesystem by its UUID, and the saved environment its kernel
+#    options. This board does not boot through GRUB; without a menu grub2's update script has nothing to regenerate
+- /boot/grub2/grub.cfg
+- /boot/grub2/grubenv
+- /usr/lib/efi/grub2/*/EFI/fedora/grub.cfg
+
+# -- dnf's record of every command the owner ran, with dates, his user id and the paths of the files he installed
+#    from. dnf5 keeps it here (/var/lib/dnf below is dnf4's); the *.toml beside it are the reasons packages are
+#    installed for and stay
+- /usr/lib/sysimage/libdnf5/transaction_history.sqlite*
+- /usr/lib/sysimage/libdnf5/offline
+
+# -- left from bringing the board up: configuration that was switched off and kept, a backup of a firmware file
+- /etc/a7a/disabled
+- /usr/lib/firmware/powervr/*.ddk-bak
+
+# -- logs, caches, spools: the directories stay
+- /var/log/journal/*
++ /var/log/**/
+- /var/log/**
+- /var/cache/libdnf5/*
+- /var/cache/PackageKit/*
++ /var/cache/**/
+- /var/cache/**
+- /var/tmp/*
+- /var/spool/abrt/*
+- /var/spool/abrt-upload/*
++ /var/spool/**/
+- /var/spool/**
+- /var/db/sudo/lectured/*
+
+# -- state of this one machine under /var/lib. Where the NAMES of the directories are data too (the login screen's
+#    home, Bluetooth: one directory per adapter and per paired device, named by address) everything below goes; the
+#    rest keeps its directories
+- /var/lib/plasmalogin/*
+- /var/lib/bluetooth/*
+# indexes and status files that name the owner's files: plocate's database is a compressed list of every path on the
+# card, his home included (updatedb does not skip /home), logrotate's status names every log it ever turned over
++ /var/lib/plocate/CACHEDIR.TAG
+- /var/lib/plocate/*
+- /var/lib/mlocate/*
+- /var/lib/logrotate/*
+# the DNSSEC trust anchor is rewritten with the time of the last query, in the owner's time zone; unbound-anchor
+# makes it anew
+- /var/lib/unbound/root.key
+# how long the last boots took, what flatpak fetched about the remote's catalogue
+- /var/lib/plymouth/boot-duration
+- /var/lib/flatpak/appstream/*
+- /var/lib/flatpak/oci/*
++ /var/lib/abrt/**/
+- /var/lib/abrt/**
++ /var/lib/AccountsService/**/
+- /var/lib/AccountsService/**
++ /var/lib/chrony/**/
+- /var/lib/chrony/**
++ /var/lib/colord/**/
+- /var/lib/colord/**
++ /var/lib/dnf/**/
+- /var/lib/dnf/**
++ /var/lib/dnsmasq/**/
+- /var/lib/dnsmasq/**
++ /var/lib/fwupd/**/
+- /var/lib/fwupd/**
++ /var/lib/geoclue/**/
+- /var/lib/geoclue/**
++ /var/lib/hp/**/
+- /var/lib/hp/**
++ /var/lib/ipsec/**/
+- /var/lib/ipsec/**
++ /var/lib/lastlog/**/
+- /var/lib/lastlog/**
++ /var/lib/NetworkManager/**/
+- /var/lib/NetworkManager/**
++ /var/lib/nfs/**/
+- /var/lib/nfs/**
++ /var/lib/PackageKit/**/
+- /var/lib/PackageKit/**
++ /var/lib/passim/**/
+- /var/lib/passim/**
++ /var/lib/private/**/
+- /var/lib/private/**
++ /var/lib/rsyslog/**/
+- /var/lib/rsyslog/**
++ /var/lib/samba/**/
+- /var/lib/samba/**
++ /var/lib/setroubleshoot/**/
+- /var/lib/setroubleshoot/**
++ /var/lib/smartmontools/**/
+- /var/lib/smartmontools/**
++ /var/lib/sss/**/
+- /var/lib/sss/**
++ /var/lib/udisks2/**/
+- /var/lib/udisks2/**
++ /var/lib/upower/**/
+- /var/lib/upower/**
++ /var/lib/systemd/coredump/**/
+- /var/lib/systemd/coredump/**
++ /var/lib/systemd/timesync/**/
+- /var/lib/systemd/timesync/**
++ /var/lib/systemd/backlight/**/
+- /var/lib/systemd/backlight/**
++ /var/lib/systemd/rfkill/**/
+- /var/lib/systemd/rfkill/**
++ /var/lib/systemd/pstore/**/
+- /var/lib/systemd/pstore/**
++ /var/lib/systemd/linger/**/
+- /var/lib/systemd/linger/**
++ /var/lib/systemd/timers/**/
+- /var/lib/systemd/timers/**
++ /var/lib/systemd/home/**/
+- /var/lib/systemd/home/**
++ /var/lib/systemd/network/**/
+- /var/lib/systemd/network/**
++ /var/lib/systemd/ephemeral-trees/**/
+- /var/lib/systemd/ephemeral-trees/**
+# keys sealed to this board's TPM, VPN state, what containers stored
++ /var/lib/tpm2-tss/**/
+- /var/lib/tpm2-tss/**
++ /var/lib/openvpn/**/
+- /var/lib/openvpn/**
++ /var/lib/containers/**/
+- /var/lib/containers/**
++ /var/lib/cni/**/
+- /var/lib/cni/**

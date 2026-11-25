@@ -1,0 +1,19 @@
+[Unit]
+Description=a7a: session config for the GPU stack that booted (open driver or vendor DDK)
+# The desktop only works when the KWin session config matches the kernel: the open-stack kernel wants no DDK
+# drop-in and cap_sys_nice on kwin_wayland, the DDK kernel wants `pvr-desktop on`'s drop-in and the cap stripped
+# (else KWin lands on llvmpipe: EGL_BAD_ALLOC, black screen). /usr/local/bin/a7a-gpu-session reads which driver
+# is bound to 1800000.gpu and fixes only what differs. Ordered before the display manager and before user sessions
+# are permitted, so no greeter and no user manager reads the drop-ins first. docs/PACKAGING-2026-09-09.md.
+After=local-fs.target systemd-udev-trigger.service systemd-modules-load.service
+Before=display-manager.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/a7a-gpu-session apply
+# the script waits up to 30 s for the driver to bind (udev loads it ~2.5 s after coldplug)
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

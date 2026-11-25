@@ -1,0 +1,4 @@
+# a7a-panel reads the GPU's load, memory and recoveries every 2 s while it is open (a7a-clock json, which runs
+# /usr/local/bin/a7a-gpu-stat through sudo: read-only, root-owned, no arguments used). Without this, each of those runs
+# would leave a log line and a PAM session in the journal. Who may run it at all is decided by the other rules.
+Defaults!/usr/local/bin/a7a-gpu-stat !log_allowed, !pam_session

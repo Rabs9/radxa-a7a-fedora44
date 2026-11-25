@@ -1,0 +1,20 @@
+#!/bin/bash
+# a7a-irqbalance-policy <sysfs device path> <irq>: irqbalance's --policyscript (irqbalance.service drop-in
+# a7a-gpu-irq.conf, package a7a-gpu-tools). It prints ban=true for the GPU interrupt of the open drm/imagination
+# stack, so irqbalance leaves it where a7a-gpu-irq-affinity put it at the driver bind: the big cluster (Item E 1(a),
+# docs/SPEED-2026-09-10.md). Without the ban, irqbalance (enabled by Fedora, started after udev) moves it back to
+# 0-7 = cpu0, a little core: measured 2026-09-10, `systemctl restart irqbalance` -> 0-7 within 13 s, and after the
+# boot of 18:14 the udev fix was gone. Every other interrupt stays irqbalance's; the DDK's GPU interrupt too (the
+# affinity was only measured on the open stack).
+# irqbalance runs this once per discovered IRQ and reads key=value lines from stdout; it expects exit 0.
+# Tests: tests/test_irq_policy.py (A7A_PROC_INTERRUPTS, A7A_GPU_DEVICE point at fakes).
+irq=${2:-}
+INTERRUPTS=${A7A_PROC_INTERRUPTS:-/proc/interrupts}
+GPU=${A7A_GPU_DEVICE:-/sys/bus/platform/devices/1800000.gpu}
+[ -n "$irq" ] || exit 0
+drv=$(readlink "$GPU/driver" 2>/dev/null); drv=${drv##*/}
+[ "$drv" = powervr ] || exit 0
+# the same name test as a7a-gpu-irq-affinity: the last column of the IRQ's /proc/interrupts line
+name=$(awk -v i="$irq:" '$1 == i { print $NF; exit }' "$INTERRUPTS" 2>/dev/null)
+case "$name" in gpu|pvr*) echo "ban=true" ;; esac
+exit 0

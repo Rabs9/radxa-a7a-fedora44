@@ -1,0 +1,4 @@
+# a7a-fedora 2026-09-10: put the GPU interrupt on the big cluster (docs/SPEED-2026-09-10.md, Item E 1(a)).
+# The default mask 0-7 makes the kernel route every GPU interrupt to cpu0, a little core. Matching on the driver
+# keeps this to the open drm/imagination stack, which is where it was measured; the DDK is untouched.
+ACTION=="bind", SUBSYSTEM=="platform", KERNEL=="1800000.gpu", DRIVER=="powervr", RUN+="/usr/local/bin/a7a-gpu-irq-affinity"

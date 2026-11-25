@@ -1,0 +1,16 @@
+mirror/
+work/
+output/
+__pycache__/
+*.pyc
+
+# the panel's cargo build (2 GB)
+tools/panel/target/
+
+# one builder's local settings (a7a-fedora.example.json shows them) and run log (src/registry.py writes it)
+a7a-fedora.json
+registry.json
+
+# a signing key's backup never belongs in the repository (tools/repo-key.sh writes it outside, to ~/a7a-fedora-key-backup)
+*signing-key.asc
+*signing-key.rev

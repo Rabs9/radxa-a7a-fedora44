@@ -1,0 +1,16 @@
+# a7a-clock codec ac101 enables this (and codec ac101b disables it), never a preset. At boot: a device tree that a new
+# kernel package brought gets the AC101, and the AC101's playback path is set; when it stops at shutdown: the trees
+# again, so a kernel installed during this boot has the AC101 at its first boot (a7a-clock says why)
+[Unit]
+Description=a7a: the AC101 codec in every device tree, and its playback path (a7a-clock codec)
+ConditionPathExists=/etc/a7a/codec
+After=local-fs.target sound.target alsa-restore.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/a7a-clock codec reapply
+ExecStop=/usr/local/bin/a7a-clock codec reapply-trees
+
+[Install]
+WantedBy=multi-user.target

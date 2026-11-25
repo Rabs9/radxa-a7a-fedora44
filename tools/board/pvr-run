@@ -1,0 +1,9 @@
+#!/bin/bash
+# pvr-run <command...>: run one program on the PowerVR BXM-4-64 (the Imagination DDK under /opt/pvr) without
+# changing the system GL stack: hardware Vulkan (VK_ICD) and hardware OpenGL ES (offscreen/GBM/X11 platforms).
+#   pvr-run vulkaninfo --summary        pvr-run eglinfo -B -p surfaceless        pvr-run glmark2-es2 --off-screen
+[ -d /opt/pvr/lib ] || { echo "pvr-run: /opt/pvr/lib is missing (the DDK is not installed)"; exit 1; }
+export LD_LIBRARY_PATH=/opt/pvr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export LIBGL_DRIVERS_PATH=/opt/pvr/lib/dri
+export VK_ICD_FILENAMES=/opt/pvr/icd/powervr_icd.json
+exec "$@"

@@ -1,0 +1,57 @@
+drm/imagination: a7a runtime-PM robustness (rebased from the v6.16 graft onto upstream master, 2026-09-09)
+
+Three things upstream master (7.3-rc2) still lacks, all soaked on the A733 with runtime power-down enabled
+(docs/OPEN-STACK-WEDGE-2026-09-09.md, "Power fix soak"):
+ 1. clear fwif_sysinit->firmware_started before every firmware (re)start: the flag lives in the firmware heap
+    and survives a runtime power-off, so pvr_wait_for_fw_boot() otherwise returns on the previous life's value;
+ 2. if pvr_power_fw_disable() fails inside runtime suspend, restart the firmware instead of returning the error
+    with the GPU half powered down (runtime PM then believes it is active and every later job "locks up");
+ 3. a gpu node without a power-domains property gives -ENOENT from of_count_phandle_with_args() and aborted
+    the probe; treat it as 0 domains.
+Dropped from the v6.16 version: the per-poll pvr_fw_stop() warnings (diagnostic only; master rewrote that
+function for RISC-V firmware).
+
+--- a/drivers/gpu/drm/imagination/pvr_power.c
++++ b/drivers/gpu/drm/imagination/pvr_power.c
+@@ -126,6 +126,11 @@
+ 	if (rpm_resume)
+ 		enable_irq(pvr_dev->irq);
+ 
++	/* a7a: firmware_started lives in the FW heap and survives a power-off, so without this the
++	 * boot wait below returns on the previous life's value before the restarted firmware has
++	 * actually booted (upstream only clears it once, in pvr_fw_init()). */
++	WRITE_ONCE(pvr_dev->fw_dev.fwif_sysinit->firmware_started, false);
++
+ 	err = pvr_fw_start(pvr_dev);
+ 	if (err)
+ 		goto out;
+@@ -380,8 +385,17 @@
+ 
+ 	if (READ_ONCE(pvr_dev->fw_dev.initialised)) {
+ 		err = pvr_power_fw_disable(pvr_dev, false, true);
+-		if (err)
++		if (err) {
++			/* a7a: the firmware has already powered its units down when the host's idle polls
++			 * fail; returning the error leaves runtime PM believing the GPU is active while the
++			 * firmware is half dead (every later job "locks up": docs/OPEN-STACK-WEDGE-2026-09-09.md).
++			 * Restart it. pvr_power_fw_disable() re-enables the IRQ itself on its failure path,
++			 * and never disabled it when the idle/power-off requests failed, so rpm_resume is false. */
++			drm_warn(drm_dev, "runtime suspend aborted (%d): restarting the firmware\n", err);
++			if (pvr_power_fw_enable(pvr_dev, false))
++				drm_err(drm_dev, "firmware restart after aborted suspend failed\n");
+ 			goto err_drm_dev_exit;
++		}
+ 	}
+ 
+ 	err = pvr_dev->device_data->pwr_ops->power_off(pvr_dev);
+@@ -635,6 +649,10 @@
+ 
+ 	domain_count = of_count_phandle_with_args(dev->of_node, "power-domains",
+ 						  "#power-domain-cells");
++	/* a7a: a node with NO power-domains property gives -ENOENT here and aborted the probe on the
++	 * A733, whose GPU sits in no described domain; 0 domains need no work (the <= 1 check below). */
++	if (domain_count == -ENOENT)
++		domain_count = 0;
+ 	if (domain_count < 0) {
+ 		err = domain_count;
+ 		goto out;

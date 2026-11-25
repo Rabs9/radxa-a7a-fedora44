@@ -1,0 +1,118 @@
+drm: 6.6 GEM core additions for the upstream-master drm_gpuvm.c (a7a-fedora open GPU stack)
+
+Master's drm_gpuvm.c (grafted by tools/pvr-graft.sh together with drivers/gpu/drm/imagination) expects
+struct drm_gem_object.gpuva to carry a mutex (immediate mode, 7.x) that the GEM core initialises for every
+object, the two-argument drm_gem_gpuva_assert_lock_held(gpuvm, obj), and the drm_gem_for_each_gpuvm_bo
+iterators. 6.6's lockdep-only gpuva.lock_dep_map (drm_gem_gpuva_set_lock) had one user, drm_gpuva_mgr.c,
+which the graft removes from drm.ko; nouveau, its only driver, is off in this build. The extra mutex in
+every GEM object is inert for the DDK flavour (pvrsrvkm has its own object model).
+
+--- a/include/drm/drm_gem.h
++++ b/include/drm/drm_gem.h
+@@ -393,9 +393,13 @@
+ 	struct {
+ 		struct list_head list;
+ 
+-#ifdef CONFIG_LOCKDEP
+-		struct lockdep_map *lock_dep_map;
+-#endif
++		/**
++		 * @gpuva.lock: lock protecting access to &drm_gem_object.gpuva.list
++		 * when the &drm_gpuvm is in immediate mode (backported from 7.x for
++		 * drivers/gpu/drm/drm_gpuvm.c; replaces 6.6's lockdep-only
++		 * lock_dep_map, whose only user, drm_gpuva_mgr.c, is gone).
++		 */
++		struct mutex lock;
+ 	} gpuva;
+ 
+ 	/**
+@@ -580,17 +584,12 @@
+  * Call this if you're not proctecting access to the gpuva list with the
+  * dma-resv lock, but with a custom lock.
+  */
+-#define drm_gem_gpuva_set_lock(obj, lock) \
+-	if (!WARN((obj)->gpuva.lock_dep_map, \
+-		  "GEM GPUVA lock should be set only once.")) \
+-		(obj)->gpuva.lock_dep_map = &(lock)->dep_map
+-#define drm_gem_gpuva_assert_lock_held(obj) \
+-	lockdep_assert((obj)->gpuva.lock_dep_map ? \
+-		       lock_is_held((obj)->gpuva.lock_dep_map) : \
++#define drm_gem_gpuva_assert_lock_held(gpuvm, obj) \
++	lockdep_assert(drm_gpuvm_immediate_mode(gpuvm) ? \
++		       lockdep_is_held(&(obj)->gpuva.lock) : \
+ 		       dma_resv_held((obj)->resv))
+ #else
+-#define drm_gem_gpuva_set_lock(obj, lock) do {} while (0)
+-#define drm_gem_gpuva_assert_lock_held(obj) do {} while (0)
++#define drm_gem_gpuva_assert_lock_held(gpuvm, obj) do {} while (0)
+ #endif
+ 
+ /**
+@@ -599,15 +598,37 @@
+  *
+  * This initializes the &drm_gem_object's &drm_gpuva list.
+  *
+- * Calling this function is only necessary for drivers intending to support the
+- * &drm_driver_feature DRIVER_GEM_GPUVA.
+- *
+- * See also drm_gem_gpuva_set_lock().
++ * drm_gem_private_object_init() calls this for every GEM object (as 7.x does;
++ * the DRIVER_GEM_GPUVA feature flag is gone upstream and the driver no longer
++ * calls it).
+  */
+ static inline void drm_gem_gpuva_init(struct drm_gem_object *obj)
+ {
+ 	INIT_LIST_HEAD(&obj->gpuva.list);
+ }
++
++/**
++ * drm_gem_for_each_gpuvm_bo() - iterator to walk over a list of &drm_gpuvm_bo
++ * @entry__: &drm_gpuvm_bo structure to assign to in each iteration step
++ * @obj__: the &drm_gem_object the &drm_gpuvm_bo to walk are associated with
++ *
++ * Backported from 7.x for drm_gpuvm.c: walks obj->gpuva.list at the
++ * &drm_gpuvm_bo container offset.
++ */
++#define drm_gem_for_each_gpuvm_bo(entry__, obj__) \
++	list_for_each_entry(entry__, &(obj__)->gpuva.list, list.entry.gem)
++
++/**
++ * drm_gem_for_each_gpuvm_bo_safe() - iterator to safely walk over a list of
++ * &drm_gpuvm_bo
++ * @entry__: &drm_gpuvm_bo structure to assign to in each iteration step
++ * @next__: &next &drm_gpuvm_bo to store the next step
++ * @obj__: the &drm_gem_object the &drm_gpuvm_bo to walk are associated with
++ *
++ * Backported from 7.x for drm_gpuvm.c.
++ */
++#define drm_gem_for_each_gpuvm_bo_safe(entry__, next__, obj__) \
++	list_for_each_entry_safe(entry__, next__, &(obj__)->gpuva.list, list.entry.gem)
+ 
+ /**
+  * drm_gem_for_each_gpuva() - iternator to walk over a list of gpuvas
+--- a/drivers/gpu/drm/drm_gem.c
++++ b/drivers/gpu/drm/drm_gem.c
+@@ -160,12 +160,13 @@
+ 	kref_init(&obj->refcount);
+ 	obj->handle_count = 0;
+ 	obj->size = size;
++	mutex_init(&obj->gpuva.lock);
+ 	dma_resv_init(&obj->_resv);
+ 	if (!obj->resv)
+ 		obj->resv = &obj->_resv;
+ 
+-	if (drm_core_check_feature(dev, DRIVER_GEM_GPUVA))
+-		drm_gem_gpuva_init(obj);
++	/* 7.x: unconditional (the DRIVER_GEM_GPUVA feature flag is gone; drivers do not call it) */
++	drm_gem_gpuva_init(obj);
+ 
+ 	drm_vma_node_reset(&obj->vma_node);
+ 	INIT_LIST_HEAD(&obj->lru_node);
+@@ -183,6 +184,7 @@
+ 	WARN_ON(obj->dma_buf);
+ 
+ 	dma_resv_fini(&obj->_resv);
++	mutex_destroy(&obj->gpuva.lock);
+ }
+ EXPORT_SYMBOL(drm_gem_private_object_fini);
+ 

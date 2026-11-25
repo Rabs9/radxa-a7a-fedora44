@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=A7A Assistant
+Comment=Ask the language model that runs on this board
+Exec=/usr/local/bin/a7a-panel --tab assistant
+Icon=dialog-messages
+Categories=Utility;
+Terminal=false

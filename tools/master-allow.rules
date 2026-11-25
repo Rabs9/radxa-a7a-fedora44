@@ -1,0 +1,329 @@
+# tools/master-allow.rules: what may be in an image made by tools/master-image.sh although no package accounts for it.
+# tools/master-audit.py reads it: every file, link and directory that no package owns, every %ghost file that exists
+# and every package file whose content is no longer the package's must match a pattern of its section, or the build
+# fails and prints the path. Then somebody decides: a rule in tools/master-filter.rules (it stays behind) or a pattern
+# here (it is known and wanted). The filter rules list what is left out; this lists what is let in, so a card that
+# holds something new stops the build instead of being published.
+#   *   anything within one path component      **  anything, any depth      /dir/**  also matches /dir itself
+#   d:/path  l:/path  f:/path   for directories, links or regular files only: a directory that is let in because it
+#                               is empty does not let in a file of that name, a link that systemctl made not a unit file
+#   A name with an "@" in it (wg-quick@office.service) is matched only by a pattern that spells the "@": what stands
+#   behind it is somebody's own name for something.
+# Keep the patterns as narrow as the thing they are for: "/etc/**" would let everything in again.
+
+[unowned]
+# -- made by tools/master-image.sh itself
+/boot/extlinux/**
+/etc/plasma-setup-done
+f:/etc/a7a-image-variant
+d:/etc/skel/.config
+f:/etc/skel/.config/kwinrc
+/etc/sudoers.d/radxa
+/etc/modules-load.d/a7a.conf
+/etc/systemd/system-preset/00-a7a.preset
+/etc/systemd/system/a7a-firstboot.service
+/etc/systemd/system/a7a-grow-rootfs.service
+/usr/local/bin/a7a-firstboot
+/usr/local/bin/a7a-grow-rootfs
+/var/lib/dbus/machine-id
+# the home is made new from /etc/skel; the vendor's NPU SDK comes from output/ddk
+/home/radxa
+/home/radxa/.bash_logout
+/home/radxa/.bash_profile
+/home/radxa/.bashrc
+/home/radxa/.config/**
+/home/radxa/ai-sdk/**
+# the DSU clock modules, one pair per kernel of the image (tools/build-dsu-modules.sh; a7a-clock loads them)
+d:/usr/local/lib/a7a
+d:/usr/local/lib/a7a/dsu
+d:/usr/local/lib/a7a/dsu/*
+f:/usr/local/lib/a7a/dsu/*/dsu_oc.ko
+f:/usr/local/lib/a7a/dsu/*/dsu_dyn.ko
+# exFAT, ISO 9660 and uinput for each kernel whose configuration leaves them out (tools/build-dsu-modules.sh builds
+# them, tools/master-image.sh installs them and says why; depmod's index files are in [ghost])
+d:/usr/lib/modules/*/extra/a7a
+f:/usr/lib/modules/*/extra/a7a/exfat.ko
+f:/usr/lib/modules/*/extra/a7a/isofs.ko
+f:/usr/lib/modules/*/extra/a7a/uinput.ko
+
+# -- units switched on, off or masked: links that systemctl makes (a unit FILE of the owner's own would be
+#    /etc/systemd/system/<name>.service or .mount, which nothing here matches)
+d:/etc/systemd/system/*.wants
+l:/etc/systemd/system/*.wants/*
+d:/etc/systemd/system/*.requires
+l:/etc/systemd/system/*.requires/*
+d:/etc/systemd/system/user@.service.wants
+l:/etc/systemd/system/getty.target.wants/getty@tty1.service
+l:/etc/systemd/system/getty.target.wants/serial-getty@ttyAS0.service
+l:/etc/systemd/system/dbus-org.*.service
+l:/etc/systemd/system/dbus.service
+l:/etc/systemd/system/default.target
+l:/etc/systemd/system/display-manager.service
+l:/etc/systemd/system/ctrl-alt-del.target
+l:/etc/systemd/system/sleep.target
+l:/etc/systemd/system/suspend.target
+l:/etc/systemd/system/hibernate.target
+l:/etc/systemd/system/hybrid-sleep.target
+l:/etc/systemd/system/systemd-repart.service
+d:/etc/systemd/user/*.wants
+l:/etc/systemd/user/*.wants/*
+l:/etc/systemd/user/dbus-org.*.service
+l:/etc/systemd/user/dbus.service
+l:/etc/systemd/user/pipewire-session-manager.service
+# Fedora's timer that tells GRUB a boot succeeded: masked by the build (this board has no GRUB environment to write)
+l:/etc/systemd/user/grub-boot-success.timer
+
+# -- the GPU setup of the card: the vendor driver (DDK) under /opt/pvr with its firmware, the switch that makes the
+#    desktop use it, and what the a7a tools wrote for it (docs/RADXA-SYNC-2026-11-15.md, section 5)
+/opt/pvr/**
+l:/usr/local/lib/dri
+/usr/lib/firmware/rgx.fw.36.56.104.183
+/usr/lib/firmware/rgx.sh.36.56.104.183
+/usr/share/vulkan/icd.d/powervr_mesa_icd.aarch64.json.disabled-by-a7a
+/etc/a7a/pvr-wl.enabled
+/etc/systemd/user/plasma-kwin_wayland.service.d/pvr.conf
+
+# -- generated from the packages' own data by their scripts (caches, indexes, alternatives)
+l:/etc/alternatives/*
+f:/var/lib/alternatives/*
+l:/usr/share/man/man1/java.1.gz
+l:/usr/share/man/man1/alt-java.1.gz
+l:/usr/share/man/man1/keytool.1.gz
+l:/usr/share/man/man1/jcmd.1.gz
+l:/usr/share/man/man1/rmiregistry.1.gz
+/usr/share/mime/**
+/usr/lib/fontconfig/cache/**
+/usr/share/icons/*/icon-theme.cache
+/usr/share/glib-2.0/schemas/gschemas.compiled
+/usr/share/applications/mimeinfo.cache
+/usr/local/share/applications/mimeinfo.cache
+/usr/share/qt6/qtwebengine_dictionaries/*.bdic
+/usr/lib/sysimage/libdnf5/comps_groups/**
+/var/lib/selinux/targeted/active/**
+/etc/selinux/targeted/contexts/files/file_contexts.pre
+/etc/selinux/.config_backup
+/var/lib/authselect/checksum
+/etc/authselect/switchable-auth
+/etc/pam.d/switchable-auth
+/etc/dconf/db/**
+/etc/foomatic/hashes.d/hashes.foomatic-opt-update
+/etc/X11/xinit/xinputrc
+/etc/alsa/state-daemon.conf
+/var/lib/alsa/asound.state
+/etc/.updated
+/var/.updated
+/etc/.pwd.lock
+
+# -- directories that are there and empty: made by mkfs, by packages' scripts, by services at their first start, or
+#    kept by the filter rules after what was in them stayed behind. Only the directory is let in: a file in one of
+#    them matches nothing here
+d:/lost+found
+d:/etc/environment.d
+d:/etc/repart.d
+d:/etc/systemd/system-preset
+d:/etc/systemd/system.control
+d:/usr/lib/efi/grub2/*
+d:/usr/lib/efi/grub2/*/EFI
+d:/usr/share/etc
+d:/usr/share/etc/bash_completion.d
+d:/usr/share/locale/es_EU
+d:/usr/share/locale/es_EU/LC_MESSAGES
+d:/usr/share/selinux/devel/include/contrib
+d:/var/cache/man/*
+d:/var/cache/man/ca@valencia
+d:/var/cache/man/sr@latin
+d:/var/cache/swcatalog/cache
+d:/var/cache/systemd
+d:/var/cache/systemd/home
+d:/var/lib/cni
+d:/var/lib/cni/networks
+d:/var/lib/containers
+d:/var/lib/containers/storage
+d:/var/lib/containers/storage/tmp
+d:/var/lib/dnf/repos
+d:/var/lib/dnf/repos/*
+d:/var/lib/fwupd/metadata
+d:/var/lib/fwupd/metadata/lvfs
+d:/var/lib/fwupd/pki
+d:/var/lib/openvpn/chroot
+d:/var/lib/passim
+d:/var/lib/passim/data
+d:/var/lib/selinux/final
+d:/var/lib/systemd/ephemeral-trees
+d:/var/lib/systemd/home
+d:/var/lib/systemd/network
+d:/var/lib/systemd/pstore
+d:/var/lib/systemd/timers
+d:/var/lib/tpm2-tss
+d:/var/lib/tpm2-tss/system
+d:/var/lib/tpm2-tss/system/keystore
+d:/var/log/passim
+
+# -- left by the build of Fedora's own image
+/config.partids
+/grub2
+/grub2/fonts
+/grub2/fonts/unicode.pf2
+/.autorelabel
+/etc/kernel/cmdline
+/etc/sysconfig/bootloader
+/etc/repart.d/50-root.conf
+/etc/grub.d/00_tuned
+
+# -- flatpak with the Fedora remote set up and nothing installed (an installed application would be files under
+#    repo/objects, app/ and runtime/, which nothing here matches)
+f:/var/lib/flatpak/.changed
+f:/var/lib/flatpak/.fedora-initialized
+d:/var/lib/flatpak/appstream
+d:/var/lib/flatpak/oci
+d:/var/lib/flatpak/repo
+f:/var/lib/flatpak/repo/config
+d:/var/lib/flatpak/repo/extensions
+d:/var/lib/flatpak/repo/objects
+d:/var/lib/flatpak/repo/refs/**
+d:/var/lib/flatpak/repo/state
+d:/var/lib/flatpak/repo/tmp/**
+
+[ghost]
+# the release lock (tools/board/dnf/versionlock.toml, written by tools/master-image.sh): a %ghost of libdnf5
+/etc/dnf/versionlock.toml
+# (the paths of this section are ones a package declares; what is the machine's own is their content, or, for the
+#  many that are links, where they point)
+# -- links of the alternatives system and of authselect, crypto-policies and ca-certificates
+/usr/bin/*
+/usr/sbin
+/usr/local/sbin
+/usr/share/man/man*/*
+/usr/lib/debug/**
+/usr/lib/jvm/*
+/usr/lib/cups/backend/smb
+/usr/libexec/samba/cups_backend_smb
+/usr/lib64/libnssckbi.so
+/usr/share/polkit-1/actions/org.fedoraproject.FirewallD1.policy
+/usr/share/polkit-1/rules.d/org.fedoraproject.FirewallD1.rules
+/etc/cifs-utils/idmap-plugin
+/etc/crypto-policies/back-ends/*
+/etc/pki/tls/certs/*
+/etc/pki/ca-trust/source/ca-bundle.legacy.crt
+/etc/nsswitch.conf
+/etc/pam.d/fingerprint-auth
+/etc/pam.d/password-auth
+/etc/pam.d/postlogin
+/etc/pam.d/smartcard-auth
+/etc/pam.d/system-auth
+/etc/sysconfig/selinux
+/var/lock
+/var/run
+# -- generated from the packages' own data
+/usr/share/mime/**
+/etc/pki/ca-trust/extracted/**
+/etc/sgml/**
+/usr/lib/modules/*/modules.*
+/usr/lib/sysimage/rpm/*
+/usr/lib/sysimage/libdnf5/*.toml
+/usr/share/icons/*/icon-theme.cache
+/usr/lib64/gdk-pixbuf-2.0/*/loaders.cache
+/usr/lib64/gio/modules/giomodule.cache
+/usr/lib64/gtk-3.0/*/immodules.cache
+/usr/lib64/vlc/plugins/plugins.dat
+/var/cache/ldconfig/aux-cache
+/var/lib/systemd/catalog/database
+/var/lib/selinux/targeted/active/**
+/etc/selinux/targeted/contexts/files/*.bin
+/etc/ld.so.cache
+/etc/udev/hwdb.bin
+/etc/audit/audit.rules
+/etc/audit/rules.d/audit.rules
+/etc/authselect/*
+/etc/crypto-policies/config
+/etc/crypto-policies/state/*
+/etc/foomatic/hashes.d/hashes.new
+/etc/selinux/config
+/etc/firewalld/firewalld.conf
+/etc/xdg/akonadi/akonadiserverrc
+/var/lib/.ssh-host-keys-migration
+# made empty by the build: logrotate's rule for process accounting fails without it
+/var/account/pacct
+# Fedora's own (dated by its image build, the same in every copy of Fedora 44)
+/etc/brlapi.key
+# -- settings of the image: tools/master-image.sh sets or checks each of them
+/etc/machine-id
+/etc/localtime
+/etc/hostname
+/etc/fstab
+/etc/locale.conf
+/etc/vconsole.conf
+/etc/X11/xorg.conf.d/00-keyboard.conf
+/etc/default/grub
+/etc/ld.so.conf.d/00-a7a-pvr-wl.conf
+/root/.bash_logout
+/root/.bash_profile
+/root/.bashrc
+/root/.cshrc
+/root/.tcshrc
+
+[unverified]
+# (package files rpm does not checksum: `rpm -V` says nothing whatever is in them)
+# -- the accounts: tools/master-image.sh sets the one login and checks users, groups, members and hashes
+/etc/passwd
+/etc/group
+/etc/shadow
+/etc/gshadow
+/etc/subuid
+/etc/subgid
+# -- checked by the build to be empty or the distribution's (hosts, motd, exports), or the image's own state
+/etc/hosts
+/etc/motd
+/etc/exports
+/etc/adjtime
+/etc/shells
+/etc/inputrc
+/etc/ld.so.conf
+/etc/rpc
+/usr/lib/motd
+/usr/bin/ld.bfd
+/var/lib/dnf/system-repo.lock
+# -- printing and scanning as Fedora's image has them (read 2026-11-16: no printer, no server, no scanner address);
+#    the system's certificate store (empty databases of Fedora's image build)
+/etc/cups/cupsd.conf
+/etc/cups/cups-files.conf
+/etc/cups/client.conf
+/etc/cups/lpoptions
+/etc/cups/snmp.conf
+/etc/cups/cups-browsed.conf
+/etc/sane.d/epsonds.conf
+/etc/pki/nssdb/cert9.db
+/etc/pki/nssdb/key4.db
+/etc/pki/nssdb/pkcs11.txt
+# -- generated from the packages' own data: SELinux policy, catalogues, caches
+/etc/selinux/targeted/contexts/customizable_types
+/etc/selinux/targeted/contexts/files/file_contexts
+/etc/selinux/targeted/contexts/files/file_contexts.homedirs
+/etc/selinux/targeted/policy/policy.*
+/etc/selinux/targeted/seusers
+/var/lib/selinux/targeted/active/**
+/var/lib/selinux/targeted/semanage.*.LOCK
+/etc/sgml/docbook/xmlcatalog
+/etc/xml/catalog
+/usr/lib64/gconv/gconv-modules
+/usr/lib64/gconv/gconv-modules.cache
+/usr/lib64/gconv/gconv-modules.d/*.conf
+/usr/share/authselect/checksum
+/usr/share/fonts/**
+# -- tuned's profile as the card has it (throughput-performance, set by hand)
+/etc/tuned/active_profile
+/etc/tuned/bootcmdline
+/etc/tuned/post_loaded_profile
+/etc/tuned/ppd_base_profile
+/etc/tuned/profile_mode
+/etc/modprobe.d/tuned.conf
+
+[changed]
+# Fedora's own kernels are kept out of dnf's way on this board (excludepkgs)
+/etc/dnf/dnf.conf
+# the LVFS firmware feed is switched off (Enabled=false): nothing on this board is updated through fwupd
+/etc/fwupd/remotes.d/lvfs.conf
+# KDE's power slider mapped to the a7a tuned profiles (tools/master-image.sh)
+/etc/tuned/ppd.conf
+# chronyd -s: the clock starts at the last running time (the clock chip has no battery)
+/etc/sysconfig/chronyd

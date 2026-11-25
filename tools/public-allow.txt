@@ -1,0 +1,41 @@
+# tools/public-check.py: strings that look personal and are fine to publish, one per line (any case).
+# Made-up hardware addresses of the tests and of manuals
+00:11:22:33:44:55
+02:11:22:33:44:55
+aa:bb:cc:dd:ee:ff
+11:22:33:44:55:66
+77:88:99:aa:bb:cc
+aa:bb:cc:00:11:22
+0c:11:22:33:44:55
+# a made-up Tailscale address of the tests
+100.101.102.103
+# made-up e-mail addresses of the tests
+owner@nas-box.local
+localhost@evil.org
+# the authors of upstream code this repository carries (kernel patches from Radxa's and Linux's trees, iced)
+feng@radxa.com
+edumazet@kernel.org
+kuniyu@google.com
+kuba@kernel.org
+xinyang@anthropic.com
+# the co-author line of the export commit (tools/public-export.sh)
+noreply@anthropic.com
+20261001221253.2964024-1-edumazet@kernel.org
+hector@hecrj.dev
+# public addresses: Cloudflare's DNS (a test of what the Assistant may fetch)
+2606:4700:4700::1111
+# part of the public handle Rabs9 (github.com/rabs in the voice tests)
+rabs
+# compiled into a7a-panel by its dependencies (the package is looked through before it is published): the author of
+# ring's assembly (CRYPTOGAMS), a root certificate's contact (webpki-roots), the designers of the fonts iced embeds
+appro@openssl.org
+info@e-szigno.hu
+dave@understandinglimited.com
+jimmac@gmail.com
+# Mesa's headers in mesa-img-a7a (/opt/pvr-wl/include): their upstream authors
+krh@redhat.com
+kevin@precisioninsight.com
+idr@us.ibm.com
+benjaminfranzke@googlemail.com
+# GitHub's ssh address (the README's remote line)
+git@github.com

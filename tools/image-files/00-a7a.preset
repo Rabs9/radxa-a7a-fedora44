@@ -1,0 +1,6 @@
+# a7a-fedora: what the image enables and disables itself (tools/assemble-image.sh)
+enable sshd.service
+enable serial-getty@ttyAS0.service
+enable a7a-firstboot.service
+enable a7a-grow-rootfs.service
+disable plasma-setup.service

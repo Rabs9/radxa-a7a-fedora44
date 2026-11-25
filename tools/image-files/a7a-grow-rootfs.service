@@ -1,0 +1,10 @@
+[Unit]
+Description=a7a-fedora: grow the root filesystem to the end of the card (first boot)
+ConditionPathExists=!/var/lib/a7a/rootfs-grown
+After=systemd-remount-fs.service local-fs.target
+Before=a7a-firstboot.service
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/sbin/a7a-grow-rootfs
+[Install]
+WantedBy=multi-user.target

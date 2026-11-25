@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=A7A Panel
+Comment=Clocks, power profile, hardware and the local assistant of the Radxa Cubie A7A
+Exec=/usr/local/bin/a7a-panel
+Icon=preferences-system-power-management
+Categories=System;Settings;HardwareSettings;
+Terminal=false

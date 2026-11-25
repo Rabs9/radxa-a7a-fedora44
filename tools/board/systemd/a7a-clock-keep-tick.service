@@ -1,0 +1,10 @@
+# a7a-board-tools: started by a7a-clock-keep.timer (a7a-clock-keep.service itself stays active once started, so a
+# timer could not start it again).
+[Unit]
+Description=Keep the time the next boot starts its clock from, now (a7a)
+After=chronyd.service
+ConditionPathExists=/usr/bin/chronyc
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/a7a-clock-keep

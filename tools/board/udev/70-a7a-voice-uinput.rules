@@ -1,0 +1,4 @@
+# a7a-voice (a7a-board-tools): typing by voice presses keys through dotool's virtual keyboard (/dev/uinput). The user
+# at the board's seat may use it, as KDE Connect's own rule (40-kdeconnect-uinput.rules) allows already: this one keeps
+# it so on an image without KDE Connect.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""a7a-ac101-dtb: a device tree for the Cubie A7A boards built with the AC101 codec, made from one that describes the
+AC101B, and back.
+
+  a7a-ac101-dtb [--undo] <in.dtb> <out.dtb>    (a7a-clock codec runs it over every device tree of the board)
+
+Radxa builds the board from one design with either of two codecs (schematic v1.10, page 12 "AUDIO AC101/AC101B"):
+option 1 an AC101 at I2C address 0x1a, fed by ALDO5 (3.3 V) and BLDO4 (1.8 V, net VCC18-CODEC); option 2 an AC101B
+at 0x3e, fed by ALDO5 alone, the three links from VCC18-CODEC to the codec (RA9, RA15, RA18) not fitted. VCC18-CODEC
+goes nowhere else (the PMIC page and the codec's are the only pages that name it), so BLDO4 switched on in an option-2
+board feeds an open net. The kernel packages' device tree comes from Radxa's linux-6.6 board.dts, which describes the
+AC101B only since radxa/allwinner-device 4835925 (2026-03-17, "migrate audio codec from AC101 to AC101B"): on the
+owner's board, an option-1 one, the 3.5 mm jack had no sound card at all (2026-11-18: "try read ac101b 5 times but
+failed"; a read scan of the codec's I2C bus found the AC101 at 0x1a, with BLDO4 off).
+
+This adds the AC101 as Radxa's tree described it before that commit, in the property names this kernel's ac101
+driver reads (irq-gpio PB2 = CODEC-IRQ, jack-det-gpio PL11 = HP-DET-PL11), with a sound card of its own on I2S0, and
+switches the AC101B and its card off (status "disabled"). The two cards cannot both stay: this kernel's ASoC core
+(6.6.98, soc_remove_link_components) cleans up EVERY component of a card that fails to come up, also one bound to
+another card, so on the owner's board the AC101B's card, failing with "already bound to card allwinner-ac101", tore
+down the shared I2S under the working AC101 card and the first sound crashed the kernel (2026-11-18, two frozen
+boots). So the result is for boards built with the AC101 only (a choice made on the board); an AC101B board keeps the
+tree as Radxa ships it. BLDO4's regulator node gets a phandle (nothing referred to it).
+A tree is taken in one of two states only: as the packages ship it (one AC101B with its card on, no AC101) or as this
+tool makes it (the AC101 and its card on, the AC101B and its card off). The tool turns the first into the second, and
+with --undo the second into the first (for a tree with nothing kept to put back: a copy that `a7a-clock gpu` made
+after the switch; BLDO4's phandle stays, unused); a tree that is in the wanted state already is copied unchanged, and
+any other is refused: both cards on (the tree that froze the board), an AC101 or its card off, two AC101Bs. Every
+result is checked: nothing changed but what was meant, it is in the wanted state, and no I2S has two enabled cards.
+Needs fdtput (package dtc). Exit 0: written; 1: a tree this tool does not know, or a check failed; 2: usage."""
+
+from __future__ import annotations
+
+import shutil
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+AC101B, AC101, MACH = "allwinner,sunxi-ac101b", "allwinner,sunxi-ac101", "allwinner,sunxi-snd-mach"
+R_PINCTRL = "allwinner,sun60iw2-r-pinctrl"
+# pin banks as this BSP's device-tree macros number them: PB = 1 on the main controller (PA = 0); the r_pio
+# controller numbers its own banks from PL = 0 (the packaged tree's r_pio references read <r_pio 0 2 0> for PL2;
+# PL = 11 made the jack's plug detection unresolvable, "get jack-det-gpio failed", review 2026-11-18)
+PB, PL = 1, 0
+CODEC, CARD = "ac101@1a", "i2s0_mach_ac101"
+# Radxa's AC101 card before 4835925 (configs/cubie_a7a/linux-6.6/board.dts)
+PIN_SWITCHES = ["MIC1", "MIC2", "LINEINL", "LINEINR", "HPOUTL", "HPOUTR", "LINEOUTL", "LINEOUTR", "SPK"]
+ROUTING = ["MIC1P_PIN", "MIC1", "MIC1N_PIN", "MIC1", "MIC2P_PIN", "MIC2", "MIC2N_PIN", "MIC2",
+           "LINEINL_PIN", "LINEINL", "LINEINR_PIN", "LINEINR",
+           "LINEOUTL", "LINEOUTLP_PIN", "LINEOUTL", "LINEOUTLN_PIN", "LINEOUTR", "LINEOUTRP_PIN", "LINEOUTR", "LINEOUTRN_PIN",
+           "SPK", "LINEOUTLP_PIN", "SPK", "LINEOUTLN_PIN", "SPK", "LINEOUTRP_PIN", "SPK", "LINEOUTRN_PIN",
+           "HPOUTL", "HPOUTL_PIN", "HPOUTR", "HPOUTR_PIN"]
+
+
+def parse(path: str):
+    """{node path: {property: bytes}} of a flattened device tree (the reader of tools/standard-dtb.py: this file goes
+    to the board alone)."""
+    with open(path, "rb") as f:
+        d = f.read()
+    magic, _, off_struct, off_strings = struct.unpack(">IIII", d[:16].ljust(16, b"\0"))
+    if magic != 0xD00DFEED:
+        raise ValueError(f"{path} is not a device tree blob")
+    nodes, stack, p = {}, [], off_struct
+
+    def name_at(o):
+        return d[off_strings + o:d.index(b"\0", off_strings + o)].decode()
+
+    while True:
+        tok = struct.unpack(">I", d[p:p + 4])[0]
+        p += 4
+        if tok == 1:
+            e = d.index(b"\0", p)
+            stack.append(d[p:e].decode())
+            p = (e + 4) & ~3
+            nodes["/" + "/".join(stack[1:])] = {}
+        elif tok == 2:
+            stack.pop()
+        elif tok == 3:
+            ln, no = struct.unpack(">II", d[p:p + 8])
+            p += 8
+            nodes["/" + "/".join(stack[1:])][name_at(no)] = d[p:p + ln]
+            p = (p + ln + 3) & ~3
+        elif tok == 9:
+            return nodes
+        elif tok != 4:
+            raise ValueError(f"{path}: unknown token {tok} in the structure block")
+
+
+def cells(v: bytes):
+    return struct.unpack(f">{len(v) // 4}I", v) if v is not None and len(v) % 4 == 0 else None
+
+
+def strings(props, name: str) -> list[str]:
+    v = props.get(name)
+    return v.rstrip(b"\0").decode(errors="replace").split("\0") if v else []
+
+
+def one(found: list[str], what: str) -> str:
+    if len(found) != 1:
+        raise ValueError(f"{len(found)} {what} (expected one)")
+    return found[0]
+
+
+def enabled(props) -> bool:
+    return strings(props, "status") in ([], ["okay"], ["ok"])
+
+
+def card_of(nodes, codec: str) -> str:
+    """The one sound card whose codec is this node."""
+    ph = cells(nodes[codec].get("phandle"))
+    return one([n for n, p in nodes.items() if MACH in strings(p, "compatible") and ph
+                and cells(nodes.get(n + "/soundcard-mach,codec", {}).get("sound-dai")) == ph], f"sound cards of {codec}")
+
+
+def state(nodes):
+    """("packaged", ac101b, its card) or ("ac101", ac101, its card, ac101b, its card); ValueError for any other tree."""
+    b = one([n for n, p in nodes.items() if AC101B in strings(p, "compatible")], "AC101B nodes")
+    b_card = card_of(nodes, b)
+    a = [n for n, p in nodes.items() if AC101 in strings(p, "compatible")]
+    if not a:
+        if not (enabled(nodes[b]) and enabled(nodes[b_card])):
+            raise ValueError("no AC101, and the AC101B or its card is switched off")
+        return ("packaged", b, b_card)
+    a = one(a, "AC101 nodes")
+    a_card = card_of(nodes, a)
+    on = {n: enabled(nodes[n]) for n in (a, a_card, b, b_card)}
+    if on[a] and on[a_card] and not on[b] and not on[b_card]:
+        return ("ac101", a, a_card, b, b_card)
+    raise ValueError("not one codec on and the other off with its card: "
+                     + ", ".join(f"{n} {'on' if v else 'off'}" for n, v in on.items()))
+
+
+def one_card_per_i2s(nodes) -> list[str]:
+    """Problems: an I2S that two enabled sound cards name as their cpu (the two-card tree that froze the board)."""
+    seen, bad = {}, []
+    for n, p in nodes.items():
+        if MACH in strings(p, "compatible") and enabled(p):
+            cpu = cells(nodes.get(n + "/soundcard-mach,cpu", {}).get("sound-dai"))
+            if cpu and cpu in seen:
+                bad.append(f"the cards {seen[cpu]} and {n} are both on, on the same I2S")
+            seen.setdefault(cpu, n)
+    return bad
+
+
+def plan(nodes, b: str, card: str):
+    """(new nodes, [(node, property, type, values)]) that make the packaged tree with the AC101B `b` and its card into
+    the AC101 one, or ValueError when it is not the tree this tool knows."""
+    phandles = {cells(p["phandle"])[0]: n for n, p in nodes.items() if cells(p.get("phandle")) and len(p["phandle"]) == 4}
+    bus, bp = b.rsplit("/", 1)[0], nodes[b]
+    irq = cells(bp.get("irq-gpio"))
+    if not irq or len(irq) != 4 or irq[1:3] != (PB, 2) or irq[0] not in phandles:
+        raise ValueError(f"{b}: irq-gpio is not PB2 of a pin controller")
+    pio = irq[0]
+    aldo5 = cells(bp.get("rglt0-supply"))
+    if not aldo5 or len(aldo5) != 1 or strings(nodes.get(phandles.get(aldo5[0], ""), {}), "regulator-name") != ["axp8191-aldo5"]:
+        raise ValueError(f"{b}: rglt0-supply is not the regulator axp8191-aldo5")
+    r_pio = nodes[one([n for n, p in nodes.items() if R_PINCTRL in strings(p, "compatible")], "r-pinctrl nodes")]
+    if not cells(r_pio.get("phandle")):
+        raise ValueError("the r-pinctrl node has no phandle")
+    bldo4 = one([n for n, p in nodes.items() if strings(p, "regulator-name") == ["axp8191-bldo4"]], "regulators axp8191-bldo4")
+    i2s = cells(nodes.get(card + "/soundcard-mach,cpu", {}).get("sound-dai"))
+    if not i2s or len(i2s) != 1 or i2s[0] not in phandles:
+        raise ValueError(f"{card}: its cpu's sound-dai is not one node")
+    codec, mach = f"{bus}/{CODEC}", card.rsplit("/", 1)[0] + "/" + CARD
+    for n in (codec, mach):
+        if n in nodes:
+            raise ValueError(f"{n} is there already")
+    top = max(phandles)
+    codec_ph, cpu_ph = top + 1, top + 2
+    bldo4_ph = cells(nodes[bldo4]["phandle"])[0] if cells(nodes[bldo4].get("phandle")) else top + 3
+    u, s = "u", "s"
+    sets = [
+        (codec, "#sound-dai-cells", u, [0]), (codec, "compatible", s, [AC101]), (codec, "reg", u, [0x1a]),
+        (codec, "sysclk-src", s, ["MCLK"]), (codec, "pcm-bit-first", s, ["MSB"]), (codec, "frame-sync-width", u, [1]),
+        (codec, "irq-gpio", u, [pio, PB, 2, 0]), (codec, "jack-det-gpio", u, [cells(r_pio["phandle"])[0], PL, 11, 0]),
+        # the level that means "nothing plugged": 0, as Radxa's AC101B node has it for the same jack contact (HP-DET)
+        (codec, "jack-det-gpio-level", u, [0]),
+        (codec, "jack-det-threshold", u, [1]), (codec, "jack-key-det-threshold", u, [10]),
+        (codec, "jack-det-debouce-time", u, [15]), (codec, "jack-key-det-debouce-time", u, [2]),
+        (codec, "jack-key-det-voltage-hook", u, [23, 24]), (codec, "jack-key-det-voltage-up", u, [21, 22]),
+        (codec, "jack-key-det-voltage-down", u, [18, 20]),
+        (codec, "rglt-max", u, [2]),
+        (codec, "rglt0-mode", s, ["PMU"]), (codec, "rglt0-voltage", u, [3300000]), (codec, "rglt0-supply", u, [aldo5[0]]),
+        (codec, "rglt1-mode", s, ["PMU"]), (codec, "rglt1-voltage", u, [1800000]), (codec, "rglt1-supply", u, [bldo4_ph]),
+        (codec, "status", s, ["okay"]), (codec, "phandle", u, [codec_ph]),
+        (mach, "compatible", s, [MACH]), (mach, "soundcard-mach,name", s, ["allwinner-ac101"]),
+        (mach, "soundcard-mach,format", s, ["i2s"]), (mach, "soundcard-mach,slot-num", u, [4]),
+        (mach, "soundcard-mach,slot-width", u, [16]), (mach, "status", s, ["okay"]),
+        (mach, "soundcard-mach,frame-master", u, [cpu_ph]), (mach, "soundcard-mach,bitclock-master", u, [cpu_ph]),
+        (mach, "soundcard-mach,jack-support", u, [4]),
+        (mach, "soundcard-mach,pin-switches", s, PIN_SWITCHES), (mach, "soundcard-mach,routing", s, ROUTING),
+        (mach + "/soundcard-mach,cpu", "sound-dai", u, [i2s[0]]), (mach + "/soundcard-mach,cpu", "soundcard-mach,pll-fs", u, [1]),
+        (mach + "/soundcard-mach,cpu", "soundcard-mach,mclk-fs", u, [2]),
+        (mach + "/soundcard-mach,cpu", "soundcard-mach,mclk-fp", u, [11289600, 12288000]),
+        (mach + "/soundcard-mach,cpu", "phandle", u, [cpu_ph]),
+        (mach + "/soundcard-mach,codec", "sound-dai", u, [codec_ph]),
+        # the AC101B and its card off: a card that fails beside a working one takes the shared I2S down with it
+        (b, "status", s, ["disabled"]), (card, "status", s, ["disabled"]),
+    ]
+    if not cells(nodes[bldo4].get("phandle")):
+        sets.append((bldo4, "phandle", u, [bldo4_ph]))
+    return [codec, mach, mach + "/soundcard-mach,cpu", mach + "/soundcard-mach,codec"], sets
+
+
+def encode(kind: str, values) -> bytes:
+    if kind == "s":
+        return b"".join(v.encode() + b"\0" for v in values)
+    return b"".join(int(v).to_bytes(4, "big") for v in values)
+
+
+def check(before, after, new, sets, removed=(), wanted_state="ac101"):
+    """Problems of the finished tree (an empty list is a pass): nodes added or removed and properties changed exactly as
+    planned, unique phandles, the wanted state, and one enabled card per I2S."""
+    bad = []
+    gone = {n for n in before if any(n == r or n.startswith(r + "/") for r in removed)}
+    if set(after) - set(before) != set(new):
+        bad.append("the nodes added are not exactly " + ", ".join(new))
+    if set(before) - set(after) != gone:
+        bad.append("the nodes gone are not exactly what was to go: " + ", ".join(sorted((set(before) - set(after)) ^ gone)[:5]))
+    wanted = {(n, p): encode(k, v) for n, p, k, v in sets}
+    for n in after:
+        for p in set(after[n]) | set(before.get(n, {})):
+            want = wanted.get((n, p), before.get(n, {}).get(p))
+            if after[n].get(p) != want:
+                bad.append(f"{n}: {p} is not what was intended")
+    phs = [cells(p["phandle"])[0] for p in after.values() if "phandle" in p]
+    if len(phs) != len(set(phs)):
+        bad.append("two nodes have the same phandle")
+    try:
+        if state(after)[0] != wanted_state:
+            bad.append(f"the result is not the {wanted_state} tree")
+    except ValueError as e:
+        bad.append(f"the result: {e}")
+    return bad + one_card_per_i2s(after)
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    undo = bool(argv) and argv[0] == "--undo"
+    if undo:
+        argv = argv[1:]
+    if len(argv) != 2:
+        print(__doc__)
+        return 2
+    src, dst = argv
+    if not shutil.which("fdtput"):
+        print("ac101-dtb: fdtput is not installed (package dtc)")
+        return 2
+    want = "packaged" if undo else "ac101"
+    tmp = dst + ".tmp"
+    try:
+        before = parse(src)
+        st = state(before)
+        if st[0] == want:
+            bad = one_card_per_i2s(before)
+            if bad:
+                raise ValueError("; ".join(bad))
+            shutil.copyfile(src, dst)
+            print(f"ac101-dtb: {src} is the {'packaged' if undo else 'AC101'} tree already: copied unchanged")
+            return 0
+        if undo:
+            _, a, a_card, b, b_card = st
+            new, removed = [], [a, a_card]
+            sets = [(b, "status", "s", ["okay"]), (b_card, "status", "s", ["okay"])]
+        else:
+            _, b, b_card = st
+            new, sets = plan(before, b, b_card)
+            removed = []
+        shutil.copyfile(src, tmp)
+        if new:
+            subprocess.run(["fdtput", "-c", tmp, *new], check=True)
+        for node, prop, kind, values in sets:
+            subprocess.run(["fdtput", "-t", kind, tmp, node, prop, *[str(v) for v in values]], check=True)
+        if removed:
+            subprocess.run(["fdtput", "-r", tmp, *removed], check=True)
+        after = parse(tmp)
+        bad = check(before, after, new, sets, removed, want)
+    except Exception as e:      # whatever the tree holds: no traceback, no half-made file left behind
+        print(f"ac101-dtb: {e}")
+        Path(tmp).unlink(missing_ok=True)
+        return 1
+    if bad:
+        print("ac101-dtb: the result is not what was intended:")
+        for b in bad[:20]:
+            print("  " + b)
+        Path(tmp).unlink(missing_ok=True)
+        return 1
+    Path(tmp).replace(dst)
+    if undo:
+        print(f"ac101-dtb: {dst}: the AC101 and its card taken out, the AC101B and its card on again")
+    else:
+        print(f"ac101-dtb: {dst}: {new[0]} and the sound card {new[1]} added, the AC101B and its card switched off")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

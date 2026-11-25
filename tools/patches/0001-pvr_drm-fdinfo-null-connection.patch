@@ -1,0 +1,35 @@
+From: a7a-fedora <241389662+Rabs9@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 12:50:00 -0400
+Subject: [PATCH] pvr_drm: do not dereference a NULL services connection in show_fdinfo
+
+A DRM file on the PowerVR node whose PVRSRV connection is not (or no longer)
+established has dfile->driver_priv == NULL. pvr_show_fdinfo() dereferenced it
+unconditionally, so reading /proc/<pid>/fdinfo/<fd> of such a file panicked the
+kernel ("Unable to handle kernel NULL pointer dereference at 0x18",
+pvr_show_fdinfo+0x60). systemd-coredump reads the fdinfo of every crashing
+process, which turned any userspace crash of a GPU client (a compositor that
+failed to initialise EGL, for example) into a hard freeze of the board.
+
+Print only the generic DRM fdinfo keys when there is no connection.
+---
+ services/server/env/linux/pvr_drm.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+--- a/services/server/env/linux/pvr_drm.c
++++ b/services/server/env/linux/pvr_drm.c
+@@ -489,6 +489,15 @@ static void pvr_show_fdinfo(struct seq_file *seq_file, struct file *file)
+ 	my_pid = dfile->pid->numbers[0].nr;
+ 
+ 	priv = (struct pvr_drm_private *)dev->dev_private;
++
++	/* No services connection behind this file (opened but never connected,
++	 * or already torn down): nothing driver-specific to report. */
++	if (!pvr_connection || !priv || !priv->dev_node) {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0))
++		drm_show_fdinfo(seq_file, file);
++#endif
++		return;
++	}
+ 
+ 	/* Generate driver-specific keys */
+ 	PVRDKFTraverse((DKF_VPRINTF_FUNC*)drm_vprintf,

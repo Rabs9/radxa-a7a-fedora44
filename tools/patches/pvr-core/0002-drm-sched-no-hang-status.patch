@@ -1,0 +1,49 @@
+drm/sched: 6.6 backport of DRM_GPU_SCHED_STAT_NO_HANG (6.17) for the upstream-master drm/imagination driver
+
+The master driver's pvr_queue_timedout_job() returns DRM_GPU_SCHED_STAT_NO_HANG when the timed-out job's
+fence is already signaled (upstream ee7cb7425314 "Don't timeout job if its fence has been signaled").
+6.6's drm_sched_job_timedout() removes the job from the pending list before calling the driver and only
+drm_sched_stop() puts it back; a NO_HANG return would leave it off the list forever (never freed, its
+context and fences pinned). Add the status and the 6.17 re-insert behaviour; RESET aliases NOMINAL so the
+driver's other return value needs no shim. Other 6.6 drivers never return the new value: unchanged.
+
+--- a/include/drm/gpu_scheduler.h
++++ b/include/drm/gpu_scheduler.h
+@@ -383,6 +383,15 @@
+ 	DRM_GPU_SCHED_STAT_NONE, /* Reserve 0 */
+ 	DRM_GPU_SCHED_STAT_NOMINAL,
+ 	DRM_GPU_SCHED_STAT_ENODEV,
++	/*
++	 * Backport of 6.17 ("drm/sched: Allow drivers to skip the reset and keep
++	 * on running"): NO_HANG = the timed-out job had in fact completed (its
++	 * fence is signaled); drm_sched_job_timedout() puts it back on the
++	 * pending list instead of leaving it removed, which would leak it.
++	 * RESET is 6.17's name for NOMINAL (the driver reset the GPU).
++	 */
++	DRM_GPU_SCHED_STAT_NO_HANG,
++	DRM_GPU_SCHED_STAT_RESET = DRM_GPU_SCHED_STAT_NOMINAL,
+ };
+ 
+ /**
+--- a/drivers/gpu/drm/scheduler/sched_main.c
++++ b/drivers/gpu/drm/scheduler/sched_main.c
+@@ -411,6 +411,19 @@
+ 		if (sched->free_guilty) {
+ 			job->sched->ops->free_job(job);
+ 			sched->free_guilty = false;
++		}
++
++		/*
++		 * Backport of 6.17 drm_sched_job_reinsert_on_false_timeout(): the
++		 * job did not hang (the driver saw its fence signaled), so put it
++		 * back where it was removed from above and wake the scheduler
++		 * thread, which reaps it through drm_sched_get_cleanup_job().
++		 */
++		if (status == DRM_GPU_SCHED_STAT_NO_HANG) {
++			spin_lock(&sched->job_list_lock);
++			list_add(&job->list, &sched->pending_list);
++			spin_unlock(&sched->job_list_lock);
++			wake_up_interruptible(&sched->wake_up_worker);
+ 		}
+ 	} else {
+ 		spin_unlock(&sched->job_list_lock);

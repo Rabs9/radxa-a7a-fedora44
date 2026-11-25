@@ -1,0 +1,2905 @@
+#!/usr/bin/env python3
+"""a7a-voice: voice commands on the Cubie A7A. Say the wake phrase, then a command the owner typed in the panel's
+Voice tab (a7a-panel): the command line typed beside it runs, as the owner.
+
+  a7a-voice setup          the speech engine (sherpa-onnx, in a venv of its own) and two English models, downloaded
+                           once into ~/.local/share/a7a-voice (about 110 MB)
+  a7a-voice on | off       the listener now and at every log-in (the user service a7a-voice.service), or neither
+  a7a-voice listen         the listener itself (what the service runs)
+  a7a-voice status         what the panel shows, as JSON: set up or not, running, what it did last, the settings
+  a7a-voice save           new settings, as JSON on stdin (the panel's Save); a running listener takes them within 1 s
+  a7a-voice test [--dry | --panel] "<text>"  the command <text> matches, run (--dry: only said; --panel, the panel's
+                           Test button: only said when it presses keys or acts on the window, which would be the panel)
+  a7a-voice npu on | off   the wake-phrase spotter's network on the NPU, or on the CPU (the default); "on" checks it
+                           on a second of silence first, and a listener that cannot start it uses the CPU's
+  a7a-voice scan           commands for the menu's applications ("open …", "close …") and common ones (keys, the
+                           window, media), found now, into the settings: what the owner changed of one stays
+  a7a-voice app open|close ID   the application of desktop file ID started, or its windows closed (as their ✕)
+  a7a-voice shortcut NAME  one of KWin's shortcuts ("Show Desktop"), as if pressed
+  a7a-voice key KEYS...    keys pressed where the cursor is (dotool's names: enter, ctrl+l, shift+enter, pagedown)
+  a7a-voice type "<text>"  <text> typed where the cursor is
+  a7a-voice ask [--to NAME] "<text>"  the Assistant's answer to <text> (or NAME's, an online assistant of the
+                           panel's settings), as a notification, and read aloud when answers are (what "hey
+                           assistant ..." and "hey NAME ..." run)
+  a7a-voice speak          whether the Assistant's answers are read aloud, in which voice, as JSON (the Assistant tab)
+  a7a-voice speak on | off answers read aloud from now on, or not; the first "on" downloads the voice (about 130 MB)
+  a7a-voice speak voice V  the voice that reads them: F1 to F5 or M1 to M5
+  a7a-voice say ["<text>"] <text> (else stdin) read aloud now, in place of whatever is being read
+  a7a-voice hush           stops what is being read
+  a7a-voice check [speak]  loads both models (the voice) and says how long that took (setup's last step)
+
+How it listens. Two small streaming models, run by sherpa-onnx (Apache-2.0) on the CPU, from PipeWire's default
+source (the USB microphone on the owner's board) at 16 kHz:
+  - a keyword spotter (sherpa-onnx's zipformer, GigaSpeech, 3.3 M parameters, Apache-2.0) waits for the wake phrases,
+    all the time: about 15 % of one little core. A phrase typed in the panel works as it is: the model's own
+    sentencepiece model splits it into the word pieces it knows (no training). It gets a fresh stream in every pause:
+    a stream that has heard much else without its phrase spots it worse (synthetic voices: 1 in 5 against 4 and 5 in
+    5; resetting only its search did not help). Two phrases: the commands' ("hey computer") and the Assistant's ("hey
+    assistant"): what follows the second is a question for the panel's Assistant, answered in a notification.
+  - a recogniser (Kroko's English community model, a zipformer, CC-BY-SA, kroko.ai) writes down what is said after
+    the wake phrase, a sentence at a time (a sentence ends after 0.8 s of silence), starting from 1.5 s before the
+    phrase was spotted, so a command said in the same breath is not cut. Nothing is written down before the wake
+    phrase. Not sherpa-onnx's own small English recogniser (zipformer-en-20M, LibriSpeech): a fresh stream of that
+    one drops the first second or two it hears (sherpa-onnx 2.0.1, board 2026-11-18: "AFTER EARLY NIGHTFALL" lost
+    from its own test recording, fed whole or 0.1 s at a time, with leading silence or without), which would cut
+    the command; Kroko's wrote the same recording down whole from a fresh stream.
+In the sentence that holds the wake phrase, only what comes after it counts: what the pre-roll caught before it is
+dropped unread, so a command said just before the phrase (by the TV, by someone else) does not run, and nothing said
+before the phrase is printed, kept or shown. The command is the one whose words the rest holds best, when it is
+close enough (short words must be nearly the same: "minute" is not "mute"); not one negated ("don't lock the
+screen"); within 8 s of the wake phrase. One heard word for word runs as soon as it is heard (unless a longer
+command's phrase holds it with more words after it), the rest when the sentence ends. A chime when the wake phrase
+is heard; a notification with what ran, or with what was heard when nothing matched.
+Commands run in a scope of their own (systemd-run --user --scope), so an application started by voice outlives a
+restart of the listener.
+Answers read aloud (the Assistant tab's "speak answers", for its own answers and those to "hey assistant"): Supertone's
+Supertonic 3 (int8, 44.1 kHz, ten voices, 31 languages; MIT code, OpenRAIL-M model), run by sherpa-onnx on the CPU, a
+sentence at a time, the next one made while one plays (board 2026-11-19: 0.45 s of work per second of speech on the
+two big cores at 4 steps; the model loads in 1.2 s, about 0.5 GB while it reads). Not Piper, Kitten or Kokoro:
+sherpa-onnx 2.0.1's wheels have no espeak-ng front end for them ("no frontend available"); Supertonic reads letters.
+A wake phrase said while an answer is read stops it (the microphone hears the speaker too).
+The NPU (VIP9000) is not used yet: Radxa's own assistant runs the same kinds of model there (Chinese ones,
+docs.radxa.com .../npu-dev/voice-assistant); English ones need converting with Allwinner's ACUITY tools first.
+Exit 0: done (test: a command matched); 1: failed or nothing matched, the reason printed; 2: usage."""
+
+from __future__ import annotations
+
+import collections
+import difflib
+import fcntl
+import hashlib
+import html
+import http.client
+import json
+import math
+import os
+import queue
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+RATE = 16000
+CHUNK = RATE // 10
+DATA = Path(os.environ.get("A7A_VOICE_DATA") or Path.home() / ".local/share/a7a-voice")
+CONFIG = Path(os.environ.get("A7A_VOICE_CONFIG") or Path.home() / ".config/a7a-voice/config.json")
+RUNDIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+STATUS = RUNDIR / "a7a-voice.json"
+PROGRESS = RUNDIR / "a7a-voice-setup.json"
+KEYWORDS = RUNDIR / "a7a-voice-keywords.txt"
+UNIT = "a7a-voice.service"
+VENV = DATA / "venv"
+MODELS = DATA / "models"
+READY = DATA / "setup.json"
+# what setup installs: the versions measured on the board (2026-11-18), wheels only (Python 3.14, aarch64)
+# the NPU spotter (tools/npu: its encoder converted with Allwinner's ACUITY, the search in numpy): installed with the
+# board tools; its one extra package goes into the venv when it is switched on (`a7a-voice npu on`), so a venv set up
+# before it keeps working
+NPU = Path(os.environ.get("A7A_VOICE_NPU") or "/usr/lib/a7a-voice/npu")
+NPU_PACKAGES = ["kaldi-native-fbank==1.23.3"]
+ENGINE = {"engine": "cpu", "npu_error": ""}         # the spotter running now, and why not the NPU's when it was asked
+PACKAGES = ["sherpa-onnx==2.0.1", "sherpa-onnx-core==2.0.1", "sentencepiece==0.2.3", "numpy==2.5.5"]
+RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
+# (directory, release tag, size, sha256 of the .tar.bz2, the files unpacked): the spotter's sha256 as downloaded
+# 2026-11-18 (GitHub lists no digest for it), Kroko's as GitHub lists it; the spotter's int8 networks only, no test
+# recordings
+KWS = ("sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01", "kws-models", 17626723,
+       "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a", r"^(tokens\.txt|bpe\.model|.*\.int8\.onnx)$")
+ASR = ("sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06", "asr-models", 57267600,
+       "c8676e5ff9ac2a85296e53ee0fd4d5fb1db6770e7a7647166eeafe349ade6834", r"^(tokens\.txt|(encoder|decoder|joiner)\.onnx)$")
+# the voice that reads answers aloud, sha256 as GitHub lists it: its four networks, its settings, voices and licence
+TTS = ("sherpa-onnx-supertonic-3-tts-int8-2026-05-11", "tts-models", 128774318,
+       "82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427",
+       r"^(LICENSE|tts\.json|voice\.bin|unicode_indexer\.bin|(duration_predictor|text_encoder|vector_estimator|vocoder)\.int8\.onnx)$")
+# what each part needs: listening for commands, and reading answers aloud (each set up on its own)
+PARTS = {"listen": (KWS, ASR), "speak": (TTS,)}
+SPEECH = CONFIG.with_name("speech.json")          # answers read aloud or not, and the voice: the Assistant tab's
+# the panel's Assistant settings (a7a-panel, prefs.rs): the online assistants' names ("hey <name>"), never their keys
+PANEL = Path(os.environ.get("A7A_PANEL_SETTINGS") or
+             Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "a7a-panel" / "assistant.json")
+SPEECH_PROGRESS = RUNDIR / "a7a-voice-speech-setup.json"
+SPEAKING = RUNDIR / "a7a-voice-speaking"          # held (flock) while an answer is read aloud, with the reader's pid
+HUSHED = RUNDIR / "a7a-voice-hushed"              # when the last hush came, in seconds since boot
+VOICES = ["F1", "F2", "F3", "F4", "F5", "M1", "M2", "M3", "M4", "M5"]   # Supertonic's, as sherpa-onnx packs them
+SPEECH_STEPS = 4      # the voice's flow steps: 5 (its default) take 0.54 s of work for a second of speech, 4 0.45 s,
+                      # both written down whole by the recogniser; 3 misheard a word, 2 garbled (board 2026-11-19)
+SPEECH_LEAD = 0.3     # s of quiet kept before each sentence (the model makes 0.5 s before it and 0.7 s after): the
+                      # pause between two, and room for the sound card to wake up before the first
+SAMPLE = "I will read the answers aloud in this voice."
+PREROLL = 20          # chunks of 0.1 s the recogniser gets from before the wake phrase was spotted (spotted about
+                      # 0.4 s after it ends, board 2026-11-18; 2 s leaves room for a slowly said phrase)
+REFRESH = 6000        # chunks (10 min) after which a spotter stream that has spotted nothing is replaced by a new one
+HUSH = 8              # quiet chunks after sound that give the spotter a fresh stream (see Listener.feed): more than
+                      # the spotter takes to name a phrase after it ends (about 0.4 s), so a phrase followed by a
+                      # pause is named before its stream goes (with 3, "hey computer" [pause] was lost: review)
+STILL_TALKING = 5     # chunks without voice that make a pause (Listener.ended)
+WORD_LAG = 10         # chunks the end of a sentence waits after the voice, for words said but not written yet (the
+                      # recogniser wrote the last word 0.45 s after the voice stopped: Actions.early)
+LONGEST_HOLD = 25     # chunks (2.5 s) at most that a sentence's end waits, in all: a voice that never stops (a
+                      # television) types its words otherwise (review 2026-11-22)
+ASK_PAUSE = 2.0       # s without a new word that end a question for the Assistant: one may pause in it to think (the
+                      # end of a sentence, 0.8 s, cut the owner's question off at its first pause: 2026-11-19)
+ASK_LONGEST = 40.0    # s after its wake phrase that a question is asked even while words still come
+LLM = "http://127.0.0.1:8080"   # a7a-llm's model server (llama.cpp), which the panel's Assistant uses too
+ANSWER_CHARS = 700    # of an answer, shown in its notification (KDE keeps the notification in its history)
+QUIET = 5.0           # seconds without a byte from the microphone that end the listener (systemd starts it again)
+WAKE_FOUND = 0.6      # how close a stretch of a sentence must come to the wake phrase to be taken for it
+WAKE_STRONG = 0.75    # ... to be taken for it before a closer stretch later in the sentence
+WAKE_EXACT = 0.95     # ... to be taken for it before an earlier, only strong one (that may be "my computer" in the pre-roll)
+CHIMES = ["/usr/share/sounds/ocean/stereo/message-new-instant.oga", "/usr/share/sounds/freedesktop/stereo/message.oga"]
+# typing and keys: dotool (Fedora's; it types through a virtual keyboard, /dev/uinput, which the seat's user may use:
+# KDE Connect's udev rule, and this package's). The listener keeps its daemon (dotoold) on this pipe, so a key needs no
+# new keyboard (a new one takes the desktop about a second to see); without it, a dotool of its own
+KEYS_PIPE = RUNDIR / "a7a-voice-keys"
+DICTATION_IDLE = 60.0  # s without a word that end dictation ("start dictation")
+TYPE_CHUNK = 1000      # characters of text in one dotool line (a pipe write of up to 4 KiB is whole)
+
+DEFAULTS = {
+    "wake": "hey cubie",
+    # the second wake phrase: what follows it is a question for the Assistant ("" = none)
+    "assistant": "hey assistant",
+    "commands": [
+        {"say": "volume up", "run": "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 10%+"},
+        {"say": "volume down", "run": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 10%-"},
+        {"say": "mute", "run": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"},
+        {"say": "open firefox", "run": "firefox"},
+        {"say": "open the panel", "run": "a7a-panel"},
+        {"say": "how hot is it", "run": "notify-send -a Voice \"Temperature\" \"$(sort -n /sys/class/thermal/thermal_zone*/temp "
+                                       "| tail -n 1 | awk '{printf \"%.0f °C\", $1/1000}')\""},
+        {"say": "lock the screen", "run": "loginctl lock-session"},
+    ],
+    # how close a sentence must come to a command (0..1), the spotter's threshold for the wake phrase (lower: it
+    # wakes more easily), the seconds a command may follow the wake phrase, the PipeWire source ("" = the default)
+    "match": 0.75,
+    "sensitivity": 0.25,
+    "window": 8.0,
+    "mic": "",
+    # the wake-phrase spotter's network on the NPU (a7a-voice npu on|off), the CPU's otherwise or when it cannot load
+    "npu": False,
+    # the commands `a7a-voice scan` found (the panel's Scan): {"id", "say", "run", "on", "kind"}; a scan keeps what the
+    # owner changed of one (its words, on or off) by its id
+    "found": [],
+}
+LIMITS = {"match": (0.5, 1.0), "sensitivity": (0.05, 0.9), "window": (2.0, 30.0)}
+
+ONES = "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen " \
+       "seventeen eighteen nineteen".split()
+TENS = "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()
+
+
+# ---------------------------------------------------------------- settings
+
+def number_words(n: int) -> str:
+    """0..999 999 as the recogniser writes them ("FIFTY FIVE", "TWO THOUSAND TEN"); larger numbers stay digits."""
+    if n < 20:
+        return ONES[n]
+    if n < 100:
+        return TENS[n // 10] + ("" if n % 10 == 0 else " " + ONES[n % 10])
+    if n < 1000:
+        return ONES[n // 100] + " hundred" + ("" if n % 100 == 0 else " " + number_words(n % 100))
+    if n < 1000000:
+        return number_words(n // 1000) + " thousand" + ("" if n % 1000 == 0 else " " + number_words(n % 1000))
+    return str(n)
+
+
+def spelled_address(written: str) -> str | None:
+    """An address as written ("www.google.com", "sam@example.fr", "github.com/rabs9") in the words said for it ("www
+    dot google dot com"), its digits kept ("1password dot com": spelled out, they would fall out of the address and
+    leave a stranger's site, password.com: review 2026-11-22); None when no dot in it comes before a domain's ending
+    ("e.g.", "3.30")."""
+    parts = re.split(r"([.@/])", written)
+    if not any(a == "." and b in DOMAINS for a, b in zip(parts, parts[1:])):
+        return None
+    said = {".": "dot", "@": "at", "/": "slash"}
+    return " " + " ".join(said.get(p) or p.replace("-", " dash ") for p in parts) + " "
+
+
+def spelled(s: str) -> str:
+    """Numbers spelled out, a hyphenated word run together ("wi-fi" is "wifi")."""
+    s = re.sub(r"(?<=[a-z])-(?=[a-z])", "", s)
+    return re.sub(r"\d+", lambda m: f" {number_words(int(m.group())) if len(m.group()) < 7 else m.group()} ", s)
+
+
+def words(s: str) -> list[str]:
+    """Lower-case words as the recogniser writes them: numbers spelled out, a hyphenated word run together ("wi-fi" is
+    "wifi"), no punctuation, apostrophes kept. An address it writes as one ("Go to LeMonde.fr": it does, for a site's
+    name, "dot" and its ending said, board 2026-11-22) is in the words said for it (spelled_address), as typing by voice finds addresses."""
+    s, out, at = s.lower().replace("’", "'"), [], 0
+    for m in re.finditer(r"[a-z0-9-]+(?:[.@/][a-z0-9-]+)+", s):
+        out.append(spelled(s[at:m.start()]))
+        out.append(spelled_address(m.group()) or spelled(m.group()))
+        at = m.end()
+    return re.findall(r"[a-z0-9]+(?:'[a-z]+)?", "".join(out) + spelled(s[at:]))
+
+
+def clean(raw) -> dict:
+    """The settings the listener uses: the defaults under what `raw` sets, numbers clamped, the wake phrase non-empty.
+    Commands are kept as typed (the panel shows them again), as strings; one without words or without a command line
+    never matches."""
+    cfg = json.loads(json.dumps(DEFAULTS))
+    if not isinstance(raw, dict):
+        return cfg
+    if isinstance(raw.get("wake"), str) and words(raw["wake"]):
+        cfg["wake"] = " ".join(raw["wake"].split())
+    if isinstance(raw.get("assistant"), str):
+        cfg["assistant"] = " ".join(raw["assistant"].split()) if words(raw["assistant"]) else ""
+    if words(cfg["assistant"]) == words(cfg["wake"]):      # one phrase cannot mean both
+        cfg["assistant"] = ""
+    if isinstance(raw.get("commands"), list):
+        cfg["commands"] = [{"say": str(c.get("say", "")), "run": str(c.get("run", ""))}
+                           for c in raw["commands"] if isinstance(c, dict)]
+    for k, (lo, hi) in LIMITS.items():
+        v = raw.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            cfg[k] = min(hi, max(lo, float(v)))
+    if isinstance(raw.get("mic"), str):
+        cfg["mic"] = raw["mic"].strip()
+    if isinstance(raw.get("npu"), bool):
+        cfg["npu"] = raw["npu"]
+    if isinstance(raw.get("found"), list):
+        cfg["found"] = [{"id": f["id"], "say": str(f.get("say", "")), "run": str(f.get("run", "")),
+                         "on": f.get("on") is not False, "kind": str(f.get("kind", "")), "made": str(f.get("made", ""))}
+                        for f in raw["found"] if isinstance(f, dict) and isinstance(f.get("id"), str) and f["id"]]
+    return cfg
+
+
+def active(cfg: dict) -> list[dict]:
+    """The commands the listener matches: the owner's own first (on a tie the first wins), then those a scan found
+    that are switched on."""
+    return cfg["commands"] + [f for f in cfg.get("found", []) if f["on"]]
+
+
+def load_config(path: Path | None = None) -> tuple[dict, str]:
+    """(settings, problem): the defaults when the file is missing. When it cannot be used (it does not parse, is not
+    an object, or its commands are not a list), the defaults with the reason, for the caller to decide: the listener
+    keeps the settings it has, or starts with no commands."""
+    path = path or CONFIG
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return clean(None), ""
+    except (OSError, ValueError) as e:
+        return clean(None), f"{path}: {e}"
+    if not isinstance(raw, dict):
+        return clean(None), f"{path}: the settings are not a JSON object"
+    if "commands" in raw and not isinstance(raw["commands"], list):
+        return clean(None), f"{path}: its \"commands\" are not a list"
+    return clean(raw), ""
+
+
+def mtime(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def write_json(path: Path, value) -> None:
+    """Whole or not at all: a reader (the panel, the listener) never sees half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(value, indent=1, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------- matching
+
+FILLER = {"the", "a", "an", "please"}
+# what a pause after the wake phrase may hold before the command: the listener waits on (review 2026-11-18)
+HESITATIONS = FILLER | {"um", "uh", "er", "erm", "hmm", "mm", "oh", "okay", "ok", "so", "well", "and"}
+# sounds said before a command and not part of it ("uh, type hello"); not "and", "so", "well": "and go to bed, kids"
+# is talk, not a search (review 2026-11-22)
+LEAD_SOUNDS = {"um", "uh", "er", "erm", "hmm", "mm", "oh", "okay", "ok"}
+
+
+def unled(heard: list[str]) -> list[str]:
+    """The words without the sounds (LEAD_SOUNDS) they begin with."""
+    n = next((n for n, w in enumerate(heard) if w not in LEAD_SOUNDS), len(heard))
+    return heard[n:]
+NEGATIONS = {"don't", "dont", "not", "never"}
+# what one says to stop an answer being read ("hey computer, stop", "… that's enough"): no "no command" notice for it
+STOPS = HESITATIONS | {"stop", "quiet", "enough", "cancel", "shush", "hush", "silence", "shut", "up", "be", "it",
+                       "that's", "thats", "now", "talking", "speaking", "reading", "pause", "never", "mind", "fine",
+                       "thank", "thanks", "you"}
+
+
+def similar(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def close(a: str, b: str) -> bool:
+    """One word close enough to be the other misheard: three quarters of the letters in common, 0.85 when either has
+    five letters or fewer ("muted" is "mute"; "minute" is not, nor "look" "lock", nor "town" "down")."""
+    return a == b or similar(a, b) >= (0.85 if min(len(a), len(b)) <= 5 else 0.75)
+
+
+def covered(stretch: list[str], phrase: list[str]) -> float:
+    """The share of the phrase's words (fillers aside) the stretch has, each close enough to a word of the stretch or
+    two of them run together (the recogniser may write "fire fox"); a phrase word that is not, run together with the
+    next one and then nearly the same (typed "wi fi", heard "wifi"; "lock screen" run together is not "screen")."""
+    pool = stretch + ["".join(stretch[i:i + 2]) for i in range(len(stretch) - 1)]
+    wanted = [w for w in phrase if w not in FILLER] or phrase
+    got = i = 0
+    while i < len(wanted):
+        if any(close(wanted[i], x) for x in pool):
+            got, i = got + 1, i + 1
+        elif i + 1 < len(wanted) and any(similar(wanted[i] + wanted[i + 1], x) >= 0.9 for x in pool):
+            got, i = got + 2, i + 2
+        else:
+            i += 1
+    return got / len(wanted)
+
+
+def find(heard: list[str], phrase: list[str]) -> int:
+    """Where the phrase's words come in the sentence in a row (the last time), or -1."""
+    p = len(phrase)
+    for i in range(len(heard) - p, -1, -1):
+        if heard[i:i + p] == phrase:
+            return i
+    return -1
+
+
+def holds(longer: list[str], phrase: list[str]) -> bool:
+    """The phrase comes in the longer one with words after it ("volume up" in "turn volume up to max")."""
+    p = len(phrase)
+    return any(longer[i:i + p] == phrase for i in range(len(longer) - p))
+
+
+def score(heard: list[str], phrase: list[str], floor: float = 0.0) -> tuple[float, int]:
+    """How well the sentence holds the phrase, 0..1, and where that stretch of it starts: 1 when its words come in it
+    in a row, else the closest stretch of about as many words, its letters against the phrase's (spaces left out)
+    times the share of the phrase's words it has (so "volume" alone is not "volume up", while "lock screen" still is
+    "lock the screen"). A stretch whose letters alone fall short of `floor` is not looked at closer (its score cannot
+    reach it): a long sentence against many commands stays quick (review 2026-11-18: 283 ms to 37 ms on the laptop)."""
+    if not heard or not phrase:
+        return 0.0, -1
+    at = find(heard, phrase)
+    if at >= 0:
+        return 1.0, at
+    target, p = "".join(phrase), len(phrase)
+    best, at = 0.0, -1
+    for n in range(max(1, p - 1), p + 2):
+        for i in range(max(1, len(heard) - n + 1)):
+            stretch = heard[i:i + n]
+            r = similar("".join(stretch), target)
+            if r > best and r >= floor:
+                s = r * covered(stretch, phrase)
+                if s > best:
+                    best, at = s, i
+    return best, at
+
+
+def negated(heard: list[str], at: int, phrase: list[str]) -> bool:
+    """"don't lock the screen": a negation right before the stretch, that the phrase does not have itself (only the
+    word right before: "never mind, mute" and "not now, open firefox" are commands)."""
+    return at > 0 and heard[at - 1] in NEGATIONS and heard[at - 1] not in phrase
+
+
+def best_match(heard: list[str], commands: list[dict], floor: float) -> tuple[dict | None, float]:
+    """(the command, its score) for a sentence's words; None when no command comes to `floor` (a negated one does not
+    count). On a tie, the longer phrase."""
+    best, best_score, best_len = None, 0.0, 0
+    for c in commands:
+        say = words(c.get("say", ""))
+        if not say or not c.get("run", "").strip():
+            continue
+        s, at = score(heard, say, floor)
+        if s >= floor and negated(heard, at, say):
+            continue
+        if s > best_score or (s == best_score and best is not None and len(say) > best_len):
+            best, best_score, best_len = c, s, len(say)
+    return (best, best_score) if best is not None and best_score >= floor else (None, best_score)
+
+
+def wake_stretches(heard: list[str], wake: str) -> tuple[list[tuple[int, int, float]], str]:
+    """The stretches of about the wake phrase's length that come close to it by their letters (the recogniser may
+    write "a computer" for "hey computer"), as (start, end, closeness) in the order of the sentence; and the phrase."""
+    w = words(wake)
+    target, p = "".join(w), len(w)
+    return sorted((i, i + n, r) for n in range(max(1, p - 1), p + 2) for i in range(len(heard) - n + 1)
+                  if (r := similar("".join(heard[i:i + n]), target)) >= WAKE_FOUND), target
+
+
+def first_stretch(found: list[tuple[int, int, float]], heard: list[str], wake: str) -> tuple[int, int, float]:
+    """Of the wake phrase's stretches (wake_stretches), the one taken for it (cut_at_wake): the first as written; else
+    the first close one, unless its first word cannot be the phrase's misheard ("my computer" in the pre-roll; "a",
+    "eh", "he" can be "hey") and a later close one is the phrase word for word, beginning with its very first word
+    (the owner's "hey commuter": 2026-11-24, open since 11-23); else the closest. Not covered(), whose run-together
+    letters take "the computer" for "hey computer"; not a later stretch over an earlier one that may be the phrase
+    ("a computer, type they computed it": "they" is close to "hey", and the command was cut: review 2026-11-24).
+    (The recogniser writing "a computer" for the phrase over a pre-roll "my computer" needs timings.)"""
+    phrase = words(wake)
+
+    def could_be(x: str) -> bool:           # a word the recogniser writes for the phrase's first one
+        return close(x, phrase[0]) or (len(x) <= 2 and x[0] in "aeiouh")
+
+    def word_for_word(f: tuple[int, int, float]) -> bool:
+        return (f[1] - f[0] == len(phrase) and heard[f[0]] == phrase[0]
+                and all(close(a, b) for a, b in zip(heard[f[0]:f[1]], phrase)))
+
+    if exact := next((f for f in found if f[2] >= WAKE_EXACT), None):
+        return exact
+    strong = next((f for f in found if f[2] >= WAKE_STRONG), None)
+    if strong is not None and not could_be(heard[strong[0]]):
+        later = next((f for f in found if f[0] > strong[0] and f[2] >= WAKE_STRONG and word_for_word(f)), None)
+        return later or strong
+    return strong or max(found, key=lambda f: f[2])
+
+
+def phrase_start(heard: list[str], wake: str, end: int) -> int | None:
+    """Where the wake phrase, as the recogniser wrote it, begins when it ends at `end`: the closest stretch ending there
+    (the later of two as close); None when none does (only the phrase's end was caught: cut_at_wake)."""
+    found, _ = wake_stretches(heard, wake)
+    ends = [f for f in found if f[1] == end]
+    return max(ends, key=lambda f: (f[2], f[0]))[0] if ends else None
+
+
+def cut_at_wake(heard: list[str], wake: str) -> tuple[int, bool] | None:
+    """Where the command may begin in the sentence the recogniser began before the phrase was spotted, and whether
+    the phrase was found as written: what came before it (the pre-roll's two seconds) is not a command, and is
+    dropped, unread. The phrase is the FIRST stretch that comes nearly as written (else the first that comes close,
+    else the closest), so a command that holds something like it ("shut down the computer") is not cut, nor an
+    earlier "my computer" in the pre-roll taken for it; of the stretches over the same words the closest, the
+    longest; and a phrase said twice in a row goes too (review 2026-11-18: sixteen cases). A phrase the pre-roll
+    caught only the end of ("...uter, open firefox") leaves that end, dropped too. None when it is not there."""
+    found, target = wake_stretches(heard, wake)
+    if not found:
+        for k in (2, 1):                    # its end only: the first word or two match the phrase's last letters
+            tail = "".join(heard[:k])
+            if len(heard) > k and len(tail) >= 2 and similar(tail, target[-len(tail):]) >= WAKE_STRONG:
+                return k, False
+        return None
+    first = first_stretch(found, heard, wake)
+
+    def through(i0: int, e0: int) -> tuple[int, float]:
+        over = [f for f in found if i0 <= f[0] < e0]
+        best = max(r for _, _, r in over)
+        return max(e for _, e, r in over if r >= best - 0.05), best
+
+    end, best = through(first[0], first[1])
+    while again := [f for f in found if f[0] == end and f[2] >= best - 0.05]:
+        f = max(again, key=lambda f: f[2])
+        end, best = through(f[0], f[1])
+    return end, first[2] >= WAKE_EXACT
+
+
+def after_wake(heard: list[str], wake: str) -> list[str] | None:
+    """The words after the wake phrase in the first sentence (cut_at_wake); None when the phrase is not there."""
+    cut = cut_at_wake(heard, wake)
+    return None if cut is None else heard[cut[0]:]
+
+
+def lead_wake(heard: list[str], wake: str) -> list[str]:
+    """A later sentence (the wake phrase said again): the whole phrase, where it begins the sentence, goes; a single
+    word of it does not ("computer status" stays whole), and a one-word phrase never (it may begin a command)."""
+    found, _ = wake_stretches(heard, wake)
+    p = len(words(wake))
+    starts = [(r, e) for i, e, r in found if i == 0 and e >= p and r >= WAKE_STRONG]
+    return heard[max(starts)[1]:] if starts and p > 1 else heard
+
+
+def phrase_inside(heard: list[str], wake: str) -> tuple[int, int] | None:
+    """Where the wake phrase comes in a sentence after words of its own, as written or word for word close ("hey
+    commuter"): (start, end), the first time; None when it does not, or only at the start. A one-word phrase never
+    (it is too likely in talk)."""
+    phrase = words(wake)
+    n = len(phrase)
+    if n < 2:
+        return None
+    for i in range(1, len(heard) - n + 1):
+        stretch = heard[i:i + n]
+        if stretch == phrase or all(close(a, b) for a, b in zip(stretch, phrase)):
+            return i, i + n
+    return None
+
+
+def keyword_line(pieces: list[str]) -> str:
+    """The wake phrase as the spotter's keyword file wants it: its word pieces, separated by spaces."""
+    return " ".join(pieces)
+
+
+def wake_phrases(cfg: dict) -> list[str]:
+    """The phrases the spotter listens for: the commands' one, the Assistant's when there is one, and "hey <name>"
+    for each online assistant (cfg["online"]; one that would be another phrase again is left out)."""
+    phrases = [cfg["wake"]] + ([cfg["assistant"]] if cfg.get("assistant") else [])
+    for name in cfg.get("online", []):
+        phrase = f"hey {name}"
+        if words(phrase) not in [words(p) for p in phrases]:
+            phrases.append(phrase)
+    return phrases
+
+
+# the panel's providers (prefs.rs Provider::key) and the words it numbers a name taken already with
+PROVIDERS = ("google", "cloudflare", "brave", "mistral", "perplexity", "openrouter", "groq", "openai", "other")
+ORDINALS = ("second", "third", "fourth", "fifth", "sixth")
+# what Rust's str::trim takes off (Unicode White_Space; Python's strip takes \x1c-\x1f too: review 2026-11-19)
+RUST_SPACE = "\t\n\x0b\x0c\r \x85\xa0\u1680" + "".join(chr(c) for c in range(0x2000, 0x200b)) + "\u2028\u2029\u202f\u205f\u3000"
+SHORTEST = 3            # letters an online assistant's name needs to be a wake phrase ("hey ai" is in too much talk)
+
+
+def online_name(name: str) -> str:
+    """A name as the panel keeps it (prefs.rs online_name): lower-case letters only, at most 3 words, 24 characters."""
+    cleaned = "".join(c if "a" <= c <= "z" else " " for c in name.lower())
+    return " ".join(cleaned.split()[:3])[:24].strip()
+
+
+def online_names(path: Path | None = None) -> list[str]:
+    """The online assistants the panel's settings switch on, with a key, by name: "hey <name>" asks one by voice
+    (a7a-panel --answer --assistant <name>). Named as the panel names them (prefs.rs from_json and cleaned: the
+    provider's name for none, a name taken already numbered "second …", a seventh dropped), or the panel would not
+    know the name it is asked for. The names only: the keys stay in the panel's file."""
+    raw = read_json(path or PANEL)
+    if not isinstance(raw, dict) or not isinstance(raw.get("online"), list):
+        return []
+    named: list[str] = []                   # every one's, switched on or not: they are numbered together
+    names: list[str] = []
+    for o in raw["online"]:
+        if not isinstance(o, dict):
+            continue
+        provider = o["provider"].strip(RUST_SPACE).lower() if isinstance(o.get("provider"), str) else ""
+        base = online_name(o["name"] if isinstance(o.get("name"), str) else "") or (provider if provider in PROVIDERS else "other")
+        name = base
+        for k in ORDINALS:
+            if name not in named:
+                break
+            name = f"{k} {base}"
+        if name in named:
+            continue
+        named.append(name)
+        on = o["on"] if isinstance(o.get("on"), bool) else True
+        if on and isinstance(o.get("key"), str) and o["key"].strip(RUST_SPACE):
+            names.append(name)
+    return names
+
+
+def keywords(cfg: dict, pieces_of, known: set) -> tuple[list[str], list[str], list[str]]:
+    """The spotter's keyword lines (`pieces_of` a phrase's word pieces, `known` the ones the spotter has): the
+    commands' phrase, the Assistant's, and "hey <name>" for each online assistant it can tell from those; with the
+    names it listens for, and why it does not for the others. The spotter names the first phrase it hears whole, so
+    one that begins another (or is another) would take it: of the two, the one first in the list stays."""
+    lines: list[str] = []
+    taken: list[list[str]] = []
+    online: list[str] = []
+    left: list[str] = []
+    for phrase in [cfg["wake"]] + ([cfg["assistant"]] if cfg.get("assistant") else []):
+        pieces = pieces_of(phrase)
+        if missing := [x for x in pieces if x not in known]:
+            raise ValueError(f"the wake phrase “{phrase}” has pieces the spotter does not know: {missing}")
+        lines.append(keyword_line(pieces))
+        taken.append(pieces)
+    for name in cfg.get("online", []):
+        phrase = f"hey {name}"
+        pieces = pieces_of(phrase)
+        if missing := [x for x in pieces if x not in known]:
+            left.append(f"“{phrase}”: the spotter does not know some of its sounds ({' '.join(missing)})")
+        elif sum(c.isalpha() for c in name) < SHORTEST:
+            left.append(f"“{phrase}”: too short, a name needs {SHORTEST} letters or more")
+        elif pieces in taken:
+            left.append(f"“{phrase}”: another wake phrase already")
+        elif any(t[:len(pieces)] == pieces or pieces[:len(t)] == t for t in taken):
+            left.append(f"“{phrase}”: it begins like another wake phrase, or another begins like it")
+        else:
+            lines.append(keyword_line(pieces))
+            taken.append(pieces)
+            online.append(name)
+    return lines, online, left
+
+
+def heard_as(phrases: list[str]) -> str:
+    return " and ".join(f"“{p}”" for p in phrases)
+
+
+def level(samples) -> float:
+    """A chunk's loudness (RMS, 1.0 = full scale)."""
+    n = len(samples)
+    if not n:
+        return 0.0
+    dot = getattr(samples, "dot", None)
+    return math.sqrt(float(dot(samples)) / n) if dot else math.sqrt(sum(x * x for x in samples) / n)
+
+
+# ---------------------------------------------------------------- reading answers aloud
+
+# signs and units the voice reads badly, in words ("52 °C" came out as "fifty two DC", "6 GB" as "six G B": board
+# 2026-11-19)
+SAID_AS = [(r"\s*°\s*C\b", " degrees Celsius"), (r"\s*°\s*F\b", " degrees Fahrenheit"), (r"\s*°", " degrees"),
+           (r"(?<=\d)\s*%", " percent"), (r"(?<=\d)\s*(?:GiB|GB)\b", " gigabytes"),
+           (r"(?<=\d)\s*(?:MiB|MB)\b", " megabytes"), (r"(?<=\d)\s*(?:KiB|kB|KB)\b", " kilobytes"),
+           (r"(?<=\d)\s*GHz\b", " gigahertz"), (r"(?<=\d)\s*MHz\b", " megahertz"),
+           (r"\btok(?:ens)?/s\b", "tokens a second"), (r"\s&\s", " and ")]
+SAID = set(".,;:!?'\"()-+=$€£%")      # signs besides letters, digits and spaces that stay in what is read
+FIRST_PIECE = 100     # characters: the first piece of an answer, which is made whole before anything plays (about
+                      # 6 s of speech, 3 s of work); a longer sentence is cut after a comma, else between two words
+PIECE = 200           # ... and every later one, made while the one before plays
+
+
+def speakable(text: str) -> list[str]:
+    """An answer (markdown) as the voice reads it, in pieces of about a sentence: code blocks, the addresses of links,
+    markdown's marks and the signs a voice cannot say left out, units in words, each line of a list or a table a
+    sentence of its own."""
+    text = re.sub(r"```.*?(?:```|\Z)", "\n", text, flags=re.S)
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"<?\bhttps?://[^\s)>\]]*[^\s)>\].,;:!?'\"]>?", "the link", text)
+    text = re.sub(r"[^\s.,;:!?]{40,}", " ", text)        # a hash, a key: nothing to say
+    sentences = []
+    for line in text.splitlines():
+        line = line.strip()
+        if "-" in line and re.fullmatch(r"\|?[\s:|-]+\|?", line):          # a table's rule
+            continue
+        line = re.sub(r"^(?:#{1,6}|>|[-*+]|\d+[.)])\s+", "", line)
+        if "|" in line:
+            line = line.strip("|").replace("|", ", ")
+        line = re.sub(r"\*\*|__|~~|[`*]", "", line)
+        line = re.sub(r"(?<=\w)_(?=\w)", " ", line).replace("_", "")
+        for pattern, said in SAID_AS:
+            line = re.sub(pattern, said, line)
+        line = "".join(c if c in SAID or unicodedata.category(c)[0] in "LNZ" else " " for c in line)
+        line = re.sub(r"\s+([,.;:!?])", r"\1", " ".join(line.split())).strip(" ,;")
+        if not re.search(r"\w", line):
+            continue
+        if line[-1] not in ".!?:":
+            line += "."
+        sentences += re.split(r"(?<=[.!?])\s+", line)
+    pieces: list[str] = []
+    for s in sentences:
+        while len(s) > (most := PIECE if pieces else FIRST_PIECE):
+            cut = (max((m.end() for m in re.finditer(r"[,;:]\s", s[:most])), default=0) or s.rfind(" ", 0, most) + 1
+                   or most)
+            pieces.append(s[:cut].strip())
+            s = s[cut:].strip()
+        pieces.append(s)
+    return [p for p in pieces if re.search(r"\w", p)]
+
+
+def speech_settings() -> dict:
+    """Answers read aloud or not, and the voice: off and the first voice until the Assistant tab sets them."""
+    raw = read_json(SPEECH)
+    raw = raw if isinstance(raw, dict) else {}
+    return {"speak": raw.get("speak") is True, "voice": raw.get("voice") if raw.get("voice") in VOICES else VOICES[0]}
+
+
+def held(path: Path) -> bool:
+    """Someone holds the lock on `path` (a process number could be another program's by now: review 2026-11-18)."""
+    try:
+        with open(path) as f:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return False
+
+
+def reader() -> int:
+    """The process reading aloud now, 0 when none: SPEAKING locked, and the process it names an `a7a-voice say`. A
+    lock held for a moment by someone looking (held, hush) leaves the number of a reader that has ended in the file,
+    which could be another program's by now: that one is not a reader (review 2026-11-19)."""
+    try:
+        with open(SPEAKING) as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                return 0
+            except OSError:
+                pass
+            pid = int(f.read().split()[0])
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (OSError, ValueError, IndexError):
+        return 0
+    return pid if pid != os.getpid() and b"say" in argv and any(a.endswith(b"a7a-voice") for a in argv) else 0
+
+
+def boot_seconds() -> float:
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def started() -> float:
+    """When this process started, in seconds since boot (as boot_seconds counts; into_venv's exec keeps it)."""
+    with open("/proc/self/stat") as f:
+        return int(f.read().rsplit(")", 1)[1].split()[19]) / os.sysconf("SC_CLK_TCK")
+
+
+def hushed_since(t: float) -> bool:
+    """A hush came after `t` (seconds since boot)."""
+    try:
+        return float(HUSHED.read_text()) > t
+    except (OSError, ValueError):
+        return False
+
+
+def hush(wait: float = 2.0, everything: bool = True) -> bool:
+    """Ends what is being read aloud: the reader's process group (it and its player), then empties SPEAKING. With
+    `everything`, a reader started before now that has not taken the lock yet (half a second of starting up) gives
+    up too: it finds the time written in HUSHED after its own start (say_aloud's own hush, making way for itself, is
+    not one of those). True when a reader was ended."""
+    if everything:
+        try:
+            HUSHED.parent.mkdir(parents=True, exist_ok=True)
+            HUSHED.write_text(f"{boot_seconds():.3f}\n")
+        except OSError:                     # (the runtime directory full: the reader that holds the lock still goes)
+            pass
+    pid = reader()
+    if not pid:
+        return False
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    end = time.monotonic() + wait
+    try:
+        with open(SPEAKING, "r+") as f:
+            while time.monotonic() < end:       # the kernel lets go of its lock as it ends
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    time.sleep(0.02)
+                    continue
+                f.truncate(0)                   # its number goes with it
+                break
+    except OSError:
+        pass
+    return True
+
+
+# ---------------------------------------------------------------- doing things
+
+def detached(argv: list[str]) -> None:
+    """Starts `argv` and does not wait for it: setsid -f returns at once, so nothing is left to reap."""
+    try:
+        subprocess.run(["setsid", "-f", *argv], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"could not start {argv[0]}: {e}", flush=True)
+
+
+def launch(line: str) -> None:
+    """A command line, as the owner, in a scope of its own: outside the listener's service, so stopping the listener
+    does not take an application it started with it."""
+    detached(["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", "/bin/sh", "-c", line])
+
+
+def notify(title: str, body: str = "") -> None:
+    """KDE reads markup in a notification's text: escaped, so what was heard or answered shows as it is (an answer's
+    "<" or "&" garbled it, and a link in it was clickable: review 2026-11-18)."""
+    detached(["notify-send", "--app-name=Voice commands", "--icon=audio-input-microphone", "--transient",
+              "--expire-time=5000", html.escape(title, quote=False), html.escape(body, quote=False)])
+
+
+def chime(path: str) -> None:
+    if path:
+        detached(["pw-play", path])
+
+
+# ---------------------------------------------------------------- found commands, keys and typing
+
+# what a scan offers besides the applications: (id, words, command line, on at first, group: its kind, which the
+# panel's Voice tab lists it under: keys, browser, music, window, board). Off at first: what would cut the owner off
+# from the board if it were misheard (restart, shut down, Wi-Fi off). Volume, mute, the temperature and the lock are
+# the built-in commands already.
+SYSTEM = [
+    ("press-enter", "press enter", "a7a-voice key enter", True, "keys"),
+    ("press-tab", "press tab", "a7a-voice key tab", True, "keys"),
+    ("press-escape", "press escape", "a7a-voice key esc", True, "keys"),
+    ("new-line", "new line", "a7a-voice key shift+enter", True, "keys"),
+    ("select-all", "select all", "a7a-voice key ctrl+a", True, "keys"),
+    ("copy", "copy that", "a7a-voice key ctrl+c", True, "keys"),
+    ("paste", "paste that", "a7a-voice key ctrl+v", True, "keys"),
+    ("undo", "undo that", "a7a-voice key ctrl+z", True, "keys"),
+    # an editor that opens on a welcome page has nowhere to type until a document is open (KWrite 26.08: board)
+    ("new-document", "new document", "a7a-voice key ctrl+n", True, "keys"),
+    ("save", "save that", "a7a-voice key ctrl+s", True, "keys"),
+    ("address-bar", "address bar", "a7a-voice key ctrl+l", True, "browser"),
+    ("new-tab", "new tab", "a7a-voice key ctrl+t", True, "browser"),
+    ("close-tab", "close tab", "a7a-voice key ctrl+w", True, "browser"),
+    ("scroll-down", "scroll down", "a7a-voice key pagedown", True, "browser"),
+    ("scroll-up", "scroll up", "a7a-voice key pageup", True, "browser"),
+    ("play", "play", "a7a-voice key playpause", True, "music"),
+    ("pause", "pause", "a7a-voice key playpause", True, "music"),
+    ("next-song", "next song", "a7a-voice key nextsong", True, "music"),
+    ("previous-song", "previous song", "a7a-voice key previoussong", True, "music"),
+    ("screenshot", "take a screenshot", "spectacle -b -f", True, "window"),
+    ("show-desktop", "show the desktop", "a7a-voice shortcut 'Show Desktop'", True, "window"),
+    ("close-window", "close this window", "a7a-voice shortcut 'Window Close'", True, "window"),
+    ("minimize-window", "minimize this window", "a7a-voice shortcut 'Window Minimize'", True, "window"),
+    ("maximize-window", "maximize this window", "a7a-voice shortcut 'Window Maximize'", True, "window"),
+    ("time", "what time is it", "notify-send -a Voice \"$(date '+%-I:%M %p')\" \"$(date '+%A, %B %-d')\"", True, "board"),
+    ("wifi-on", "turn wifi on", "nmcli radio wifi on", True, "board"),
+    ("wifi-off", "turn wifi off", "nmcli radio wifi off", False, "board"),
+    ("restart", "restart the computer", "systemctl reboot", False, "board"),
+    ("shut-down", "shut down the computer", "systemctl poweroff", False, "board"),
+]
+
+
+def app_dirs() -> list[Path]:
+    """Where the menu's applications are (the XDG data directories' applications, the owner's first), Flatpak's
+    included when the session did not name them (a service's environment may not)."""
+    home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    dirs = [home] + [Path(d) for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if d]
+    for flatpak in (home / "flatpak/exports/share", Path("/var/lib/flatpak/exports/share")):
+        if flatpak not in dirs:
+            dirs.insert(1, flatpak)
+    return [d / "applications" for d in dirs]
+
+
+def desktop_entries(dirs: list[Path] | None = None, desktop: str | None = None) -> list[dict]:
+    """The applications the menu shows, by their desktop file (an id seen first hides the same id later, as the
+    menu does: the owner's own copy of one wins): {"id" ("org.kde.kwrite"), "name", "generic", "wmclass", "path"}.
+    Not those hidden from it (NoDisplay, Hidden), shown on other desktops only, run in a terminal, or whose program is
+    not there (TryExec). Sorted by name."""
+    desktops = set((desktop if desktop is not None else os.environ.get("XDG_CURRENT_DESKTOP") or "KDE").split(":"))
+    seen: dict[str, dict | None] = {}
+    for d in dirs if dirs is not None else app_dirs():
+        for path in sorted(d.rglob("*.desktop")) if d.is_dir() else []:
+            app_id = str(path.relative_to(d).with_suffix("")).replace("/", "-")
+            if app_id in seen:
+                continue
+            seen[app_id] = None
+            entry = {}
+            try:
+                section = ""
+                for line in path.read_text(errors="replace").splitlines():
+                    line = line.strip()
+                    if line.startswith("["):
+                        section = line
+                    elif section == "[Desktop Entry]" and "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        entry.setdefault(k.strip(), v.strip())
+            except OSError:
+                continue
+            listed = lambda k: {x for x in entry.get(k, "").split(";") if x}
+            try_exec = entry.get("TryExec", "")
+            if (entry.get("Type") != "Application" or not entry.get("Exec") or not entry.get("Name")
+                    or entry.get("NoDisplay") == "true" or entry.get("Hidden") == "true" or entry.get("Terminal") == "true"
+                    or (listed("OnlyShowIn") and not listed("OnlyShowIn") & desktops) or listed("NotShowIn") & desktops
+                    or (try_exec and not (shutil.which(try_exec) if "/" not in try_exec else os.access(try_exec, os.X_OK)))):
+                continue
+            seen[app_id] = {"id": app_id, "name": entry["Name"], "generic": entry.get("GenericName", ""),
+                            "wmclass": entry.get("StartupWMClass", ""), "path": str(path)}
+    return sorted((e for e in seen.values() if e), key=lambda e: e["name"].lower())
+
+
+def app_words(e: dict) -> str:
+    """How an application is said: its name, unless that is KDE's K and a consonant ("KCalc", "KWrite", "KRDC": not
+    words the recogniser writes), then what it is ("scientific calculator") when that is three words at most."""
+    if re.match(r"k[^aeiouy\W]", e["name"], re.I) and 0 < len(words(e["generic"])) <= 3:
+        return " ".join(words(e["generic"]))
+    return " ".join(words(e["name"]))
+
+
+def same_words(commands: list[dict]) -> list[str]:
+    """The words more than one command answers to (of those with a command line), each once: only the first of them
+    would ever run."""
+    count = collections.Counter(tuple(words(c["say"])) for c in commands if words(c["say"]) and c["run"].strip())
+    return [" ".join(w) for w, n in count.items() if n > 1]
+
+
+def scanned(cfg: dict, entries: list[dict]) -> tuple[list[dict], dict]:
+    """The found commands after a scan: "open …" and "close …" for each application, then SYSTEM's. One found before
+    keeps the owner's words for it and its on or off (by its id); a new one is on at first unless one of the owner's
+    own commands has its words (that one would take it) or SYSTEM has it off. An application gone takes its two with
+    it. With what changed: the words added and removed, and those said for more than one command switched on."""
+    old = {f["id"]: f for f in cfg.get("found", [])}
+    owners = {tuple(words(c["say"])) for c in cfg["commands"] if c["run"].strip()}
+    fresh = []
+    for e in entries:
+        if said := app_words(e):
+            q = shlex.quote(e["id"])
+            fresh += [(f"open:{e['id']}", f"open {said}", f"a7a-voice app open {q}", True, "app"),
+                      (f"close:{e['id']}", f"close {said}", f"a7a-voice app close {q}", True, "app")]
+    fresh = [(f"system:{k}", say, run, on, group) for k, say, run, on, group in SYSTEM] + fresh
+    found, added = [], []
+    for fid, say, run, on, kind in fresh:
+        if fid in {f["id"] for f in found}:            # (two entries cannot share an id; a hand-edited file might)
+            continue
+        if fid in old:
+            o = old[fid]                                # the owner's words stay; words the scan made follow the name
+            found.append({"id": fid, "say": o["say"] if o["say"] != (o.get("made") or say) else say, "run": run,
+                          "on": o["on"], "kind": kind, "made": say})
+        else:
+            found.append({"id": fid, "say": say, "run": run, "on": on and tuple(words(say)) not in owners, "kind": kind,
+                          "made": say})
+            added.append(say)
+    ids = {f["id"] for f in found}
+    removed = [o["say"] for i, o in old.items() if i not in ids]
+    return found, {"added": added, "removed": removed, "found": len(found),
+                   "same": same_words(cfg["commands"] + [f for f in found if f["on"]])}
+
+
+def scan() -> int:
+    """`a7a-voice scan`: the found commands brought up to date in the settings (a running listener takes them within
+    1 s), and what changed, said."""
+    cfg, problem = load_config()
+    if problem:
+        print(f"not scanned: {problem} (save the settings in the panel first)")
+        return 1
+    cfg["found"], report = scanned(cfg, desktop_entries())
+    write_json(CONFIG, cfg)
+    on = sum(f["on"] for f in cfg["found"])
+    print(f"{report['found']} commands found ({on} on): {len(report['added'])} new, {len(report['removed'])} gone")
+    for what, said in (("new", report["added"]), ("gone", report["removed"])):
+        if said:
+            print(f"{what}: " + ", ".join(f"“{s}”" for s in said[:12]) + (f" and {len(said) - 12} more" if len(said) > 12 else ""))
+    for s in report["same"]:
+        print(f"“{s}” is said for more than one command: only the first runs; change the words of the others")
+    return 0
+
+
+def keyboard_env() -> dict:
+    """The desktop's keyboard layout for dotool (it types for "us" otherwise): KDE's first layout, and its variant."""
+    layout = variant = ""
+    try:
+        for line in (Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "kxkbrc").read_text().splitlines():
+            k, _, v = line.partition("=")
+            if k.strip() == "LayoutList":
+                layout = v.split(",")[0].strip()
+            elif k.strip() == "VariantList":
+                variant = v.split(",")[0].strip()
+    except OSError:
+        pass
+    return {k: v for k, v in (("DOTOOL_XKB_LAYOUT", layout), ("DOTOOL_XKB_VARIANT", variant)) if v}
+
+
+def keys(lines: list[str]) -> str:
+    """dotool's actions ("key ctrl+l", "type hello"), through the listening listener's dotool (Typist) when it runs,
+    else a dotool of its own. "" when they went, else why not."""
+    todo = [(line.replace("\n", " ") + "\n").encode() for line in lines]
+    try:
+        fd = os.open(KEYS_PIPE, os.O_WRONLY | os.O_NONBLOCK)      # ENXIO when no listener reads it
+    except OSError:
+        fd = -1
+    if fd >= 0:
+        try:
+            while todo:                     # a line at a time, each whole (TYPE_CHUNK keeps it under a pipe's 4 KiB)
+                if os.write(fd, todo[0]) != len(todo[0]):
+                    break
+                todo.pop(0)
+        except OSError:
+            pass                                                    # the lines not written, to a dotool of its own
+        finally:
+            os.close(fd)
+        if not todo:
+            return ""
+    data = b"".join(todo)
+    try:
+        r = subprocess.run(["dotool"], input=data, capture_output=True, timeout=60, env={**os.environ, **keyboard_env()})
+    except FileNotFoundError:
+        return "typing needs dotool (sudo dnf install dotool)"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"dotool: {e}"
+    return r.returncode and (r.stderr.decode(errors="replace").strip() or f"dotool failed ({r.returncode})") or ""
+
+
+def type_lines(text: str) -> list[str]:
+    """dotool's lines that type `text`: a line break as Shift+Enter (Enter alone sends a chat message), long text
+    in pieces."""
+    out = []
+    for i, part in enumerate(text.split("\n")):
+        if i:
+            out.append("key shift+enter")
+        out += [f"type {part[j:j + TYPE_CHUNK]}" for j in range(0, len(part), TYPE_CHUNK)]
+    return out
+
+
+class Typist:
+    """The listener's keyboard: one dotool kept running for its life (a new one takes the desktop about a second to
+    see), fed by the listener's own typing (send) and, through KEYS_PIPE, by `a7a-voice key|type` run as commands.
+    A dotool that stopped is started again, at most every 5 s, and what could not be typed is said, never dropped in
+    silence; nothing here waits on dotool (the listener's sound must keep coming: review 2026-11-22)."""
+
+    def __init__(self, pipe: Path = KEYS_PIPE, argv=("dotool",)):
+        self.pipe, self.argv = pipe, list(argv)
+        self.proc, self.started, self.lock, self.inode, self.errors = None, -1e9, threading.Lock(), None, None
+        try:
+            pipe.unlink(missing_ok=True)
+            os.mkfifo(pipe, 0o600)
+            fd = os.open(pipe, os.O_RDWR)            # read and write: never at its end between two writers
+            self.inode = os.fstat(fd).st_ino
+            threading.Thread(target=self.relay, args=(fd,), daemon=True).start()
+        except OSError as e:
+            print(f"no pipe for the key commands ({e}): they use a dotool of their own", flush=True)
+
+    def relay(self, fd: int) -> None:
+        with os.fdopen(fd, "rb") as f:
+            for line in f:
+                if why := self.send([line.decode(errors="replace").rstrip("\n")]):
+                    print(f"a key command was not typed: {why}", flush=True)
+
+    def start(self) -> str:
+        """"" when a dotool runs, else why not."""
+        if self.proc is not None and self.proc.poll() is None:
+            return ""
+        why = ""
+        if self.proc is not None:
+            err = ""
+            if self.errors is not None:
+                self.errors.seek(0)
+                err = self.errors.read().decode(errors="replace").strip().splitlines()[-1:]
+                err = err[0][-200:] if err else ""
+            why = f"dotool stopped (exit {self.proc.returncode}){': ' + err if err else ''}"
+            self.proc = None
+        if time.monotonic() - self.started < 5:
+            return why or "dotool stopped"
+        self.started = time.monotonic()
+        # its warnings (a key it does not know) to a file: a pipe nobody read would fill and stop it (review)
+        if self.errors is not None:
+            self.errors.close()
+        self.errors = tempfile.TemporaryFile()
+        try:
+            self.proc = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=self.errors,
+                                         env={**os.environ, **keyboard_env()})
+        except OSError:
+            return "typing needs dotool (sudo dnf install dotool)"
+        time.sleep(0.3)                              # one that cannot open /dev/uinput stops at once: said now
+        if self.proc.poll() is not None:
+            return self.start() or "dotool stopped"
+        return ""
+
+    def send(self, lines: list[str]) -> str:
+        data = "".join(line.replace("\n", " ") + "\n" for line in lines).encode()
+        with self.lock:
+            if why := self.start():
+                return why
+            try:
+                self.proc.stdin.write(data)
+                self.proc.stdin.flush()
+                return ""
+            except OSError as e:
+                return f"dotool stopped: {e}"
+
+    def close(self) -> None:
+        if self.proc is not None:
+            self.proc.terminate()
+        try:                                         # its own pipe only (another listener's may be there now)
+            if self.inode is not None and self.pipe.stat().st_ino == self.inode:
+                self.pipe.unlink()
+        except OSError:
+            pass
+
+
+def kwin_close(names: list[str]) -> str:
+    """The windows of an application closed as their ✕ would (each may ask to save first), by a KWin script: those
+    whose desktop file name or window class is one of `names`. "" when KWin took the script, else why not."""
+    script = RUNDIR / f"a7a-voice-close-{os.getpid()}.js"
+    plugin = script.stem
+    script.write_text(
+        f"const names = {json.dumps([n.lower() for n in names])};\n"
+        "for (const w of workspace.windowList()) {\n"
+        "  if (w.normalWindow && (names.includes((w.desktopFileName || '').toLowerCase()) ||\n"
+        "                         names.includes((w.resourceClass || '').toLowerCase()))) w.closeWindow();\n"
+        "}\n")
+    call = ["gdbus", "call", "--session", "--dest", "org.kde.KWin", "--object-path"]
+    try:
+        r = subprocess.run(call + ["/Scripting", "--method", "org.kde.kwin.Scripting.loadScript", str(script), plugin],
+                           capture_output=True, text=True, timeout=10)
+        n = re.search(r"-?\d+", r.stdout)
+        if r.returncode or not n or int(n.group()) < 0:
+            return f"KWin did not take the script: {r.stderr.strip() or r.stdout.strip()}"
+        subprocess.run(call + [f"/Scripting/Script{n.group()}", "--method", "org.kde.kwin.Script.run"],
+                       capture_output=True, timeout=10)
+        time.sleep(0.5)                                     # (unloaded at once, it may not have run)
+        return ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"KWin: {e}"
+    finally:
+        try:
+            subprocess.run(call + ["/Scripting", "--method", "org.kde.kwin.Scripting.unloadScript", plugin],
+                           capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        script.unlink(missing_ok=True)
+
+
+def app(action: str, app_id: str) -> int:
+    """`a7a-voice app open|close ID`: the application of that desktop file started (as the menu starts it, by gio),
+    or its windows closed."""
+    e = next((e for e in desktop_entries() if e["id"] == app_id), None)
+    if e is None:
+        notify("No such application", f"“{app_id}” is not in the menu now: Scan again in the panel's Voice tab.")
+        print(f"no application {app_id} in the menu")
+        return 1
+    if action == "open":
+        try:
+            r = subprocess.run(["gio", "launch", e["path"]], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as ex:
+            print(f"could not start {e['name']}: {ex}")
+            return 1
+        if r.returncode:
+            print(f"could not start {e['name']}: {r.stderr.strip()}")
+        return r.returncode and 1
+    tail = app_id.rsplit(".", 1)[-1]
+    why = kwin_close([app_id] + [n for n in (e["wmclass"], tail if len(tail) >= 4 else "") if n])
+    if why:
+        print(why)
+    return 1 if why else 0
+
+
+def shortcut(name: str) -> int:
+    """`a7a-voice shortcut NAME`: one of KWin's own shortcuts ("Show Desktop", "Window Close"), as if pressed."""
+    r = subprocess.run(["gdbus", "call", "--session", "--dest", "org.kde.kglobalaccel", "--object-path", "/component/kwin",
+                        "--method", "org.kde.kglobalaccel.Component.invokeShortcut", name], capture_output=True, text=True)
+    if r.returncode:
+        print(r.stderr.strip())
+    return r.returncode and 1
+
+
+# ---------------------------------------------------------------- typing what is said
+
+# words said for a sign: in an address ("www dot google dot com") they are written as the sign without spaces; in text
+# only the punctuation ones (a comma, a full stop) are, and "at" stays a word
+SIGNS = {"dot": ".", "slash": "/", "colon": ":", "dash": "-", "hyphen": "-", "underscore": "_", "at": "@"}
+PUNCTUATION = [(("question", "mark"), "?"), (("exclamation", "mark"), "!"), (("exclamation", "point"), "!"),
+               (("full", "stop"), "."), (("period",), "."), (("comma",), ","), (("colon",), ":"),
+               (("semicolon",), ";"), (("new", "line"), "\n"), (("new", "paragraph"), "\n\n")]
+ENDS = ".?!\n"
+# what an address ends in after its last dot, said (the recogniser writes it as a word)
+# the keys a sentence of their words alone presses while dictating ("press enter", "select all"): editing and sending;
+# the media, scrolling and other commands' words are typed then ("pause" is a word: review 2026-11-22)
+DICTATION_KEYS = {"enter", "tab", "esc", "shift+enter", "ctrl+a", "ctrl+c", "ctrl+v", "ctrl+z"}
+# words an "at" after them makes no address of ("visit us at example dot com" is not us@example.com: review)
+NOT_NAMES = {"me", "us", "am", "is", "are", "was", "were", "be", "i", "we", "you", "it", "him", "her", "them", "here",
+             "there", "home", "work", "look", "meet", "find", "visit", "email", "mail", "write", "online"}
+DOMAINS = {"com", "org", "net", "ca", "io", "edu", "gov", "uk", "co", "de", "fr", "info", "app", "dev", "ai", "tv",
+           "me", "us", "eu", "xyz"}
+
+
+def www(ws: list[str]) -> list[str]:
+    """"w w w" and "double u double u double u" as the recogniser may write www; and two or three w's before a "dot"
+    ("ww dot google dot com"): it drops one of the three at times (the owner's voice, board 2026-11-22: "Type WW.google.com")."""
+    s = re.sub(r"\b(?:double u double u double u|double you double you double you|w w w)\b", "www", " ".join(ws))
+    ws = [p for n, w in enumerate(s.split()) for p in unglued(s.split(), n, w)]
+    out, i = [], 0
+    while i < len(ws):
+        j = i
+        while j < len(ws) and set(ws[j]) == {"w"}:
+            j += 1
+        if j > i and j < len(ws) and ws[j] == "dot" and sum(map(len, ws[i:j])) in (2, 3):
+            out.append("www")
+            i = j
+        else:
+            out.append(ws[i])
+            i += 1
+    return out
+
+
+def unglued(ws: list[str], n: int, w: str) -> list[str]:
+    """The n-th word w, its "dot" taken apart from the word it is glued to between www and another dot ("ww dotgoogle
+    dot com": owner, board 2026-11-23); otherwise whole ("a dotted line", "www dotted")."""
+    if w.startswith("dot") and len(w) > 4 and n and ws[n - 1] in ("ww", "www") and ws[n + 1:n + 2] == ["dot"]:
+        return ["dot", w[3:]]
+    return [w]
+
+
+def address_runs(ws: list[str]) -> list[tuple[int, int, str]]:
+    """The stretches of the words that spell an address, as (start, end, written): a word, then a sign's word and a
+    word, again and again ("sam at example dot fr"), with a "dot" before a domain's ending among them. Only those
+    words are written as one ("my email is sam at example dot fr": the first three stay words; review 2026-11-22)."""
+    runs, i = [], 0
+    while i < len(ws):
+        if ws[i] in SIGNS:                          # an address begins with a word
+            i += 1
+            continue
+        j = i + 1
+        while j + 1 < len(ws) and ws[j] in SIGNS and ws[j + 1] not in SIGNS:
+            j += 2
+        start = i
+        if "at" in ws[i:j]:                         # one "at" at most: the name before the last one ("email me at
+            k = i + max(n for n, w in enumerate(ws[i:j]) if w == "at")      # sam at example dot net"), unless
+            start = k - 1 if ws[k - 1] not in NOT_NAMES else k + 1         # that is a common word ("visit us at …")
+        run = ws[start:j]
+        if run and run[0] not in SIGNS and any(a == "dot" and b in DOMAINS for a, b in zip(run, run[1:])):
+            written = "".join(SIGNS.get(w, w) for w in run)
+            if start and ws[start - 1] in ("ww", "www") and "@" not in written and (not runs or runs[-1][1] < start):
+                start, written = start - 1, "www." + written    # its dot not written ("Type www google.com")
+            runs.append((start, j, written))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def address(ws: list[str]) -> str | None:
+    """The first address the words say ("www dot google dot com" is www.google.com, "sam at example dot fr"
+    sam@example.fr, "github dot com slash rabs" github.com/rabs), or None."""
+    runs = address_runs(www(ws))
+    return runs[0][2] if runs else None
+
+
+def with_addresses(ws: list[str]) -> list[str]:
+    """The words, each address they say as one word, written (address_runs)."""
+    ws = www(ws)
+    out, at = [], 0
+    for i, j, written in address_runs(ws):
+        out += ws[at:i] + [written]
+        at = j
+    return out + ws[at:]
+
+
+def spoken_text(ws: list[str], capital: bool) -> str:
+    """The words as text, punctuation said as words written as signs ("hello comma world period" is "hello, world."),
+    "i" as "I"; a capital letter where a sentence begins after . ? ! or a line break, and on the first word with
+    `capital`. An address said in them is written as one (with_addresses), and never given a capital."""
+    ws = with_addresses(ws)
+    out, i, cap = "", 0, capital
+    while i < len(ws):
+        sign = next(((p, s) for p, s in PUNCTUATION if tuple(ws[i:i + len(p)]) == p), None)
+        if sign:
+            out = out.rstrip(" ") + sign[1]
+            i += len(sign[0])
+            cap = sign[1][-1] in ENDS
+            continue
+        w = ws[i]
+        w = "I" + w[1:] if w == "i" or w.startswith("i'") else w
+        if cap:
+            w = w if set(w) & set(".@/") else w[:1].upper() + w[1:]
+            cap = False
+        out += ("" if not out or out[-1] == "\n" else " ") + w
+        i += 1
+    return out
+
+
+def builtin_words(heard: list[str]) -> str:
+    """Which of typing by voice's own phrases the words are: "type" ("type …"), "go" ("go to …"), "delete" ("delete
+    that"), "start" or "stop" (dictation); "" for none. The phrases a word off are taken too ("start dictating")."""
+    if len(heard) >= 2 and heard[0] in ("type", "pe"):     # "pe": the recogniser's "type" after the wake phrase,
+        return "type"                                      # 5 times of 8 (owner, board 2026-11-22/23)
+    if len(heard) >= 3 and heard[:2] == ["go", "to"]:
+        return "go"
+    said = "".join(heard)
+    for kind, phrase in (("delete", "deletethat"), ("start", "startdictation"), ("stop", "stopdictation")):
+        if len(heard) <= 3 and similar(said, phrase) >= 0.85:
+            return kind
+    return ""
+
+
+class Actions:
+    """What the listener does with what it hears: the chime, the command or the question, the notifications, the
+    status file. `launch`, `notify`, `chime` and `hush` are the functions above outside the tests. `kind` is what the
+    last wake phrase asked for: "command" (the commands' phrase) or "ask" (the Assistant's). A wake phrase stops an
+    answer being read aloud (`interrupted`): said for that, it needs nothing after it, and a miss is not shown.
+    `keys` types and presses keys (keys() outside the tests). Typing by voice is built in, before the commands: "type
+    …" types the rest, "go to …" opens an address, "delete that" takes back what was typed last, and "start
+    dictation" types every sentence after it, without a wake phrase, until "stop dictation" (or a wake phrase, or a
+    minute without a word: Listener)."""
+
+    def __init__(self, cfg: dict, launch=launch, notify=notify, chime=chime, status=None, hush=lambda: hush(0.5),
+                 reading=lambda: held(SPEAKING), keys=keys):
+        self.cfg = cfg
+        self.launch, self.notify, self.chime, self.hush, self.reading, self.keys = launch, notify, chime, hush, reading, keys
+        self.status = status or (lambda **kw: None)
+        self.sound = next((c for c in CHIMES if Path(c).exists()), "")
+        self.kind = "command"
+        self.interrupted = False
+        self.question: list[str] = []      # the words of a question so far (it is asked after a pause: Listener)
+        self.commands_spotted = False      # the commands' phrase was spotted inside this question's session
+        self.dictating = False
+        self.typed: list[tuple[int, str]] = []   # each piece typed, the last last ("delete that"): its characters, and
+                                                 # the tail before it (put back when it is taken back)
+        self.tail = ""                     # the last character dictation typed: a space or a capital comes next
+
+    def kind_of(self, spotted: str) -> str:
+        """Which phrase the spotter heard (it gives the phrase back, as its word pieces spell it): "command", "ask"
+        (the board's Assistant) or "ask:<name>" (an online one, "hey <name>")."""
+        heard = words(spotted)
+        if heard == words(self.cfg["wake"]):    # (an online one named "computer" does not take the commands' phrase)
+            return "command"
+        if self.cfg.get("assistant") and heard == words(self.cfg["assistant"]):
+            return "ask"
+        for name in self.cfg.get("online", []):
+            if heard == words(f"hey {name}"):
+                return f"ask:{name}"
+        return "command"
+
+    def phrase(self) -> str:
+        if self.kind.startswith("ask:"):
+            return f"hey {self.kind[4:]}"
+        return self.cfg["assistant"] if self.kind == "ask" else self.cfg["wake"]
+
+    def woke(self, kind: str = "command", new: bool = True) -> None:
+        """The wake phrase was spotted: `new` when it opens a session (not said again inside one)."""
+        self.kind = kind
+        self.interrupted = self.hush() or (self.interrupted and not new)
+        if new:
+            self.question = []
+            self.commands_spotted = False
+        print(f"wake phrase heard: {self.phrase()!r}" + (" (the answer being read stopped)" if self.interrupted else ""),
+              flush=True)
+        self.chime(self.sound)
+        self.status(state="awake")
+
+    def command_words(self, text: str, first: bool) -> tuple[list[str] | None, bool]:
+        """The words that can hold the command, and whether they are sure: in the first sentence (it began with the
+        pre-roll) those after the wake phrase, None while it is not found there, sure when the phrase was found as
+        written; in a later one, all but a wake phrase it begins with (a stray spot of the phrase inside a later
+        sentence cuts nothing: review 2026-11-18), sure."""
+        heard = words(text)
+        if not first:
+            return lead_wake(heard, self.phrase()), True
+        cut = cut_at_wake(heard, self.phrase())
+        if cut is None:
+            return None, False
+        at = cut[0]
+        # "type", or "pe" (the recogniser's "type" there: builtin_words), taken into the phrase written close: "hey
+        # kubi pe" comes closer to "hey cubie" than "hey kubi" does. Given back, unless the phrase itself ends so
+        # ("hey ho pe" for "hey hope", "proto type"): which one it is cannot be told then, and such a phrase is left as
+        # it was before (reviews 2026-11-23: closeness rules misread one-word and long phrases). Not when only the
+        # phrase's end was caught (no stretch ends at the cut): those words are its end.
+        if (at and heard[at - 1] in ("pe", "type")
+                and (start := phrase_start(heard, self.phrase(), at)) is not None and start < at - 1
+                and not "".join(words(self.phrase())).endswith(heard[at - 1])):
+            at -= 1                         # (start < at - 1: "pe" alone taken for the phrase, "peep": review)
+        return heard[at:], cut[1]
+
+    def early(self, text: str, first: bool) -> bool:
+        """What is heard so far, before the sentence ends: a command whose phrase it holds word for word runs at once,
+        unless a longer command's phrase holds that one with more words after it ("volume up" waits while there is a
+        "turn volume up to max"). Kroko writes the last word up to 1.7 s after it is said, and the sentence ends 0.8 s
+        after that (board, 2026-11-18: "open firefox" whole 0.45 s after the voice stopped, the end 1.75 s after).
+        Exact phrases only, found by plain comparison: this runs at every new word. Not before the wake phrase is
+        found as written: while it is only close, it may be "my computer" in the pre-roll, with the owner's own
+        phrase still to come (the end of the sentence decides then, about 1.2 s later)."""
+        if self.kind.startswith("ask") or self.dictating:     # a question, or dictation: whole when the sentence ends
+            return False
+        heard, sure = self.command_words(text, first)
+        if not heard or not sure or builtin_words(unled(heard)):     # "type …" waits for the end of what it types
+            return False
+        phrases = [(c, say) for c in active(self.cfg) if c["run"].strip() and (say := words(c["say"]))]
+        found = [(c, say) for c, say in phrases if (at := find(heard, say)) >= 0 and not negated(heard, at, say)]
+        if not found:
+            return False
+        c, say = max(found, key=lambda f: len(f[1]))
+        if any(len(other) > len(say) and holds(other, say) for _, other in phrases):
+            return False
+        self.ran(c, heard, 1.0)
+        return True
+
+    def ran(self, c: dict, heard: list[str], s: float) -> None:
+        said = " ".join(heard)
+        print(f"heard: {said!r}\n-> {c['say']!r} ({s:.2f}): {c['run']}", flush=True)
+        self.launch(c["run"])
+        self.notify(f"▶ {c['say']}", c["run"])
+        self.status(state="listening", heard=said, ran=c["say"], score=round(s, 2))
+
+    def type_text(self, text: str, what: str) -> None:
+        """`text` typed where the cursor is; what typed it, shown as a command's run is."""
+        if not text:
+            return
+        why = self.keys(type_lines(text))
+        if why:
+            print(f"could not type: {why}", flush=True)
+            self.notify("Could not type", why)
+            return
+        self.typed.append((len(text), self.tail))
+        self.tail = text[-1:]
+        print(f"typed {len(text)} characters ({what})", flush=True)
+        self.status(state="dictating" if self.dictating else "listening", heard=what, ran="type", score=None)
+
+    def builtin(self, heard: list[str]) -> bool:
+        """Typing by voice ("type …", "go to …", "delete that", "start dictation"): True when the words were one."""
+        kind = builtin_words(heard)
+        if kind == "type":
+            said = heard[1:]
+            if said[:1] == ["dot"] and (runs := address_runs(www(said[1:]))) and runs[0][0] == 0:
+                said = said[1:]             # "www" not written, its "dot" was: "type dot google dot com" (the owner's
+            self.type_text(spoken_text(said, capital=False), "type")   # voice, board 2026-11-23): google.com
+        elif kind == "go":
+            # an address said ("go to lemonde dot fr") opens; anything else is searched for, never guessed into a site
+            # of its own ("go to my bank" is not mybank.com, a stranger's: review 2026-11-22)
+            site, said = address(heard[2:]), " ".join(heard[2:])
+            if site:
+                line, shown = f"xdg-open {shlex.quote(site if re.match(r'[a-z]+://', site) else 'https://' + site)}", site
+            elif shutil.which("firefox"):
+                line, shown = f"firefox --search {shlex.quote(said)}", f"search for “{said}”"
+            else:
+                line, shown = f"xdg-open {shlex.quote('https://duckduckgo.com/?q=' + urllib.parse.quote(said))}", f"search for “{said}”"
+            print(f"heard: {' '.join(heard)!r}\n-> {line}", flush=True)
+            self.launch(line)
+            self.notify(f"▶ go to {site or said}", shown)
+            self.status(state="listening", heard=" ".join(heard), ran="go to", score=None)
+        elif kind == "delete":
+            self.take_back()
+        elif kind == "start":
+            self.dictating, self.tail = True, ""
+            print("dictation on", flush=True)
+            self.notify("Dictation on", "What you say is typed where the cursor is. Say “stop dictation” when done.")
+            self.status(state="dictating", heard=" ".join(heard), ran="start dictation", score=None)
+        elif kind == "stop":
+            self.stop_dictation("")
+        else:
+            return False
+        return True
+
+    def take_back(self) -> None:
+        if not self.typed:
+            self.notify("Nothing to delete", "Nothing was typed by voice since the listener started.")
+            return
+        n, self.tail = self.typed.pop()
+        why = self.keys(["key " + " ".join(["backspace"] * n)])
+        print(f"took back {n} characters" + (f": {why}" if why else ""), flush=True)
+
+    def dictate(self, text: str) -> None:
+        """A sentence said while dictating: typed (with a space before it, and a capital where a sentence begins),
+        unless it is "stop dictation", "delete that", or the words of a typing key's command exactly ("press enter":
+        DICTATION_KEYS; other commands' words are typed: "pause" said in a sentence of its own is a word here).
+        Punctuation said alone ("new line", "period") is typed, not run, so what comes after it is spaced right."""
+        heard = words(text)
+        if not heard:
+            return
+        kind = builtin_words(heard)
+        if kind in ("stop", "delete") and len(heard) <= 3:
+            self.stop_dictation("") if kind == "stop" else self.take_back()
+            return
+        typed = spoken_text(heard, capital=self.tail in ("", *ENDS))
+        if re.search(r"[A-Za-z0-9]", typed):
+            exact = [c for c in active(self.cfg) if c["run"].startswith("a7a-voice key ")
+                     and c["run"].removeprefix("a7a-voice key ").strip() in DICTATION_KEYS and words(c["say"]) == heard]
+            if exact:
+                self.ran(exact[0], heard, 1.0)
+                return
+        if self.tail and self.tail not in " \n" and typed[:1] not in ",.?!:;\n":
+            typed = " " + typed
+        self.type_text(typed, "dictation")
+
+    def stop_dictation(self, why: str) -> None:
+        if not self.dictating:
+            return
+        self.dictating = False
+        print(f"dictation off{f' ({why})' if why else ''}", flush=True)
+        self.notify("Dictation off", why.capitalize() if why else "")
+        self.status(state="listening")
+
+    def sentence(self, text: str, first: bool) -> bool:
+        """A sentence after (or with) the wake phrase. True when it is dealt with (a command ran, or the miss was
+        reported); False when it held nothing yet: nothing after the wake phrase (or the phrase not found in it), or a
+        hesitation only ("um", "okay"), and the command may come in the next one; or a question's words, which may go
+        on in the next one (asked after a pause: ask). Only the words after the phrase are printed, kept or shown."""
+        if self.dictating:
+            self.dictate(text)
+            return True
+        heard, _ = self.command_words(text, first)
+        if not heard or all(w in HESITATIONS for w in heard):
+            return False
+        if self.kind.startswith("ask"):
+            if self.commands_spotted and (inside := phrase_inside(heard, self.cfg["wake"])) is not None:
+                # "what time is it" [0.6 s] "hey computer, mute": one sentence for the recogniser, the pause too short
+                # to end it; the spotter heard the commands' phrase inside the session, and it is written here after
+                # the question's words: the question goes, what follows the phrase is a command (2026-11-24). Not on
+                # the words alone: "is hey computer a good name?" is a question
+                self.question += heard[:inside[0]]
+                if any(w not in HESITATIONS for w in self.question):
+                    self.ask()
+                else:                                   # "hey assistant, uh, hey computer": no question (review)
+                    self.question = []
+                self.kind = "command"
+                rest = heard[inside[1]:]
+                return self.sentence(" ".join(rest), False) if rest else False
+            raw, said, wake = words(text), unled(heard), words(self.cfg["wake"])
+            if (len(lead_wake(raw, self.cfg["wake"])) < len(raw) if not first else
+                    len(wake) > 1 and similar("".join(said[:len(wake)]), "".join(wake)) >= WAKE_STRONG):
+                # "… what time is it" [pause] "hey computer, mute": the question goes now, and this is a command
+                # (the commands' phrase inside the Assistant's session is not spotted as a new one: review); also
+                # right after the Assistant's phrase, in one sentence with it ("hey assistant" [1 s] "hey computer,
+                # mute": the sentence's end is held for the voice: review 2026-11-23)
+                if self.question:
+                    self.ask()
+                self.kind = "command"
+                return self.sentence(text, first)
+            self.question += heard
+            return False
+        # a command said word for word comes before typing by voice's own phrases (the owner's "go to sleep" is not a
+        # search, as the panel's Test would not make it one: review 2026-11-22); both after a sound ("uh, type hello",
+        # "okay, go to sleep": review)
+        said = unled(heard)
+        exact = next((c for c in active(self.cfg) if c["run"].strip() and words(c["say"]) in (heard, said)), None)
+        if exact is not None:
+            self.ran(exact, heard, 1.0)
+            return True
+        if self.builtin(said):
+            return True
+        match, s = best_match(heard, active(self.cfg), self.cfg["match"])
+        if match is not None:
+            self.ran(match, heard, s)
+            return True
+        said = " ".join(heard)
+        # "with the wake phrase": in one breath with it, as the recogniser wrote it (a "pe" for "type" there is its
+        # own, not a reset's in a later sentence). Only the words taken for the command are printed, as before: where
+        # the phrase begins is not sure enough to print more (reviews 2026-11-23); they hold pre-roll only when
+        # cut_at_wake took a pre-roll "my computer" for the phrase (an open matter of the cut, older than this)
+        print(f"heard: {said!r}" + (" (with the wake phrase)" if first else "") + "\nno command matched", flush=True)
+        # "hey computer, stop" after a reading stopped: done, as asked. Anything else is shown: a command said in one
+        # breath with that phrase loses its start (the recogniser begins at the phrase then: Listener.feed)
+        if not (self.interrupted and all(w in STOPS for w in heard)):
+            self.notify("No command matched", f"Heard: “{said}”")
+        self.status(state="listening", heard=said, ran="", score=None)
+        return True
+
+    def ask(self) -> None:
+        """The question so far, to the Assistant: its own program, in a scope of its own like any command (starting the
+        model and the answer take a minute or more, and the listener goes on listening meanwhile)."""
+        if self.interrupted and all(w in STOPS for w in self.question):
+            # "hey assistant, stop" while an answer is read: stopped, as asked; not a question (its answer would be
+            # read aloud in turn: review 2026-11-19)
+            print(f"heard: {' '.join(self.question)!r}: the reading stopped", flush=True)
+            self.question = []
+            self.status(state="listening", heard="", ran="", score=None)
+            return
+        question, self.question = " ".join(self.question), []
+        to = self.kind[4:] if self.kind.startswith("ask:") else ""
+        print(f"asked {to or 'the Assistant'}: {question!r}", flush=True)
+        self.launch(f"{shlex.quote(str(Path(__file__).resolve()))} ask {f'--to {shlex.quote(to)} ' if to else ''}{shlex.quote(question)}")
+        self.status(state="listening", heard=question, ran=to or "the Assistant", score=None)
+
+    def gave_up(self) -> None:
+        what = "question" if self.kind.startswith("ask") else "command"
+        print(f"no {what} after the wake phrase", flush=True)
+        if not self.interrupted:                # said to stop the reading: nothing more was wanted
+            self.notify(f"No {what} heard", f"Say a {what} within {self.cfg['window']:.0f} s of “{self.phrase()}”.")
+        self.status(state="listening")
+
+
+class Listener:
+    """The wake phrase and the command, from 0.1 s of audio at a time. `kws` and `asr` are sherpa-onnx's KeywordSpotter
+    and OnlineRecognizer (endpoint detection on), or anything with their methods; `act` an Actions. The recogniser
+    runs only from the wake phrase (fed the last PREROLL chunks first) until the command is dealt with."""
+
+    def __init__(self, kws, asr, act: Actions, now=time.monotonic):
+        self.kws, self.asr, self.act, self.now = kws, asr, act, now
+        self.ks = kws.create_stream()
+        self.rs = None
+        self.recent: collections.deque = collections.deque(maxlen=PREROLL)
+        self.woke_at = -1.0
+        self.opened_at = -1.0               # when the session began (woke_at moves with the phrase said again)
+        self.spoke_at = -1.0                # when the last new words came (a question ends after a pause)
+        self.first = False                  # the sentence under way is the stream's first, which holds the pre-roll
+        self.so_far = ""
+        self.unspotted = 0
+        self.levels: collections.deque = collections.deque(maxlen=300)
+        self.quiet, self.sound = 0, False
+        self.held = 0                       # chunks the sentence under way's ends have waited, in all
+        self.chunk = 0                      # chunks heard
+        self.paused = -1                    # the last chunk of the last pause (STILL_TALKING quiet chunks or more)
+                                            # that voice came after
+        self.voiced = -1                    # the last chunk with voice
+        self.wrote = 0                      # the chunk the recogniser last wrote something new on
+        self.began = None                   # the chunk the sentence under way's first word was written on (the
+                                            # first one after the wake phrase in the stream's first sentence)
+        self.spotted_at = 0                 # the chunk the wake phrase was spotted on (the stream's start)
+
+    def gap(self) -> None:
+        """The microphone has gone quiet (unplugged: microphone() yields None): a session under way ends now, its
+        question asked, rather than whenever sound comes back (review 2026-11-19)."""
+        if self.rs is None:
+            return
+        self.rs = None
+        self.act.stop_dictation("no sound from the microphone")
+        if self.act.question:
+            self.act.ask()
+        else:
+            self.act.status(state="listening")
+
+    def spotter(self, kws) -> None:
+        """A new keyword spotter (the wake phrase changed)."""
+        self.kws, self.ks, self.unspotted = kws, kws.create_stream(), 0
+
+    def hushed(self, samples) -> bool:
+        """The chunk is quiet, after sound: HUSH chunks within 6 dB of the room's own noise (the tenth percentile of
+        the last 30 s) after one above it. Nobody is in the middle of a phrase then."""
+        lv = level(samples)
+        self.levels.append(lv)
+        if lv < max(2 * sorted(self.levels)[len(self.levels) // 10], 1e-4):
+            self.quiet += 1
+            if self.quiet >= HUSH and self.sound:
+                self.sound = False
+                return True
+        else:
+            self.quiet, self.sound = 0, True
+        return False
+
+    def ended(self) -> bool:
+        """The sentence under way has ended: the recogniser says so (0.8 s without a new letter written), unless it
+        goes on in fact (goes_on) and there is voice it has not written yet: voice in the last STILL_TALKING chunks,
+        or voice that came STILL_TALKING chunks or more after the last word written, WORD_LAG at most after it
+        stopped (the recogniser writes late: the end came at "type www", the rest said, then the voice stopped, and
+        the end was taken before the rest was written: review 2026-11-22). It waits LONGEST_HOLD at most. The recogniser is slow to write letters spelled out: "type double-u double-u double-u
+        dot google dot com", said in one go, ended at "type WW" and the rest was lost; "hey cubie" ended while "type"
+        was being said, and "ty" went with it ("pe hello world"; the owner's voice, board 2026-11-22: "Type
+        www.google.com" whole with this). After a pause, the voice is a new sentence ("… see you" [1 s] "stop dictation"; "hey assistant, what
+        time is it" [1.5 s] "hey computer, mute"): it ends where the recogniser says, as it did (review 2026-11-22)."""
+        if not self.asr.is_endpoint(self.rs):
+            return False
+        unwritten = self.quiet < STILL_TALKING or (self.voiced - self.wrote >= STILL_TALKING
+                                                   and self.chunk - self.voiced <= WORD_LAG)
+        if unwritten and self.held < LONGEST_HOLD and self.goes_on():
+            self.held += 1
+            return False
+        return True
+
+    def goes_on(self) -> bool:
+        """The voice heard now is the sentence's own (Listener.ended): no pause came after its first word was
+        written. A pause before that is not between sentences: "hey cubie" [0.6 s] "type double-u double-u …" is one
+        (review 2026-11-22); after it, the voice is a new sentence ("… see you" [1 s] "stop dictation"; "hey
+        assistant, what time is it" [1.5 s] "hey computer, mute": the last word may be written in the pause, but the
+        first was written before it). Not in a first sentence without the wake phrase written in it: its end is the
+        recogniser's, as it was, and the next sentence is all command (held, the command went into it and was dropped
+        with it: the owner's voice, board 2026-11-22). When nothing at all is written yet (the recogniser wrote nothing of
+        the pre-roll at times), the words to come are all command now, as the next sentence's would be, and the stream
+        goes on unreset: a reset in the voice cut "type" to "pe"."""
+        text = self.asr.get_result(self.rs).strip()
+        if not text:                        # nothing to put together wrongly
+            self.first = False
+            return True
+        if self.first and self.act.command_words(text, True)[0] is None:
+            return False
+        return self.began is None or self.paused < self.began
+
+    def fresh(self) -> None:
+        """A new recogniser stream for the command, after a first sentence that held none of its own words (the wake
+        phrase alone, or written past knowing: "Hey, Kyivi"), fed from just before the voice that came after the
+        phrase: from 0.3 s before it, when a pause after the phrase has ended (the voice may be over again, and not
+        written yet: "hey cubie" [0.6 s] "mute" [quiet]: review 2026-11-23); from where the phrase was spotted when
+        there was voice after it without such a pause (one breath, or a gap under 0.5 s: about 0.4 s after the
+        phrase's end, so none of it, though the command's start may be cut: "kyivi type hello" matched nothing, "pe
+        hello" types: review); the last 0.3 s when nothing has been said since.
+        A reset there, in the command being said, cut its start ("re bar" for "address bar", "pe" for "type"), and a
+        stream run on unreset wrote nothing more of it at times; a fresh one wrote "Address bar" from wherever it
+        began between the pause and the word (the owner's voice, board 2026-11-23). Its sentences are all command (not
+        first)."""
+        if self.paused >= self.spotted_at - 3:      # a pause after the phrase (one before it ends 0.9 s earlier or more)
+            start = self.paused - 2
+        elif self.voiced >= self.spotted_at - 2:    # voice since the phrase (its own ends about 4 chunks before)
+            start = self.spotted_at
+        else:
+            start = self.chunk - 2
+        start = max(start, self.chunk - len(self.recent) + 1)
+        self.rs = self.asr.create_stream()
+        for c in list(self.recent)[start - self.chunk - 1:]:
+            self.rs.accept_waveform(RATE, c)
+        while self.asr.is_ready(self.rs):
+            self.asr.decode_stream(self.rs)
+        self.held, self.wrote, self.began, self.so_far = 0, self.chunk, None, ""
+
+    def said_words(self, text: str) -> bool:
+        """The sentence under way holds a word said for its own sake: one after the wake phrase, but a hesitation ("hey
+        cubie, uh" holds none); any word while dictating ("Okay." is typed: review 2026-11-22). A later sentence's wake
+        phrase is the phrase said again ("hey cubie" [0.6 s] "type …" in an open session: review), the commands'
+        inside the Assistant's too."""
+        if self.first:
+            heard = self.act.command_words(text, True)[0] or []
+        else:
+            heard = lead_wake(self.act.command_words(text, False)[0], self.act.cfg["wake"])
+        return bool(heard) if self.act.dictating else any(w not in HESITATIONS for w in heard)
+
+    def feed(self, samples) -> None:
+        t = self.now()
+        self.recent.append(samples)
+        self.unspotted += 1
+        quiet = self.quiet
+        pause = self.hushed(samples)
+        self.chunk += 1
+        if not self.quiet:
+            self.voiced = self.chunk
+            if quiet >= STILL_TALKING:
+                self.paused = self.chunk - 1
+        if pause and self.rs is None:
+            # a fresh spotter stream in every pause: one that has heard much else without its phrase spots it worse
+            # (board 2026-11-18, synthetic voices: 1 in 5 against 4 and 5 in 5; resetting its search did not help)
+            self.ks, self.unspotted = self.kws.create_stream(), 0
+        elif self.rs is None and self.unspotted >= REFRESH:
+            # no pause in 10 minutes (steady noise): a fresh stream all the same, given the last 2 s so a phrase being
+            # said is not cut
+            self.ks, self.unspotted = self.kws.create_stream(), 0
+            for c in list(self.recent)[:-1]:
+                self.ks.accept_waveform(RATE, c)
+        self.ks.accept_waveform(RATE, samples)
+        fed = False
+        while self.kws.is_ready(self.ks):
+            self.kws.decode_stream(self.ks)
+            if spotted := self.kws.get_result(self.ks):
+                self.kws.reset_stream(self.ks)
+                self.unspotted = 0
+                if self.act.dictating:              # a wake phrase ends dictation: a command or a question follows
+                    self.act.stop_dictation("")
+                    self.rs = None
+                kind = self.act.kind_of(spotted)
+                if self.rs is not None and kind != self.act.kind:
+                    # the other phrase inside an open session ("my computer" in a question for the Assistant): the
+                    # phrase that opened it decides what it is (review 2026-11-18). The commands' phrase inside a
+                    # question is noted: written in the question's sentence as well, it ends the question there
+                    # (Actions.sentence), and a command's wait then counts from it (2026-11-24)
+                    print("the other wake phrase, inside the session: not taken", flush=True)
+                    if kind == "command" and self.act.kind.startswith("ask"):
+                        self.act.commands_spotted = True
+                        self.woke_at = t
+                    continue
+                self.woke_at = self.spoke_at = t
+                self.act.woke(kind, new=self.rs is None)
+                if self.rs is None:
+                    self.opened_at = t
+                    self.rs = self.asr.create_stream()
+                    # the pre-roll (this chunk included), unless the phrase stopped an answer being read: what came
+                    # before it then was the speaker's ("… say hey computer, mute" must not mute: review 2026-11-19),
+                    # so the recogniser starts here, and its first sentence is all command (no phrase to cut it at)
+                    for c in [samples] if self.act.interrupted else self.recent:
+                        self.rs.accept_waveform(RATE, c)
+                    fed = True
+                    self.first = not self.act.interrupted
+                    self.so_far = ""
+                    self.held, self.wrote, self.began = 0, self.chunk, None
+                    self.spotted_at = self.chunk
+        if self.rs is None:
+            return
+        if not fed:
+            self.rs.accept_waveform(RATE, samples)
+        while self.asr.is_ready(self.rs):
+            self.asr.decode_stream(self.rs)
+        so_far = self.asr.get_result(self.rs).strip()
+        if so_far != self.so_far:
+            self.so_far = so_far
+            self.spoke_at = t
+            self.wrote = self.chunk
+            if self.began is None and self.said_words(so_far):
+                # the command's first word: its own LONGEST_HOLD from here; the wait on the wake phrase alone spent it
+                # (the recogniser wrote nothing for 2.4 s of "type double-u double-u", slowly said: the owner's voice, board
+                # 2026-11-23, "type ww" at the cap)
+                self.began, self.held = self.chunk, 0
+            if so_far and self.act.early(so_far, self.first):
+                self.rs = None
+                return
+        if self.ended():
+            self.held = 0
+            text = self.asr.get_result(self.rs).strip()
+            self.so_far, self.began = "", None
+            first, self.first = self.first, False
+            if text and self.act.sentence(text, first):
+                self.asr.reset(self.rs)
+                if not self.act.dictating:          # dictation goes on in the same stream
+                    self.rs = None
+                return
+            heard = self.act.command_words(text, True)[0] if first else None
+            if first and (not heard or all(w in HESITATIONS for w in heard)):
+                self.fresh()                        # nothing of its own written: the command, or question, is to come
+            else:
+                self.asr.reset(self.rs)             # (its words were taken: a question goes on; review 2026-11-23)
+        if self.act.dictating:
+            if t - self.spoke_at > DICTATION_IDLE:
+                self.rs = None
+                self.act.stop_dictation("a minute without a word")
+            return
+        if self.act.question:
+            # a question goes out after ASK_PAUSE without a new word, or once it has run on for ASK_LONGEST (with what
+            # is being said then), or when an answer begins to be read (its words are not the owner's: review); until
+            # then the next sentence may still belong to it
+            longest = t - self.opened_at > ASK_LONGEST
+            if longest and self.so_far:
+                self.act.sentence(self.so_far, self.first)
+            if longest or (t - self.spoke_at >= ASK_PAUSE and not self.so_far) or self.act.reading():
+                if self.act.question:
+                    self.act.ask()
+                if (self.act.commands_spotted and self.woke_at > self.spoke_at and not longest
+                        and not self.act.reading()):
+                    # the commands' phrase spotted after the question's last word, its own words not written yet
+                    # (the recogniser writes up to 1.7 s late): the session goes on as a command's, its wait counted
+                    # from that phrase (review 2026-11-24: the command was dropped without a word)
+                    self.act.kind = "command"
+                    return
+                self.rs = None
+            return
+        if t - self.woke_at > self.act.cfg["window"] and not self.asr.get_result(self.rs).strip():
+            self.rs = None
+            self.act.gave_up()
+
+
+# ---------------------------------------------------------------- the engine (in the venv)
+
+def model_file(d: Path, part: str) -> str:
+    """The model's `part` network: its int8 one when it has one."""
+    found = sorted(d.glob(f"{part}*.int8.onnx")) or sorted(d.glob(f"{part}*.onnx"))
+    if not found:
+        raise FileNotFoundError(f"no {part} in {d}: set it up again")
+    return str(found[0])
+
+
+def spotter(cfg: dict):
+    """sherpa-onnx's keyword spotter for the wake phrases (their pieces from the model's own sentencepiece model),
+    which names the one it heard as those pieces spell it; with the online assistants' names it listens for, and
+    why not for the others (keywords)."""
+    import sentencepiece
+    import sherpa_onnx
+    d = MODELS / KWS[0]
+    sp = sentencepiece.SentencePieceProcessor(model_file=str(d / "bpe.model"))
+    known = {line.split()[0] for line in (d / "tokens.txt").read_text().splitlines() if line.strip()}
+    lines, online, left = keywords(cfg, lambda phrase: sp.encode(" ".join(words(phrase)).upper(), out_type=str), known)
+    for why in left:
+        print(f"not listening for {why}", flush=True)
+    KEYWORDS.parent.mkdir(parents=True, exist_ok=True)
+    KEYWORDS.write_text("\n".join(lines) + "\n")
+    ENGINE.update(engine="cpu", npu_error="")
+
+    def cpu():
+        return sherpa_onnx.KeywordSpotter(tokens=str(d / "tokens.txt"), encoder=model_file(d, "encoder"),
+                                          decoder=model_file(d, "decoder"), joiner=model_file(d, "joiner"),
+                                          keywords_file=str(KEYWORDS), keywords_threshold=cfg["sensitivity"],
+                                          num_threads=1, provider="cpu")
+    if cfg.get("npu"):
+        try:
+            kws = Guarded(npu_spotter(d, cfg["sensitivity"]), cpu)
+            ENGINE["engine"] = "npu"
+            return kws, online, left
+        except Exception as e:                       # anything at all: the CPU's spotter instead, and why
+            ENGINE["npu_error"] = f"the NPU spotter could not start ({e}): the CPU's is listening"
+            print(ENGINE["npu_error"], flush=True)
+    return cpu(), online, left
+
+
+def npu_spotter(d: Path, threshold: float):
+    """The spotter with its encoder on the NPU, from the files in NPU (the network, its CPU part's weights, the code),
+    the keywords and tokens as the CPU's spotter has them."""
+    if str(NPU) not in sys.path:
+        sys.path.insert(0, str(NPU))
+    import kaldi_native_fbank  # noqa: F401  (its features: here, not first in the listener's create_stream)
+    import numpy as np
+    import npu_kws
+    import npunet
+    k = npu_kws.Spotter(npunet.Net(NPU / "kws_encoder_fp16_a733.nb"), NPU / "kws_cpu.npz", d / "tokens.txt",
+                        KEYWORDS, keywords_threshold=threshold)
+    st = k.create_stream()                           # once through, on a second of silence: it runs, and sanely
+    st.accept_waveform(RATE, np.zeros(RATE, np.float32))
+    runs = 0
+    while k.is_ready(st):
+        k.decode_stream(st)
+        runs += 1
+    if not runs or not all(np.isfinite(x).all() for x in k.states):
+        raise OSError("the NPU's encoder gave no usable output on silence")
+    k.reset_stream(st)
+    return k
+
+
+class Guarded:
+    """The NPU's spotter with the CPU's behind it: the first error from the NPU side (a failed or timed-out run)
+    hands the listening to the CPU's spotter for good, said in ENGINE and printed; the audio of that moment is
+    lost, the listener goes on. Streams are wrapped so the Listener's stream follows the swap."""
+
+    class Stream:
+        def __init__(self, owner):
+            self.owner, self.inner, self.gen = owner, owner.k.create_stream(), owner.gen
+
+        def accept_waveform(self, rate, samples):
+            self.owner.run(lambda: self.current().accept_waveform(rate, samples))
+
+        def current(self):
+            if self.gen != self.owner.gen:           # made before a swap: a fresh stream of the CPU's
+                self.inner, self.gen = self.owner.k.create_stream(), self.owner.gen
+            return self.inner
+
+    def __init__(self, npu, make_cpu):
+        self.k, self.make_cpu, self.gen = npu, make_cpu, 0
+
+    def run(self, f, default=None):
+        try:
+            return f()
+        except Exception as e:
+            if self.gen:                             # the CPU's own error: the listener's to handle
+                raise
+            ENGINE.update(engine="cpu", npu_error=f"the NPU spotter failed ({e}): the CPU's is listening")
+            print(ENGINE["npu_error"], flush=True)
+            self.k, self.gen = self.make_cpu(), 1
+            return default
+
+    def create_stream(self):
+        return Guarded.Stream(self)
+
+    def is_ready(self, s):
+        return self.run(lambda: self.k.is_ready(s.current()), False)
+
+    def decode_stream(self, s):
+        self.run(lambda: self.k.decode_stream(s.current()))
+
+    def get_result(self, s):
+        return self.run(lambda: self.k.get_result(s.current()), "")
+
+    def reset_stream(self, s):
+        self.run(lambda: self.k.reset_stream(s.current()))
+
+
+def recogniser():
+    import sherpa_onnx
+    d = MODELS / ASR[0]
+    return sherpa_onnx.OnlineRecognizer.from_transducer(
+        tokens=str(d / "tokens.txt"), encoder=model_file(d, "encoder"), decoder=model_file(d, "decoder"),
+        joiner=model_file(d, "joiner"), num_threads=1, sample_rate=RATE, feature_dim=80, decoding_method="greedy_search",
+        provider="cpu", enable_endpoint_detection=True, rule1_min_trailing_silence=2.4, rule2_min_trailing_silence=0.8,
+        rule3_min_utterance_length=15)
+
+
+def voice_engine():
+    """sherpa-onnx's Supertonic, on two threads (four or eight were no quicker: board 2026-11-19)."""
+    import sherpa_onnx
+    d = MODELS / TTS[0]
+    return sherpa_onnx.OfflineTts(sherpa_onnx.OfflineTtsConfig(model=sherpa_onnx.OfflineTtsModelConfig(
+        supertonic=sherpa_onnx.OfflineTtsSupertonicModelConfig(
+            duration_predictor=model_file(d, "duration_predictor"), text_encoder=model_file(d, "text_encoder"),
+            vector_estimator=model_file(d, "vector_estimator"), vocoder=model_file(d, "vocoder"),
+            tts_json=str(d / "tts.json"), unicode_indexer=str(d / "unicode_indexer.bin"),
+            voice_style=str(d / "voice.bin")),
+        num_threads=2, provider="cpu")))
+
+
+def generation(voice: str):
+    import sherpa_onnx
+    g = sherpa_onnx.GenerationConfig()
+    g.sid, g.num_steps, g.speed = VOICES.index(voice), SPEECH_STEPS, 1.0
+    g.extra = {"lang": "en"}
+    return g
+
+
+def trimmed(x, rate: int):
+    """A piece's samples without most of the quiet the model puts around it: SPEECH_LEAD s of it kept before the
+    voice, 0.15 s after."""
+    import numpy as np
+    loud = np.flatnonzero(np.abs(x) > 0.01)
+    if not len(loud):
+        return x[:0]
+    return x[max(0, loud[0] - int(SPEECH_LEAD * rate)):loud[-1] + 1 + int(0.15 * rate)]
+
+
+def player(rate: int) -> list[str]:
+    """pw-cat playing raw samples from its stdin, one stream named "Assistant" in the sound settings; for the tests,
+    the command line in A7A_VOICE_PLAYER ({rate} in it is the sample rate)."""
+    other = os.environ.get("A7A_VOICE_PLAYER")
+    if other:
+        return shlex.split(other.replace("{rate}", str(rate)))
+    return ["pw-cat", "--playback", "--raw", "--format", "f32", "--rate", str(rate), "--channels", "1",
+            "-P", '{ application.name = "Assistant" media.name = "Answer read aloud" }', "-"]
+
+
+def feed(pipe, pieces: queue.Queue) -> None:
+    """Writes the pieces' samples to the player as it takes them, until None (then the end); once the player is gone,
+    takes the rest and drops it, so whoever puts them never waits on a full queue."""
+    ended = False
+    try:
+        while (b := pieces.get()) is not None:
+            pipe.write(b)
+        ended = True
+        pipe.close()
+    except OSError:
+        while not ended and pieces.get() is not None:
+            pass
+
+
+def read_aloud(pieces: list[str], voice: str, since: float | None = None) -> int:
+    """The pieces read aloud, in the venv: each made while the one before plays (the model lets go of Python's lock
+    while it works, so the thread that feeds the player keeps up: board 2026-11-19), into one stream; at most two
+    pieces ahead of the player (the rest would be made for nothing when it is stopped). Ends early after a hush that
+    came after `since`."""
+    import numpy as np
+    tts, gen = voice_engine(), generation(voice)
+    out: queue.Queue = queue.Queue(maxsize=2)
+    p = feeder = None
+    stopped = False
+    with tempfile.TemporaryFile() as err:          # what the player says, read when it has ended
+        try:
+            for piece in pieces:
+                audio = tts.generate(piece, gen)
+                if since is not None and hushed_since(since):
+                    if p is not None:
+                        p.terminate()                   # what it has not played yet goes with it
+                    stopped = True
+                    break
+                if p is not None and p.poll() is not None:
+                    break
+                if not len(audio.samples):
+                    print(f"the voice made nothing of {piece!r}", flush=True)
+                    continue
+                if p is None:
+                    try:
+                        p = subprocess.Popen(player(audio.sample_rate), stdin=subprocess.PIPE,
+                                             stdout=subprocess.DEVNULL, stderr=err)
+                    except FileNotFoundError:
+                        raise RuntimeError("pw-cat is missing: install pipewire-utils") from None
+                    feeder = threading.Thread(target=feed, args=(p.stdin, out), daemon=True)
+                    feeder.start()
+                out.put(trimmed(np.asarray(audio.samples, dtype=np.float32), audio.sample_rate).tobytes())
+        finally:
+            if p is not None:
+                out.put(None)
+                feeder.join()
+        if p is None or p.wait() == 0 or stopped:
+            return 0
+        err.seek(0)
+        said = err.read().decode(errors="replace").strip().splitlines()
+    raise RuntimeError(f"the player stopped (exit {p.returncode}){': ' + said[-1] if said else ''}")
+
+
+def microphone(mic: str, quiet: float = QUIET, silent=lambda gone: None):
+    """The microphone, 0.1 s at a time, as float samples: pw-record at 16 kHz mono (PipeWire resamples). Not a byte
+    for `quiet` seconds (the microphone unplugged: the stream waits, unlinked) is told to `silent(True)`, and the
+    first sound after it to `silent(False)`; the listener says so and waits on, for the microphone to come back
+    (exiting instead met systemd's start limit within two minutes, and left it off for good: review 2026-11-18).
+    While there is no sound, None every `quiet` seconds, so the listener still reads new settings (a new "mic")."""
+    import numpy as np
+    argv = ["pw-record", "--rate", str(RATE), "--channels", "1", "--format", "s16", "--raw", "--latency", "100ms"]
+    if mic:
+        argv += ["--target", mic]
+    try:
+        p = subprocess.Popen([*argv, "-"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise RuntimeError("pw-record is missing: install pipewire-utils") from None
+    fd, buf, gone = p.stdout.fileno(), bytearray(), False
+    try:
+        while True:
+            if not select.select([fd], [], [], quiet)[0]:
+                if not gone:
+                    gone = True
+                    silent(True)
+                yield None
+                continue
+            b = os.read(fd, 1 << 16)
+            if not b:
+                return
+            if gone:
+                gone = False
+                silent(False)
+            buf += b
+            while len(buf) >= CHUNK * 2:
+                yield np.frombuffer(bytes(buf[:CHUNK * 2]), dtype=np.int16).astype(np.float32) / 32768
+                del buf[:CHUNK * 2]
+    finally:
+        p.terminate()
+        try:
+            p.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+def in_venv() -> bool:
+    return Path(sys.prefix).resolve() == VENV.resolve()
+
+
+def into_venv(argv: list[str]) -> None:
+    """Runs this command again with the venv's Python, where sherpa-onnx is."""
+    py = VENV / "bin" / "python"
+    if not in_venv():
+        os.execv(str(py), [str(py), str(Path(__file__).resolve()), *argv])
+
+
+def listen() -> int:
+    if not ready():
+        write_json(STATUS, {"state": "error", "error": "not set up: press Set up in the panel's Voice tab", "at": time.time()})
+        print("not set up: a7a-voice setup", flush=True)
+        return 0                                      # no restart loop: nothing would change until setup runs
+    into_venv(["listen"])
+
+    def report(**kw):
+        cur.update(kw, at=time.time())
+        write_json(STATUS, cur)
+
+    def stop(*_):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    seen = mtime(CONFIG), mtime(PANEL)      # before the reading: a save made while the models load is seen at once
+    cfg, problem = load_config()
+    cfg["online"] = online_names()
+    if problem:
+        cfg["commands"] = []                # not the built-in ones, which may hold commands the owner removed
+    # "online": the online assistants it listens for ("hey <name>"), "left_out": why not for the others
+    # "wake", "assistant": the two phrases it wakes for (the old ones when it could not take a new one; the panel
+    # tells a refused phrase by them, 2026-11-24)
+    # "read": the settings file's time when it was last read (status() compares the phrases only then: review)
+    cur = {"state": "starting", "wake": cfg["wake"], "assistant": cfg["assistant"], "read": seen[0], "pid": os.getpid(),
+           "heard": "", "ran": "",
+           "error": problem and f"{problem}: no commands until the settings are saved again", "online": [], "left_out": []}
+    report()
+    typist = Typist()                       # the keyboard typing by voice uses, kept for the listener's life
+    if why := typist.start():               # now: the desktop takes about a second to see a new keyboard
+        print(f"no typing by voice: {why}", flush=True)
+    act = Actions(cfg, status=report, keys=typist.send)
+    try:
+        kws, online, left = spotter(cfg)
+        listener = Listener(kws, recogniser(), act)
+        print(f"listening for {heard_as(wake_phrases(dict(cfg, online=online)))}, {len(active(cfg))} commands", flush=True)
+        report(state="listening", online=online, left_out=left, **ENGINE)
+        quiet = [False, ""]                 # the microphone silent, and the error to show again once it is back
+
+        def silent(gone: bool) -> None:
+            quiet[0] = gone
+            if gone:
+                quiet[1] = cur["error"]
+                print("no sound from the microphone", flush=True)
+                report(error=f"no sound from the microphone for {QUIET:.0f} s: is it plugged in?")
+            else:
+                print("the microphone is back", flush=True)
+                report(error=quiet[1])
+
+        def settled(error: str) -> None:
+            """A reading of the settings went well, or `error`: shown now, or (the microphone's error first) when the
+            microphone is back."""
+            if quiet[0]:
+                quiet[1] = error
+            else:
+                report(error=error)
+
+        for n, samples in enumerate(microphone(cfg["mic"], silent=silent)):
+            if samples is None:
+                listener.gap()
+            else:
+                listener.feed(samples)
+                if n % 10:
+                    continue
+            if any(cur.get(k) != v for k, v in ENGINE.items()):   # the NPU's spotter handed over to the CPU's
+                report(**ENGINE)
+            if (m := (mtime(CONFIG), mtime(PANEL))) == seen:
+                continue
+            seen = m
+            new, problem = load_config()
+            new["online"] = online_names()
+            if problem:                             # a file that does not parse: the last good settings stay
+                print(problem, flush=True)
+                settled(problem)
+                continue
+            if new["mic"] != cfg["mic"]:
+                print("the microphone setting changed: restarting", flush=True)
+                return 1                            # systemd starts the listener again, on the new source
+            error = ""
+            if (wake_phrases(new) != wake_phrases(cfg) or new["sensitivity"] != cfg["sensitivity"]
+                    or new["npu"] != cfg["npu"]):
+                try:
+                    kws, online, left = spotter(new)
+                    listener.spotter(kws)
+                    report(online=online, left_out=left, **ENGINE)
+                except Exception as e:              # a phrase the spotter cannot take: the ones it has stay
+                    error = f"{e}; still listening for {heard_as(wake_phrases(cfg))}"
+                    print(error, flush=True)
+                    new["wake"], new["assistant"], new["sensitivity"] = cfg["wake"], cfg["assistant"], cfg["sensitivity"]
+                    new["online"], new["npu"] = cfg.get("online", []), cfg["npu"]
+            cfg = act.cfg = new
+            print(f"settings reloaded: {heard_as(wake_phrases(dict(cfg, online=cur['online'])))}, {len(active(cfg))} commands", flush=True)
+            report(wake=cfg["wake"], assistant=cfg["assistant"], read=seen[0])
+            settled(error)
+        report(state="error", error="the microphone stream ended")
+        print("the microphone stream ended", flush=True)
+        return 1
+    except SystemExit:
+        report(state="off")
+        return 0
+    except Exception as e:                              # shown in the panel, and systemd tries again
+        report(state="error", error=str(e))
+        print(f"failed: {e}", flush=True)
+        return 1
+    finally:
+        typist.close()
+
+
+def engine_problem() -> str:
+    """Why the venv's packages do not import, or ""."""
+    try:
+        import numpy, sentencepiece, sherpa_onnx  # noqa: F401
+    except Exception as e:                  # a damaged file in the venv raises others than ImportError (review)
+        return f"{type(e).__name__}: {e}"
+    return ""
+
+
+def check(part: str = "listen") -> int:
+    """Both models load (with the default wake phrase: a phrase of the owner's that the spotter refuses is the
+    listener's error to report, not a failed setup); or the voice loads and says a word (into nothing). Exit 3 when
+    the speech engine itself does not load: the venv is at fault then, not the models."""
+    into_venv(["check"] + (["speak"] if part == "speak" else []))
+    if problem := engine_problem():
+        print(f"the speech engine does not load: {problem}")
+        return 3
+    t = time.time()
+    if part == "speak":
+        if not len(voice_engine().generate("Ready.", generation(VOICES[0])).samples):
+            raise RuntimeError("the voice made no sound")
+        print(f"the voice loads and speaks ({time.time() - t:.1f} s)")
+        return 0
+    spotter(clean(None))
+    recogniser()
+    print(f"both models load ({time.time() - t:.1f} s)")
+    return 0
+
+
+# ---------------------------------------------------------------- setup
+
+def python_version() -> str:
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def venv_ok(r) -> bool:
+    """The marker setup writes last names these packages and this Python (the venv's python is the system's: after a
+    Fedora update to another Python its packages are not found), and the venv is there."""
+    return (isinstance(r, dict) and r.get("packages") == PACKAGES and r.get("python") == python_version()
+            and (VENV / "bin" / "python").exists())
+
+
+def ready(models=PARTS["listen"]) -> bool:
+    """Set up for this version: the venv (venv_ok), and the models, checked by a setup (the marker names them) and on
+    disk (each directory is moved into place whole)."""
+    r = read_json(READY)
+    return (venv_ok(r) and isinstance(r.get("models"), list)
+            and all(m[0] in r["models"] and (MODELS / m[0]).is_dir() for m in models))
+
+
+def mark(models, checked: bool = True) -> None:
+    """The marker: this venv, and the models checked in it, these added (or, not `checked`, taken out)."""
+    r = read_json(READY)
+    have = set(r["models"]) if venv_ok(r) and isinstance(r.get("models"), list) else set()
+    names = {m[0] for m in models}
+    have = have | names if checked else have - names
+    write_json(READY, {"packages": PACKAGES, "models": [m[0] for m in (KWS, ASR, TTS) if m[0] in have],
+                       "python": python_version(), "at": time.strftime("%F %T")})
+
+
+def progress(fraction: float, step: str, where: Path | None = None) -> None:
+    write_json(where or PROGRESS, {"fraction": round(fraction, 3), "step": step, "pid": os.getpid()})
+
+
+def setup_running(part: str | None = None) -> bool:
+    """A setup holds the lock (of `part`, when given: the lock is one, and the other part's setup holding it says
+    nothing of this part's progress file)."""
+    lock = DATA / "setup.lock"
+    if not held(lock):
+        return False
+    try:
+        return part is None or lock.read_text().split()[1] == part
+    except (OSError, IndexError):
+        return False
+
+
+def tell(text: str) -> None:
+    """Printed for whoever started us; the panel may have closed, and setup goes on without it."""
+    try:
+        print(text, flush=True)
+    except OSError:
+        pass
+
+
+# what a setup needs on the card besides its models (2026-11-24, measured on the board: the venv 131 MB, pip's cache
+# 35 MB), and the room kept spare on top
+VENV_BYTES = 200 << 20
+SPARE_BYTES = 50 << 20
+# pip's words for a board that cannot reach pypi.org
+OFFLINE = ("Failed to establish a new connection", "Temporary failure in name resolution", "Name or service not known",
+           "Network is unreachable", "No route to host", "Connection refused", "ConnectTimeoutError", "Read timed out",
+           "ProxyError")
+
+
+def free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def space_needed(models: tuple) -> int:
+    """What a setup of `models` still needs on the card: the venv when it must be made, and for each model not
+    unpacked yet its archive (less what of it is downloaded) and what it unpacks beside it (about its size again),
+    with SPARE_BYTES on top (2026-11-24: a full card stopped a setup halfway with "No space left on device")."""
+    need = SPARE_BYTES if venv_ok(read_json(READY)) else SPARE_BYTES + VENV_BYTES
+    for name, _tag, size, _sha, _keep in models:
+        if (MODELS / name).is_dir():
+            continue
+        part = MODELS / f"{name}.tar.bz2.part"
+        have = part.stat().st_size if part.exists() else 0
+        need += max(0, size - have) + size * 5 // 4
+    return need
+
+
+def pip_failed(logged: Path, code: int) -> str:
+    """Why pip stopped, in words: no internet (the first run may well be offline), or its own last ERROR line."""
+    try:
+        said = logged.read_text(errors="replace")
+    except OSError:
+        said = ""
+    if any(w in said for w in OFFLINE):
+        return ("could not download the speech engine: no connection to pypi.org. Is the board on the internet? "
+                "Connect, then try again")
+    lines = [l.strip() for l in said.splitlines() if l.strip()]
+    errors = [l for l in lines if l.startswith("ERROR:")]
+    last = errors[-1] if errors else lines[-1] if lines else f"pip exit {code}"
+    return f"installing the speech engine failed ({last}); pip's whole answer is in {logged}"
+
+
+def download(model: tuple, lo: float, hi: float, where: Path | None = None) -> None:
+    """One model: downloaded (continued if a part is there), its size and sha256 checked, the files it needs
+    unpacked into MODELS/<name> (whole or not at all); its progress in `where` (PROGRESS)."""
+    name, tag, size, sha, keep = model
+    if (MODELS / name).is_dir():
+        return
+    MODELS.mkdir(parents=True, exist_ok=True)
+    part = MODELS / f"{name}.tar.bz2.part"
+    have = part.stat().st_size if part.exists() else 0
+    if have > size:
+        part.unlink()
+        have = 0
+    announced = None                     # the file's whole size as the server's answer gave it
+    if have < size:
+        req = urllib.request.Request(f"{RELEASES}/{tag}/{name}.tar.bz2", headers={"Range": f"bytes={have}-"} if have else {})
+        # each way a first run's download fails, in words, what came kept for the next try (2026-11-24)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                resumed = bool(have) and r.status == 206
+                got = have if resumed else 0
+                n = r.headers.get("Content-Length", "")
+                announced = got + int(n) if n.isdigit() else None
+                chunk = r.read(1 << 18)
+                # an answer from the start is looked at before the part is touched (review 2026-11-24): a network's
+                # login page, sent as a 200, truncated a part and then had it removed as another file
+                if not resumed:
+                    if not chunk.startswith(b"BZh"):
+                        raise RuntimeError(f"{name}: the answer is not the model's archive (a network's login page?): "
+                                           "is the board on the internet? Connect, then try again")
+                    if announced is not None and announced != size:
+                        raise RuntimeError(f"{name}: the server's file is {announced} bytes, {size} expected: not the "
+                                           "file this setup knows")
+                with open(part, "ab" if resumed else "wb") as f:
+                    last = 0.0
+                    while chunk:
+                        f.write(chunk)
+                        got += len(chunk)
+                        if time.time() - last > 0.5:
+                            last = time.time()
+                            progress(lo + (hi - lo) * 0.9 * got / size,
+                                     f"downloading {name} ({got >> 20} of {size >> 20} MB)", where)
+                        chunk = r.read(1 << 18)
+        except urllib.error.HTTPError as e:
+            e.close()
+            if e.code == 416:       # the part asks from past the server's file: every try would; it goes
+                part.unlink(missing_ok=True)
+                raise RuntimeError(f"{name}: the download server answered 416 (what was kept is longer than its file): "
+                                   "removed, try again") from None
+            raise RuntimeError(f"{name}: the download server answered {e.code} {e.reason}: try again later") from None
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"{name}: no connection to the download server (github.com): {e.reason}. Is the board on "
+                               "the internet? Connect, then try again") from None
+        except (TimeoutError, ConnectionError, http.client.HTTPException) as e:
+            raise RuntimeError(f"{name}: the download was cut ({type(e).__name__}): trying again carries on where it "
+                               "stopped") from None
+    came = part.stat().st_size
+    if came != size and came == announced:
+        # the server sent all it said, and that is not the file this setup expects: no try would get it
+        part.unlink()
+        raise RuntimeError(f"{name}: the server's file is {came} bytes, {size} expected: not the file this setup knows")
+    if came != size:
+        # the server stopped sending without an error: what came is kept
+        raise RuntimeError(f"{name}: the download was cut ({came >> 20} of {size >> 20} MB): trying again carries on "
+                           "where it stopped")
+    h = hashlib.sha256()
+    with open(part, "rb") as f:
+        while block := f.read(1 << 20):
+            h.update(block)
+    if h.hexdigest() != sha:
+        part.unlink()
+        raise RuntimeError(f"{name}: the download is damaged (sha256 {h.hexdigest()}) and was removed: run setup again")
+    progress(lo + (hi - lo) * 0.95, f"unpacking {name}", where)
+    tmp = MODELS / f"{name}.unpacking"
+    if tmp.exists():
+        for f in sorted(tmp.rglob("*"), reverse=True):
+            f.unlink() if f.is_file() else f.rmdir()
+        tmp.rmdir()
+    tmp.mkdir()
+    with tarfile.open(part, "r:bz2") as t:
+        for m in t.getmembers():
+            if m.isfile() and Path(m.name).parent.name == name and re.match(keep, Path(m.name).name):
+                m.name = Path(m.name).name
+                t.extract(m, tmp, filter="data")
+    if not any(tmp.iterdir()):
+        raise RuntimeError(f"{name}: none of the files it needs in the download")
+    tmp.rename(MODELS / name)
+    part.unlink()
+
+
+def listener_back() -> None:
+    """Listening set up again: a listener that stopped on "not set up" (a package update or a new Python asked for a
+    new venv) starts again, also when the voice's setup made it (review 2026-11-19)."""
+    st = read_json(STATUS)
+    if isinstance(st, dict) and st.get("state") == "error":
+        STATUS.unlink(missing_ok=True)
+    if systemctl("is-enabled", UNIT).stdout.strip() == "enabled":
+        systemctl("reset-failed", UNIT)
+        systemctl("restart", UNIT)
+
+
+def setup(part: str = "listen") -> int:
+    """The venv with the pinned wheels, the part's models, and a load check; the progress for the panel in PROGRESS
+    (listening: the Voice tab's Set up) or SPEECH_PROGRESS (the voice: the Assistant tab's speak answers). One at a
+    time (a lock under DATA); what pip and the check print goes to a log under DATA, not to the caller, who may have
+    gone (the panel closed: a check writing to its closed pipe failed, review 2026-11-18). The venv is made beside the
+    old one and moved into place whole, so an interrupted setup or a new Python leaves nothing half made. The other
+    part's models, when they are on disk, are checked in it too, not downloaded again: a new venv for one part would
+    otherwise leave the other unready without a word (review 2026-11-19)."""
+    models, where = PARTS[part], PROGRESS if part == "listen" else SPEECH_PROGRESS
+    DATA.mkdir(parents=True, exist_ok=True)
+    lock = open(DATA / "setup.lock", "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        tell("setup is already running")
+        return 1
+    lock.truncate(0)
+    lock.write(f"{os.getpid()} {part}\n")          # which part (setup_running)
+    lock.flush()
+    logged = DATA / ("setup.log" if part == "listen" else f"setup-{part}.log")
+    log = open(logged, "w")
+    try:
+        # room first: a full card would stop it halfway (2026-11-24)
+        need, free = space_needed(models), free_bytes(DATA)
+        if free < need:
+            raise RuntimeError(f"not enough space on the card: {free >> 20} MB free, setting up needs about "
+                               f"{need >> 20} MB. Free some space, then try again")
+        progress(0.0, "making the venv", where)
+        if not venv_ok(read_json(READY)):
+            new = VENV.with_name("venv.new")
+            shutil.rmtree(new, ignore_errors=True)
+            subprocess.run([sys.executable, "-m", "venv", str(new)], check=True, stdout=log, stderr=log)
+            progress(0.05, "installing the speech engine (sherpa-onnx)", where)
+            try:
+                subprocess.run([str(new / "bin" / "python"), "-m", "pip", "install", "--quiet",
+                                "--disable-pip-version-check", "--no-input", "--only-binary=:all:", *PACKAGES],
+                               check=True, stdout=log, stderr=log)
+            except subprocess.CalledProcessError as e:
+                log.flush()
+                shutil.rmtree(new, ignore_errors=True)          # its room back, on a small card
+                raise RuntimeError(pip_failed(logged, e.returncode)) from None
+            READY.unlink(missing_ok=True)
+            shutil.rmtree(VENV, ignore_errors=True)
+            new.rename(VENV)
+        total, done = sum(m[2] for m in models), 0
+        for m in models:                    # each its share of the bar, by its size
+            download(m, 0.25 + 0.7 * done / total, 0.25 + 0.7 * (done + m[2]) / total, where)
+            done += m[2]
+        progress(0.96, "loading the models" if part == "listen" else "loading the voice", where)
+
+        def checked(p: str) -> None:
+            subprocess.run([str(VENV / "bin" / "python"), str(Path(__file__).resolve()), "check",
+                            *([] if p == "listen" else [p])], check=True, stdout=log, stderr=log)
+
+        try:
+            # the engine's imports on their own first: one that crashes (a damaged library: SIGSEGV, not an
+            # ImportError, so check's exit 3 is never reached) is the venv's, made again by the next setup, the
+            # models left alone (review 2026-11-19)
+            subprocess.run([str(VENV / "bin" / "python"), "-c", "import numpy, sentencepiece, sherpa_onnx"], check=True,
+                           stdout=log, stderr=log)
+        except subprocess.CalledProcessError as e:
+            READY.unlink(missing_ok=True)
+            raise RuntimeError(f"the speech engine does not load (exit {e.returncode}): the next setup makes it again")
+        try:
+            checked(part)
+        except subprocess.CalledProcessError as e:
+            # what does not load is made again by the next setup, and only that: the venv when the engine itself
+            # does not load (exit 3; every part is checked in the new one); else the part's models, downloaded
+            # again (a damaged file keeps its name, and download() takes a model whose directory is there for
+            # done), unless the check was killed (out of memory beside the language model, say: they are kept)
+            if e.returncode == 3:
+                READY.unlink(missing_ok=True)
+            else:
+                mark(models, checked=False)
+                if e.returncode != -signal.SIGKILL:     # a crash on a damaged file is downloaded again
+                    for m in models:
+                        shutil.rmtree(MODELS / m[0], ignore_errors=True)
+            raise
+        mark(models)
+        listening = part == "listen"
+        for other, theirs in PARTS.items():
+            if other != part and not ready(theirs) and all((MODELS / m[0]).is_dir() for m in theirs):
+                try:
+                    checked(other)
+                    mark(theirs)
+                    listening |= other == "listen"
+                except subprocess.CalledProcessError:
+                    tell(f"{other}: its models do not load in the new venv: set that part up again")
+        if listening:
+            listener_back()
+        tell("the voice is set up" if part == "speak" else "set up: turn it on in the panel's Voice tab, or a7a-voice on")
+        return 0
+    except (OSError, RuntimeError, subprocess.SubprocessError, tarfile.TarError, http.client.HTTPException) as e:
+        # (a connection cut in the middle of a download is http.client's IncompleteRead, not an OSError: review)
+        tell(f"setup failed: {e} (more in {logged})")
+        write_json(where, {"fraction": 0.0, "step": "", "error": str(e), "pid": os.getpid()})
+        return 1
+    finally:
+        cur = read_json(where)
+        if not (isinstance(cur, dict) and cur.get("error")):
+            where.unlink(missing_ok=True)
+        log.close()
+        lock.close()
+
+
+# ---------------------------------------------------------------- the panel's commands
+
+def systemctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=30)
+
+
+def status() -> dict:
+    """The panel's view: the listener's own report while it runs; after it stopped, only the error it stopped on.
+    Settings that do not read come with no commands: what a listener started now would run (not the built-in ones,
+    which a Save from the tab would bring back)."""
+    cfg, problem = load_config()
+    if problem:
+        cfg["commands"] = []
+    running = systemctl("is-active", UNIT).stdout.strip() == "active"
+    enabled = systemctl("is-enabled", UNIT).stdout.strip() == "enabled"
+    st = read_json(STATUS)
+    st = st if isinstance(st, dict) else {}
+    progress_now = read_json(PROGRESS)
+    # a setup that ended without finishing (killed, the board switched off) left its progress behind
+    if isinstance(progress_now, dict) and not progress_now.get("error") and not setup_running("listen"):
+        progress_now = {"fraction": 0.0, "step": "", "error": "the setup stopped before it finished: press Set up again"}
+    out = {"ready": ready(), "running": running, "enabled": enabled, "config": cfg, "config_error": problem,
+           "setup": progress_now, "online": online_names()}
+    if running:                             # (online: the names it really listens for, of those, when it says)
+        out.update({k: v for k, v in st.items() if k in ("state", "heard", "ran", "score", "at", "error", "online", "left_out",
+                                                       "engine", "npu_error")})
+        # the two phrases it wakes for, beside the saved ones in "config": a refused one differs (2026-11-24); only
+        # once it has read the settings the file holds now (a save just made is not read yet: review 2026-11-24)
+        if (isinstance(st.get("wake"), str) and isinstance(st.get("assistant"), str)
+                and st.get("read") == mtime(CONFIG)):
+            out["listening"] = {"wake": st["wake"], "assistant": st["assistant"]}
+    elif st.get("state") == "error":
+        out["error"] = st.get("error", "")
+    return out
+
+
+def on() -> int:
+    if not ready():
+        print("not set up: a7a-voice setup (or Set up in the panel's Voice tab)")
+        return 1
+    if not CONFIG.exists():
+        write_json(CONFIG, clean(None))
+    systemctl("reset-failed", UNIT)                 # after 4 failed starts systemd would not start it again
+    r = systemctl("enable", "--now", UNIT)
+    print(r.stdout + r.stderr if r.returncode else "listening: say the wake phrase, then a command")
+    return r.returncode and 1
+
+
+def off() -> int:
+    r = systemctl("disable", "--now", UNIT)
+    STATUS.unlink(missing_ok=True)
+    print(r.stdout + r.stderr if r.returncode else "voice commands off")
+    return r.returncode and 1
+
+
+def save(text: str) -> int:
+    try:
+        raw = json.loads(text)
+    except ValueError as e:
+        print(f"not saved: {e}")
+        return 1
+    if not isinstance(raw, dict):
+        print("not saved: the settings are a JSON object")
+        return 1
+    write_json(CONFIG, clean(raw))
+    print(f"saved to {CONFIG}")
+    return 0
+
+
+def npu(switch: str) -> int:
+    """`npu on`: the NPU spotter's package into the venv when it is missing, the spotter started once on a second of
+    silence (the same files the listener will load), then the setting saved; the listener takes it within 1 s. `npu
+    off`: the setting saved off."""
+    cfg, problem = load_config()
+    if problem:
+        print(f"not changed: {problem}")
+        return 1
+    if switch == "on":
+        if not ready():
+            print("not set up: a7a-voice setup")
+            return 1
+        py = str(VENV / "bin" / "python")
+        if subprocess.run([py, "-c", "import kaldi_native_fbank"], capture_output=True).returncode != 0:
+            print(f"installing {' '.join(NPU_PACKAGES)} into {VENV}", flush=True)
+            r = subprocess.run([py, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--no-input",
+                                "--only-binary=:all:", *NPU_PACKAGES], capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"not switched on: pip failed:\n{r.stderr.strip()[-800:]}")
+                return 1
+        probe = ("import sys, numpy as np; sys.argv = ['a7a-voice']; "
+                 "import importlib.machinery, importlib.util; "
+                 f"l = importlib.machinery.SourceFileLoader('v', {str(Path(__file__).resolve())!r}); "
+                 "s = importlib.util.spec_from_loader('v', l); v = importlib.util.module_from_spec(s); l.exec_module(v); "
+                 "cfg, _ = v.load_config(); cfg['online'] = v.online_names(); cfg['npu'] = True; "
+                 "k, _, _ = v.spotter(cfg); "
+                 "st = k.create_stream(); st.accept_waveform(16000, np.zeros(16000, np.float32)); "
+                 "[k.decode_stream(st) for _ in range(8) if k.is_ready(st)]; "
+                 "print('NPU-PROBE', v.ENGINE['engine'], v.ENGINE['npu_error'], flush=True)")
+        try:
+            r = subprocess.run([py, "-c", probe], capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            print("not switched on: the NPU spotter took over 2 minutes to start")
+            return 1
+        # its own line: VIPLite prints its version on the way out, after it
+        out = next((x[len("NPU-PROBE "):] for x in r.stdout.splitlines() if x.startswith("NPU-PROBE ")), "")
+        if r.returncode != 0 or not out.startswith("npu"):
+            print(f"not switched on: {out or r.stderr.strip()[-800:]}")
+            return 1
+    raw = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    raw["npu"] = switch == "on"
+    write_json(CONFIG, clean(raw))
+    print(f"the spotter's network on the {'NPU' if switch == 'on' else 'CPU'}")
+    return 0
+
+
+def llm_ready(timeout: float = 3.0) -> bool:
+    """The model server answers and has its model loaded (llama.cpp's /health is 503 while it loads)."""
+    try:
+        with urllib.request.urlopen(f"{LLM}/health", timeout=timeout) as r:
+            return r.status == 200
+    except (OSError, ValueError):
+        return False
+
+
+def ask(question: str, wait: float = 300.0, to: str = "") -> int:
+    """A question said after the Assistant's wake phrase: the answer of the panel's own Assistant (the same model and
+    board tools as its tab: a7a-panel --answer) as a notification, which KDE keeps in its history, and read aloud
+    when the Assistant tab's speak answers is on. The model server is started first when it is not up (a7a-llm
+    serve: the model takes a minute or two to load, and then stays, about 6 GB, until the Assistant tab's Stop
+    server). `to`: an online assistant's name ("hey <name>"), which answers instead (no model server needed). Run by
+    the listener on its own, in a scope like a command."""
+    title = to.title() if to else "Assistant"
+    first = notify_id(title, f"“{question}”\nThinking…")
+    if not to and not llm_ready():
+        notify_id(title, f"“{question}”\nStarting the model first: a minute or two…", first)
+        try:
+            r = subprocess.run(["a7a-llm", "serve"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)
+        except (OSError, subprocess.SubprocessError) as e:
+            return answered(first, f"The model did not start: {e}", title=title)
+        out = [line.strip() for line in (r.stdout + r.stderr).splitlines() if line.strip()]
+        if r.returncode and not any("already running" in line for line in out):
+            return answered(first, f"The model did not start: {out[0] if out else f'a7a-llm exit {r.returncode}'}", title=title)
+        end = time.time() + wait
+        while not llm_ready():
+            if time.time() > end:
+                return answered(first, "The model did not get ready (its log: /tmp/a7a-llm.log).", title=title)
+            time.sleep(2)
+        notify_id(title, f"“{question}”\nThinking…", first)
+    try:
+        r = subprocess.run(["a7a-panel", "--answer", question, *(["--assistant", to] if to else [])],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        return answered(first, f"No answer: {e}", title=title)
+    text = r.stdout.strip() if r.returncode == 0 else ""
+    if not text:
+        why = [line for line in r.stderr.splitlines() if line.strip()]
+        return answered(first, f"No answer: {why[-1] if why else 'the Assistant failed'}", title=title)
+    tell(text)
+    plain = re.sub(r"[*_`#]+", "", text)
+    if len(plain) > ANSWER_CHARS:
+        plain = plain[:ANSWER_CHARS].rsplit(" ", 1)[0] + " …"
+    answered(first, plain, ok=True, title=title)
+    if speech_settings()["speak"]:
+        try:                                # until it has been read, or stopped (a wake phrase, Stop speaking)
+            subprocess.run([str(Path(__file__).resolve()), "say"], input=text, text=True, timeout=1800)
+        except (OSError, subprocess.SubprocessError) as e:
+            tell(f"not read aloud: {e}")
+    return 0
+
+
+def notify_id(title: str, body: str, replace: int = 0, keep: bool = False) -> int:
+    """A notification that a later one can take the place of (notify-send --print-id / --replace-id); its id, 0 when
+    there is none."""
+    argv = ["notify-send", "--app-name=Voice commands", "--icon=audio-input-microphone", "--print-id",
+            f"--expire-time={30000 if keep else 0}"]
+    if replace:
+        argv.append(f"--replace-id={replace}")
+    try:
+        r = subprocess.run([*argv, html.escape(title, quote=False), html.escape(body, quote=False)], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, timeout=10)
+        return int(r.stdout.strip() or 0)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+
+
+def answered(first: int, text: str, ok: bool = False, title: str = "Assistant") -> int:
+    notify_id(title, text, first, keep=True)
+    if not ok:
+        tell(text)
+    return 0 if ok else 1
+
+
+def say_aloud(text: str | None = None) -> int:
+    """`a7a-voice say`: the text (None: stdin) read aloud now, in the voice chosen, in place of whatever is being
+    read; done when it has been read, or ended with its process group by hush (the panel's Stop speaking, a wake
+    phrase), or by a hush that came after it started, before it took the lock. The text from stdin is read in the
+    venv (into_venv's exec keeps stdin): an answer in the program's arguments would be readable by anyone in /proc,
+    and could be too long for them (review 2026-11-19)."""
+    if not ready(PARTS["speak"]):
+        print("the voice is not set up: turn on speak answers in the panel's Assistant tab (or a7a-voice speak on)")
+        return 1
+    into_venv(["say"] + ([] if text is None else [text]))
+    if text is None:
+        text = sys.stdin.buffer.read().decode(errors="replace")
+    pieces = speakable(text)
+    if not pieces:
+        return 0
+    since = started()
+    try:
+        os.setpgrp()                        # a process group of its own, with its player: hush ends both at once
+    except OSError:
+        pass                                # one already (started by setsid)
+    SPEAKING.parent.mkdir(parents=True, exist_ok=True)
+    with open(SPEAKING, "a+") as lock:
+        for _ in range(40):                 # what is being read stops first, also one started meanwhile
+            hush(everything=False)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            print("not read aloud: what is being read does not stop")
+            return 1
+        lock.truncate(0)
+        lock.write(str(os.getpid()))
+        lock.flush()
+        try:
+            if hushed_since(since):         # stopped while it was starting
+                return 0
+            return read_aloud(pieces, speech_settings()["voice"], since)
+        except (OSError, RuntimeError) as e:
+            print(f"not read aloud: {e}")
+            return 1
+        finally:
+            lock.truncate(0)                # no number left behind for hush to find
+
+
+def speech_status() -> dict:
+    """The Assistant tab's view: answers read aloud or not, the voice, the voice set up, one being read now, the
+    voice's download at work (or why it stopped)."""
+    prog = read_json(SPEECH_PROGRESS)
+    if isinstance(prog, dict) and not prog.get("error") and not setup_running("speak"):
+        prog = {"fraction": 0.0, "step": "", "error": "the download stopped before it finished: turn speak answers on again"}
+    # busy: a setup of either part at work (one of listening's may make a new venv, and check the voice in it last)
+    return dict(speech_settings(), voices=VOICES, ready=ready(PARTS["speak"]), speaking=held(SPEAKING),
+                setup=prog if isinstance(prog, dict) else None, busy=setup_running())
+
+
+def speak(args: list[str]) -> int:
+    """`a7a-voice speak [on | off | voice V]`. The first "on" sets the voice up (a download of a minute or two, its
+    progress in speech_status); "on" and a new voice read a sample in the voice."""
+    if not args:
+        print(json.dumps(speech_status(), ensure_ascii=False))
+        return 0
+    cur = speech_settings()
+    if args == ["off"]:
+        write_json(SPEECH, dict(cur, speak=False))
+        hush()
+        print("answers are not read aloud")
+        return 0
+    if args == ["on"]:
+        if not ready(PARTS["speak"]) and setup("speak"):
+            return 1
+        write_json(SPEECH, dict(cur, speak=True))
+        print(f"answers are read aloud, in voice {cur['voice']}")
+    elif len(args) == 2 and args[0] == "voice":
+        if args[1] not in VOICES:
+            print(f"no voice {args[1]}: one of {' '.join(VOICES)}")
+            return 1
+        write_json(SPEECH, dict(cur, voice=args[1]))
+        print(f"voice {args[1]}")
+    else:
+        return usage()
+    if ready(PARTS["speak"]):
+        detached([str(Path(__file__).resolve()), "say", SAMPLE])
+    return 0
+
+
+def test(text: str, dry: bool = False, panel: bool = False) -> int:
+    """The command `text` matches, run; not with `dry`, nor from the panel (`panel`) when it presses keys or acts on
+    the window: it would act on the panel itself (close it, type into it: review 2026-11-22)."""
+    cfg, problem = load_config()
+    if problem:
+        print(f"{problem}: no commands")
+        return 1
+    heard = words(text)
+    match, s = best_match(heard, active(cfg), cfg["match"])
+    if match is None:
+        closest, cs = best_match(heard, active(cfg), 0.0)
+        hint = f": the closest is “{closest['say']}” ({cs:.2f}, {cfg['match']:.2f} needed)" if closest else ""
+        print(f"no command matches “{text}”{hint}")
+        return 1
+    if panel and match["run"].startswith(("a7a-voice key ", "a7a-voice type ", "a7a-voice shortcut ")):
+        dry = True
+    print(f"“{text}” -> “{match['say']}” ({s:.2f}): {match['run']}" + (" (not run from the panel: it would act on the panel itself)" if dry else ""))
+    if not dry:
+        launch(match["run"])
+    return 0
+
+
+def usage() -> int:
+    print(__doc__.split("\n\n")[1], file=sys.stderr)
+    return 2
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    cmd = argv[0] if argv else ""
+    if cmd == "setup" and len(argv) == 1:
+        return setup()
+    if cmd == "listen" and len(argv) == 1:
+        return listen()
+    if cmd == "check" and argv[1:] in ([], ["speak"]):
+        return check(*argv[1:])
+    if cmd == "speak":
+        return speak(argv[1:])
+    if cmd == "say" and len(argv) <= 2:
+        return say_aloud(*argv[1:])
+    if cmd == "hush" and len(argv) == 1:
+        print("stopped" if hush() else "nothing was being read")
+        return 0
+    if cmd == "on" and len(argv) == 1:
+        return on()
+    if cmd == "off" and len(argv) == 1:
+        return off()
+    if cmd == "status" and len(argv) == 1:
+        print(json.dumps(status(), ensure_ascii=False))
+        return 0
+    if cmd == "save" and len(argv) == 1:
+        return save(sys.stdin.read())
+    if cmd == "ask" and len(argv) == 2:
+        return ask(argv[1])
+    if cmd == "ask" and len(argv) == 4 and argv[1] == "--to":
+        return ask(argv[3], to=argv[2])
+    if cmd == "test" and len(argv) == 2:
+        return test(argv[1])
+    if cmd == "test" and len(argv) == 3 and argv[1] in ("--dry", "--panel"):
+        return test(argv[2], dry=argv[1] == "--dry", panel=argv[1] == "--panel")
+    if cmd == "npu" and argv[1:] in (["on"], ["off"]):
+        return npu(argv[1])
+    if cmd == "scan" and len(argv) == 1:
+        return scan()
+    if cmd == "app" and len(argv) == 3 and argv[1] in ("open", "close"):
+        return app(argv[1], argv[2])
+    if cmd == "shortcut" and len(argv) == 2:
+        return shortcut(argv[1])
+    if cmd == "key" and len(argv) >= 2:
+        why = keys(["key " + " ".join(argv[1:])])
+        print(why or "pressed")
+        return 1 if why else 0
+    if cmd == "type" and len(argv) == 2:
+        why = keys(type_lines(argv[1]))
+        print(why or "typed")
+        return 1 if why else 0
+    return usage()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

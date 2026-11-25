@@ -1,0 +1,298 @@
+From: a7a-fedora
+Subject: [PATCH] sunxi-drm: trace framebuffer and GEM lifetimes; /proc/sunxi-drm/fault-test (debug aids for the DE IOMMU fault)
+
+pr_info lines (visible with kernel.printk console level 7, or in dmesg/journal) for every framebuffer
+create/destroy and every GEM free on the sunxi-drm device: device address, size, dumb or imported (with the
+dma-buf exporter's name) and the process doing it. That identifies who unmapped a buffer the display engine was
+still scanning out. The DE frame-trace ring (/proc/sunxi-drm/debug) gains the fb id and its fault-time dump runs
+on the unbound workqueue so it is not stuck behind the faulting CPU.
+
+/proc/sunxi-drm/fault-test (root, write-only): "punch" unmaps the first page of the buffer last committed on
+DE-0 plane 0 so the DE faults on purpose, "heal" maps it back. Used to prove the fault recovery of the next patch.
+The DRM side of the IOMMU unmap watch: any unmap overlapping a buffer committed to a DE plane in the last 64
+updates (and not yet released through a framebuffer destroy) is reported by the IOMMU driver with a stack trace.
+---
+diff --git a/drivers/drm/sunxi_drm_debug.c b/drivers/drm/sunxi_drm_debug.c
+index f47d295..3e2653c 100644
+--- a/drivers/drm/sunxi_drm_debug.c
++++ b/drivers/drm/sunxi_drm_debug.c
+@@ -26,6 +26,9 @@
+ #include <linux/seq_file.h>
+ #include <linux/types.h>
+ #include <sunxi-iommu.h>
++#include <linux/iommu.h>
++#include <linux/proc_fs.h>
++#include <linux/uaccess.h>
+ #include "sunxi_drm_debug.h"
+ 
+ typedef struct trace_buf_info {
+@@ -42,6 +45,7 @@ typedef struct trace_buf_info {
+ 
+ 	// drm drm_framebuffer unmap record
+ 	struct drm_framebuffer *fb;
++	u32 fb_id;
+ 	int name;
+ 	u64 unmap_ts;
+ 	u32 mapped;
+@@ -92,8 +96,8 @@ static void  __maybe_unused sunxidrm_debug_record_exception(void)
+ 		spin_unlock_irqrestore(&frame->lock, flags);
+ 	}
+ 
+-	// schedule dprintk task
+-	schedule_work(&dbgdat.work);
++	// schedule dprintk task (unbound: the faulting CPU may be stuck in the IRQ storm)
++	queue_work(system_unbound_wq, &dbgdat.work);
+ }
+ 
+ static void sunxidrm_debug_work_func(struct work_struct *work)
+@@ -115,11 +119,11 @@ static void sunxidrm_debug_work_func(struct work_struct *work)
+ 		for (i = 0; i < FRAME_TRACE_LEN; i++) {
+ 			trace_buf_t *tbuf = &frame->data[i];
+ 			pr_err("[%02d] %d ts %lld plane %d line %d format 0x%08x %dx%d %d-%d-%d %d-%d-%d %pad "
+-			       "map:%d "
++			       "fb:%u map:%d "
+ 			       "unmap-ts:%lld\n",
+ 			       i, tbuf->seq, tbuf->update_ts, tbuf->plane, tbuf->cur_line, tbuf->format, tbuf->width,
+ 			       tbuf->height, tbuf->pitches[0], tbuf->pitches[1], tbuf->pitches[2], tbuf->offsets[0],
+-			       tbuf->offsets[1], tbuf->offsets[2], &tbuf->dma_addr, tbuf->mapped, tbuf->unmap_ts);
++			       tbuf->offsets[1], tbuf->offsets[2], &tbuf->dma_addr, tbuf->fb_id, tbuf->mapped, tbuf->unmap_ts);
+ 		}
+ 		spin_unlock_irqrestore(&frame->lock, flags);
+ 	}
+@@ -149,12 +153,12 @@ int sunxidrm_debug_show(struct seq_file *sfile, void *offset)
+ 			trace_buf_t *tbuf = &frame->data[i];
+ 			seq_printf(sfile,
+ 				   "[%02d] %d ts %lld plane %d line %d format 0x%08x %dx%d %d-%d-%d %d-%d-%d %pad "
+-				   "map:%d "
++				   "fb:%u map:%d "
+ 				   "unmap-ts:%lld\n",
+ 				   i, tbuf->seq, tbuf->update_ts, tbuf->plane, tbuf->cur_line, tbuf->format,
+ 				   tbuf->width, tbuf->height, tbuf->pitches[0], tbuf->pitches[1], tbuf->pitches[2],
+-				   tbuf->offsets[0], tbuf->offsets[1], tbuf->offsets[2], &tbuf->dma_addr, tbuf->mapped,
+-				   tbuf->unmap_ts);
++				   tbuf->offsets[0], tbuf->offsets[1], tbuf->offsets[2], &tbuf->dma_addr, tbuf->fb_id,
++				   tbuf->mapped, tbuf->unmap_ts);
+ 		}
+ 		seq_putc(sfile, '\n');
+ 
+@@ -163,6 +167,101 @@ int sunxidrm_debug_show(struct seq_file *sfile, void *offset)
+ 	return 0;
+ }
+ 
++/*
++ * a7a-fedora: /proc/sunxi-drm/fault-test (root, write-only), to provoke a display-engine IOMMU fault on purpose
++ * and prove the recovery path (docs/DE-IOMMU-STORM-2026-09-07.md) without waiting for the real race:
++ *   punch   unmap the first page of the framebuffer last committed on DE-0's plane 0 (the DE faults on its next
++ *           frame of that buffer: the fault callback stops the DE, the next flush restarts it)
++ *   heal    map that page back
++ */
++static struct {
++	dma_addr_t iova;
++	phys_addr_t phys;
++} fault_test;
++
++static ssize_t sunxidrm_fault_test_write(struct file *file, const char __user *ubuf, size_t len, loff_t *off)
++{
++	char cmd[16] = { 0 };
++	frame_trace_t *frame;
++	unsigned long flags;
++	dma_addr_t iova = 0;
++	int ret;
++
++	if (len >= sizeof(cmd))
++		return -EINVAL;
++	if (copy_from_user(cmd, ubuf, len))
++		return -EFAULT;
++	if (!global_iommu_domain || !dbgdat.init)
++		return -ENODEV;
++
++	if (!strncmp(cmd, "punch", 5)) {
++		if (fault_test.iova)
++			return -EBUSY;
++		frame = dbgdat.frames[0];
++		spin_lock_irqsave(&frame->lock, flags);
++		if (frame->wpos)
++			iova = frame->data[(frame->wpos - 1) % FRAME_TRACE_LEN].dma_addr;
++		spin_unlock_irqrestore(&frame->lock, flags);
++		if (!iova)
++			return -ENOENT;
++		fault_test.phys = iommu_iova_to_phys(global_iommu_domain, iova);
++		if (!fault_test.phys)
++			return -ENOENT;
++		ret = iommu_unmap(global_iommu_domain, iova, PAGE_SIZE);
++		pr_err("sunxi-drm fault-test: unmapped page %pad (phys %pap) of the current scanout buffer: %d\n",
++		       &iova, &fault_test.phys, ret);
++		fault_test.iova = iova;
++	} else if (!strncmp(cmd, "heal", 4)) {
++		if (!fault_test.iova)
++			return -ENOENT;
++		ret = iommu_map(global_iommu_domain, fault_test.iova, fault_test.phys, PAGE_SIZE,
++				IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
++		pr_err("sunxi-drm fault-test: mapped page %pad back: %d\n", &fault_test.iova, ret);
++		fault_test.iova = 0;
++		if (ret)
++			return ret;
++	} else {
++		return -EINVAL;
++	}
++	return len;
++}
++
++static const struct proc_ops sunxidrm_fault_test_ops = {
++	.proc_write = sunxidrm_fault_test_write,
++};
++
++void sunxidrm_debug_fault_test_init(struct proc_dir_entry *dir)
++{
++	proc_create("fault-test", 0200, dir, &sunxidrm_fault_test_ops);
++}
++
++/* a7a-fedora: does [iova, iova+size) overlap a buffer committed to a DE plane recently (the last 64 updates)? */
++static bool sunxidrm_debug_unmap_watch(unsigned long iova, size_t size)
++{
++	unsigned long flags;
++	bool hit = false;
++	int id, i;
++
++	if (!dbgdat.init)
++		return false;
++	for (id = 0; id < DE_MAX_COUNT && !hit; id++) {
++		frame_trace_t *frame = dbgdat.frames[id];
++		spin_lock_irqsave(&frame->lock, flags);
++		for (i = 0; i < FRAME_TRACE_LEN; i++) {
++			trace_buf_t *t = &frame->data[i];
++			u64 start = t->dma_addr, end = start + (u64)t->pitches[0] * t->height;
++			if (!t->mapped || !t->dma_addr || !t->height)
++				continue;
++			if (iova < end && iova + size > start) {
++				hit = true;
++				break;
++			}
++		}
++		spin_unlock_irqrestore(&frame->lock, flags);
++	}
++	return hit;
++}
++
+ void sunxidrm_debug_init(struct platform_device *pdev)
+ {
+ 	int id = 0;
+@@ -185,6 +284,7 @@ void sunxidrm_debug_init(struct platform_device *pdev)
+ 		dev_info(&pdev->dev, "register iommu fault callback for sunxi-drm, master=%d\n", master);
+ 		sunxi_iommu_register_fault_cb(sunxidrm_debug_record_exception, master);
+ 	}
++	sunxi_iommu_register_unmap_watch(sunxidrm_debug_unmap_watch);
+ }
+ #endif
+ 
+@@ -249,6 +349,7 @@ void sunxidrm_debug_trace_frame(u32 crtc, u32 plane, struct drm_framebuffer *fb)
+ 	frame->data[index].plane = plane;
+ 	frame->data[index].update_ts = ktime_get();
+ 	frame->data[index].fb = fb;
++	frame->data[index].fb_id = fb ? fb->base.id : 0;
+ 	frame->data[index].mapped = 1;
+ 	if (fb && fb->format) {
+ 		frame->data[index].format = fb->format->format;
+diff --git a/drivers/drm/sunxi_drm_debug.h b/drivers/drm/sunxi_drm_debug.h
+index ebd2cc2..3019443 100644
+--- a/drivers/drm/sunxi_drm_debug.h
++++ b/drivers/drm/sunxi_drm_debug.h
+@@ -16,6 +16,8 @@
+ #include <linux/platform_device.h>
+ 
+ void sunxidrm_debug_init(struct platform_device *pdev);
++struct proc_dir_entry;
++void sunxidrm_debug_fault_test_init(struct proc_dir_entry *dir);
+ void sunxidrm_debug_term(void);
+ void sunxidrm_debug_trace_begin(u32 crtc);
+ void sunxidrm_debug_trace_frame(u32 crtc, u32 plane, struct drm_framebuffer *fb);
+diff --git a/drivers/drm/sunxi_drm_drv.c b/drivers/drm/sunxi_drm_drv.c
+index 19a9221..97993a9 100644
+--- a/drivers/drm/sunxi_drm_drv.c
++++ b/drivers/drm/sunxi_drm_drv.c
+@@ -33,6 +33,7 @@
+ #include <linux/proc_fs.h>
+ #include <linux/component.h>
+ #include <linux/platform_device.h>
++#include <linux/sched.h>
+ #include "sunxi_drm_drv.h"
+ #include "sunxi_drm_crtc.h"
+ #include "sunxi_drm_gem.h"
+@@ -100,8 +101,22 @@ static inline struct sunxi_drm_device *connector_to_sunxi_drm_device(struct drm_
+ 	return container_of(connector, struct sunxi_drm_device, connector);
+ }
+ 
++/* a7a-fedora buffer lifetime trace (see sunxi_gem_dma_free) */
++static void sunxi_drm_fb_trace(const char *what, struct drm_framebuffer *fb)
++{
++	struct drm_gem_dma_object *dma_obj = fb->obj[0] ? to_drm_gem_dma_obj(fb->obj[0]) : NULL;
++	dma_addr_t addr = dma_obj ? dma_obj->dma_addr : 0;
++
++	pr_info("sunxi-drm: fb %u %s %ux%u %p4cc mod=0x%llx pitch=%u dma_addr=%pad %s by %s[%d]\n",
++		fb->base.id, what, fb->width, fb->height, &fb->format->format,
++		fb->modifier, fb->pitches[0], &addr,
++		(fb->obj[0] && fb->obj[0]->import_attach) ? "imported" : "dumb",
++		current->comm, task_pid_nr(current));
++}
++
+ static void sunxi_drm_gem_fb_destroy(struct drm_framebuffer *fb)
+ {
++	sunxi_drm_fb_trace("destroy", fb);
+ 	sunxidrm_debug_trace_framebuffer_unmap(fb);
+ 	drm_gem_fb_destroy(fb);
+ }
+@@ -115,8 +130,12 @@ struct drm_framebuffer *
+ sunxi_drm_gem_fb_create(struct drm_device *dev, struct drm_file *file,
+ 			const struct drm_mode_fb_cmd2 *mode_cmd)
+ {
+-	return drm_gem_fb_create_with_funcs(dev, file, mode_cmd,
+-					    &sunxi_drm_gem_fb_funcs);
++	struct drm_framebuffer *fb = drm_gem_fb_create_with_funcs(dev, file, mode_cmd,
++								  &sunxi_drm_gem_fb_funcs);
++
++	if (!IS_ERR(fb))
++		sunxi_drm_fb_trace("create", fb);
++	return fb;
+ }
+ 
+ static int sunxi_drm_atomic_helper_commit(struct drm_device *dev,
+@@ -1193,6 +1212,7 @@ static int sunxi_drm_procfs_create(void)
+ static int sunxi_drm_procfs_init(struct drm_device *drm)
+ {
+ 	proc_create_single_data("debug", 444, proc_entry, sunxidrm_debug_show, NULL);
++	sunxidrm_debug_fault_test_init(proc_entry);
+ 
+ 	proc_create_single_data("status", 444, proc_entry,
+ 				sunxi_drm_procfs_status_show, drm);
+diff --git a/drivers/drm/sunxi_drm_gem.c b/drivers/drm/sunxi_drm_gem.c
+index 593e0cf..614afd9 100644
+--- a/drivers/drm/sunxi_drm_gem.c
++++ b/drivers/drm/sunxi_drm_gem.c
+@@ -12,6 +12,8 @@
+ 
+ #include <linux/dma-buf.h>
+ #include <linux/dma-direction.h>
++#include <linux/sched.h>
++#include <linux/printk.h>
+ #include <drm/drm.h>
+ #include <drm/drm_fb_helper.h>
+ #include <drm/drm_gem.h>
+@@ -133,6 +135,18 @@ void sunxi_gem_dma_free(struct sunxi_gem_object *sgem_obj)
+ 	struct drm_gem_object *gem_obj = &dma_obj->base;
+ 	struct iosys_map map = IOSYS_MAP_INIT_VADDR(dma_obj->vaddr);
+ 
++	/*
++	 * a7a-fedora buffer lifetime trace: the device address is what the
++	 * display engine scans out from; when it is unmapped under a plane
++	 * the DE faults on it (sunxi-iommu "Bug is in DE0 module").
++	 */
++	pr_info("sunxi-drm: gem free %s dma_addr=%pad size=%zu name=%d%s%s by %s[%d]\n",
++		gem_obj->import_attach ? "imported" : "dumb", &dma_obj->dma_addr,
++		gem_obj->size, gem_obj->name,
++		gem_obj->import_attach ? " exporter=" : "",
++		gem_obj->import_attach ? gem_obj->import_attach->dmabuf->exp_name : "",
++		current->comm, task_pid_nr(current));
++
+ 	if (gem_obj->import_attach) {
+ 		if (dma_obj->vaddr)
+ 			dma_buf_vunmap_unlocked(gem_obj->import_attach->dmabuf, &map);

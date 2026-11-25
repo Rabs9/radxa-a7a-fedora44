@@ -1,0 +1,16 @@
+# /etc/dnf/versionlock.toml of the Radxa Cubie A7A Fedora image (tools/master-image.sh).
+# Keeps the system on its Fedora release: Discover offers the next release ("Fedora 45" on 2026-11-17) and nothing in
+# it has run on this board; a release upgrade replaces the desktop, the graphics stack and the libraries the board's
+# GPU glue was built against. With this entry the upgrade stops at dnf's dependency resolution, before anything is
+# downloaded or changed. Updates within the release are not affected (44-x versions pass).
+# To upgrade anyway, at your own risk: sudo dnf versionlock delete fedora-release-common
+version = "1.0"
+
+[[packages]]
+name = "fedora-release-common"
+comment = "a7a: stay on the Fedora release this image was tested on"
+
+[[packages.conditions]]
+key = "evr"
+comparator = "<"
+value = "45"

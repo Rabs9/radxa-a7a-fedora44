@@ -1,0 +1,14 @@
+[Unit]
+Description=a7a: strip cap_sys_nice from kwin_wayland so LD_LIBRARY_PATH (the PowerVR DDK drop-in) is honoured
+# Fedora's kwin package sets cap_sys_nice on /usr/bin/kwin_wayland. A binary with file capabilities runs in the
+# dynamic loader's secure mode, which ignores LD_LIBRARY_PATH, LIBGL_DRIVERS_PATH and MESA_LOADER_DRIVER_OVERRIDE:
+# pvr-desktop's drop-in is then silently dropped and KWin starts on Fedora's mesa. The capability only ever gave
+# KWin real-time thread priority, which fails here anyway. Re-applied by every kwin update, hence this unit.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=-/usr/sbin/setcap -r /usr/bin/kwin_wayland
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,99 @@
+#!/bin/bash
+# pvr-desktop on|off|status|all|none: put Plasma's compositor (KWin) on the PowerVR DDK.
+#   on     KWin composites on the GPU: a systemd user drop-in gives plasma-kwin_wayland.service the DDK libraries and
+#          KWIN_COMPOSE=O2ES (the DDK is GLES-only). Xwayland's glamor lands on the DDK too, so X11 clients started with
+#          pvr-run render on the GPU (Wayland-native clients stay on mesa). Takes effect at the next login.
+#          'on --debug' also logs KWin's DRM backend (kwin_wayland_drm) to the journal.
+#   off    remove the drop-in (the rollback; works over ssh or the serial console). Next login composites in software.
+#   all    ALSO make the DDK the system-wide GL stack (/etc/ld.so.conf.d/00-pvr.conf) for an X11 session, where every
+#          app renders on the GPU like the Debian card did. Wayland clients cannot use the DDK's EGL (no Wayland platform).
+#   none   undo 'all' (keeps 'on' if set).
+set -e
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+DROP=/etc/systemd/user/plasma-kwin_wayland.service.d; CONF=/etc/ld.so.conf.d/00-pvr.conf; ENV=/etc/environment.d/90-pvr.conf
+# Tell every RUNNING user manager about the drop-in change: `systemctl reload user@<uid>.service` makes the manager
+# re-execute (user@.service is Type=notify-reload, ReloadSignal=RTMIN+25; what a systemd package update does), which
+# re-reads the unit files. Not `sudo -u <user> systemctl --user daemon-reload` (PAM: pam_systemd asks logind for a
+# session, and at boot, when a7a-gpu-session.service runs this before systemd-user-sessions.service, logind waits for
+# user@.service, which waits for that very service = a deadlock until the unit times out; reviewer, 2026-09-10), and
+# not `systemctl --user -M <user>@` either (a transient systemd-run service with PAMName=login per user). Only active
+# instances: at boot there are none (no linger on the board) and a queued start job is never waited for.
+reload_user_managers() {
+  local u
+  for u in $(systemctl list-units --plain --no-legend --state=active 'user@*.service' 2>/dev/null | sed -n 's/^\(user@[0-9]*\.service\).*/\1/p'); do
+    SYSTEMD_BUS_TIMEOUT=15s systemctl reload "$u" 2>/dev/null || true
+  done
+}
+# KWin 6.8 has no QPainter backend for real displays any more: KWIN_COMPOSE=Q there is "Could not fulfill the requested
+# compositing mode", KWin exits and the screen stays black (2026-11-16). Where it is gone, software compositing is
+# OpenGL ES on Mesa (llvmpipe). Read off the library, as a7a-gpu-session does, which rewrites a stale drop-in at boot
+# and when kwin is updated
+sw_compose() { if grep -qa DrmQPainterBackend /usr/lib64/libkwin.so.6 2>/dev/null; then echo Q; else echo O2ES; fi; }
+need_ddk() { [ -d /opt/pvr/lib ] && [ -f /lib/firmware/rgx.fw.36.56.104.183 ] || { echo "the DDK is not installed under /opt/pvr"; exit 1; }; [ -e /usr/local/lib/dri ] || ln -s /opt/pvr/lib/dri /usr/local/lib/dri; }
+case "${1:-status}" in
+  on)
+    # Before the pvr_show_fdinfo fix (tools/patches/0001-pvr_drm-fdinfo-null-connection.patch) a crash of any GPU client
+    # panicked the kernel, so a compositor experiment could freeze the board; with the fixed module a crash is just a crash.
+    if [ ! -f /etc/a7a/pvrsrvkm-fdinfo-fixed ] && [ "${2:-}" != "--force" ]; then
+      echo "REFUSED: this board's pvrsrvkm does not carry the fdinfo NULL-guard (marker /etc/a7a/pvrsrvkm-fdinfo-fixed missing);"
+      echo "a compositor crash on the DDK would panic the kernel (2026-09-07). Install the fixed module first (a7a-fedora: kernel"
+      echo "stage + update), or 'pvr-desktop on --force' if you accept a possible hard freeze."; exit 1; fi
+    need_ddk; mkdir -p "$DROP"; rm -f "$DROP/software.conf"
+    # Fedora's kwin package sets cap_sys_nice on kwin_wayland; a capability-bearing binary ignores LD_LIBRARY_PATH
+    # (loader secure mode), which silently defeats this drop-in. a7a-kwin-nocap.{path,service} keep it stripped.
+    setcap -r /usr/bin/kwin_wayland 2>/dev/null || true
+    cat > "$DROP/pvr.conf" <<EOF
+[Service]
+Environment=LD_LIBRARY_PATH=/opt/pvr/lib
+Environment=LIBGL_DRIVERS_PATH=/opt/pvr/lib/dri
+Environment=KWIN_COMPOSE=O2ES
+Environment=VK_ICD_FILENAMES=/opt/pvr/icd/powervr_icd.json
+Environment=MESA_LOADER_DRIVER_OVERRIDE=sunxi-drm
+Environment=KWIN_FORCE_SW_CURSOR=1
+Environment=KWIN_RENDER_NODES=/dev/dri/none
+EOF
+    # KWIN_RENDER_NODES=/dev/dri/none (KWin >= 6.7): KWin 6.7 pairs any platform-bus display device with the "most capable"
+    # platform render node, i.e. the GPU's renderD128, and the DDK's EGL on the render node reports every dma-buf format as
+    # external-only (not renderable), so no output configuration works (black screen, KWin never allocates a buffer).
+    # A render-node list that matches nothing makes KWin fall back to card0's own EGL, where the DDK offers LINEAR ARGB/XRGB
+    # as render targets (what KWin 6.6 used). Probe: tools/gpu-debug/egl-dmabuf-mods.c. Tested 2026-09-07 on KWin 6.7.4.
+    # 'pvr-desktop on --debug': KWin's DRM backend log (commits, modesets, buffers) into the journal, for the display-engine
+    # IOMMU fault investigation (docs/GPU-TQ-FAULT-2026-09-07.md); read it with journalctl --user -u plasma-kwin_wayland
+    [ "${2:-}" = "--debug" ] && echo "Environment=QT_LOGGING_RULES=kwin_wayland_drm.debug=true" >> "$DROP/pvr.conf"
+    # No XWAYLAND_NO_GLAMOR here, on purpose: Xwayland inherits this environment and its glamor runs on the DDK (card0 gbm
+    # device, DRI3 + Present enabled), which is what gives X11 clients the GPU (docs/XAPPS-ON-GPU-2026-09-08.md: glmark2-es2
+    # 1267 vs 136 in software; re-verified 2026-09-09 with a second rootless Xwayland: 1918, 0 hardware recoveries).
+    # The 2026-09-07 "Guilty Lockup, PID Xwayland" that made us set it was the 1200 MHz overclock plus the dma-buf exporter
+    # bug (patches 0005 + the 1008 MHz DTB), not glamor. Xwayland tries desktop GL first, fails on the DDK and falls back to
+    # GLES by itself: a "-glamor es" wrapper changes nothing but two log lines (measured 2026-09-09).
+    # MESA_LOADER_DRIVER_OVERRIDE=sunxi-drm: the DDK's loader cannot map the display node's kernel driver to its DRI driver on
+    # its own; Debian's Xorg wrapper set exactly this for the process that opens card0 (and nothing else, GLX clients break).
+    reload_user_managers
+    echo "KWin will composite on the PowerVR at the next login (log out and back in). 'pvr-desktop off' reverts." ;;
+  off)
+    rm -f "$DROP/pvr.conf"; mkdir -p "$DROP"
+    # KWin 6.7 with Fedora's mesa (llvmpipe) cannot create EGL images on this board (EGL_BAD_ALLOC, black screen after
+    # login, 2026-09-07): software compositing means KWin's QPainter backend (dumb buffers, no EGL), like the greeter,
+    # for as long as KWin has one (sw_compose above).
+    printf '[Service]\nEnvironment=KWIN_COMPOSE=%s\n' "$(sw_compose)" > "$DROP/software.conf"
+    reload_user_managers
+    echo "KWin drop-in removed: software compositing (KWIN_COMPOSE=$(sw_compose)) at the next login." ;;
+  all)
+    need_ddk; echo /opt/pvr/lib > "$CONF"; mkdir -p /etc/environment.d
+    # the X11 session: KWin composites with GLES on the DDK's EGL (X11 platform), Qt apps use EGL instead of GLX (the DDK has
+    # no GLX), the cursor plane workaround from the Debian card, the DDK's DRI driver and the Vulkan ICD for everything
+    printf 'KWIN_COMPOSE=O2ES\nQT_XCB_GL_INTEGRATION=xcb_egl\nKWIN_FORCE_SW_CURSOR=1\nLIBGL_DRIVERS_PATH=/opt/pvr/lib/dri\nVK_ICD_FILENAMES=/opt/pvr/icd/powervr_icd.json\n' > "$ENV"
+    # the login greeter is a Wayland KWin + QtQuick client: the DDK EGL has no Wayland platform, so keep it on software
+    mkdir -p /etc/systemd/system/plasmalogin.service.d
+    printf '[Service]\nEnvironment=QSG_RHI_BACKEND=software\nEnvironment=QT_QUICK_BACKEND=software\nEnvironment=KWIN_COMPOSE=%s\n' "$(sw_compose)" > /etc/systemd/system/plasmalogin.service.d/pvr.conf
+    systemctl daemon-reload; ldconfig
+    echo "DDK is now the system GL stack. Log out, choose 'Plasma (X11)' on the login screen, log in. 'pvr-desktop none' reverts." ;;
+  none)
+    rm -f "$CONF" "$ENV" /etc/systemd/system/plasmalogin.service.d/pvr.conf; rmdir /etc/systemd/system/plasmalogin.service.d 2>/dev/null || true
+    systemctl daemon-reload; ldconfig; echo "system-wide DDK removed (mesa again after a re-login)." ;;
+  status)
+    [ -f "$DROP/pvr.conf" ] && echo "on: KWin drop-in present ($DROP/pvr.conf)" || echo "off: KWin composites in software$([ -f "$DROP/software.conf" ] && echo " ($(sed -n 's/^Environment=//p' "$DROP/software.conf" | head -1))")"
+    [ -f "$CONF" ] && echo "all: DDK system-wide ($CONF)" || echo "system GL stack: mesa"
+    ls /opt/pvr/lib/libEGL.so.1 /lib/firmware/rgx.fw.* >/dev/null 2>&1 && echo "DDK: installed, firmware: present" || echo "DDK: incomplete" ;;
+  *) echo "usage: pvr-desktop on|off|all|none|status"; exit 1 ;;
+esac

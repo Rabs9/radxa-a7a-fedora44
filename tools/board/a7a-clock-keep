@@ -1,0 +1,15 @@
+#!/bin/bash
+# a7a-clock-keep: keep the time the next boot starts its clock from.
+# systemd (257 and later) sets the clock at boot to the newest of its own build time and the modification time of
+# /var/lib/systemd/timesync/clock (systemd(1), "System clock epoch"). systemd-timesyncd keeps that file; Fedora runs
+# chronyd instead, so nothing did, and a board without its clock battery started every boot at systemd's build date
+# until chronyd set the clock. What runs before chronyd saw the wrong date: PackageKit's offline updates (Discover's
+# "update and restart", right after sysinit) took packages signed after that date for signed in the future and
+# refused them, Fedora's as well as this project's (review 2026-11-24).
+# Run at boot and at shutdown (a7a-clock-keep.service) and every hour (a7a-clock-keep.timer). Only a clock chronyd
+# says is synchronised is kept: a wrong one would be the next boot's start, and the epoch only moves forward.
+#   A7A_CLOCK_FILE overrides the file (for the tests).
+set -u
+F=${A7A_CLOCK_FILE:-/var/lib/systemd/timesync/clock}
+chronyc -n tracking 2>/dev/null | grep -qE '^Leap status +: Normal$' || exit 0
+mkdir -p "${F%/*}" && touch "$F"

@@ -1,0 +1,27 @@
+#!/bin/bash
+# a7a-gpu-irq-affinity [cpulist]: put the GPU interrupt on the big cluster.
+#
+# The A733's GPU interrupt is a level interrupt with the default mask 0-7, and the kernel routes those to the
+# FIRST cpu in the mask, so every one of them lands on cpu0 — a little core (capacity 401 against 1024 on cpu6-7).
+# Moving it to the big cluster is worth ~+3.7% on a small client window (267-271 -> 277-280 fps, glmark2 through
+# the compositor) and nothing measurable on a large one, where the frame is dominated by KWin's own CPU time.
+# cpu6 alone and cpu7 alone are within noise of each other, so the whole big cluster is used: that also keeps
+# working if cpu6 is offline. docs/SPEED-2026-09-10.md, Item E 1(a).
+#
+# Run from /usr/lib/udev/rules.d/90-a7a-gpu-irq.rules when a driver binds to 1800000.gpu; safe to run by hand.
+set -u
+CPUS=${1:-6-7}
+
+# /proc/interrupts names the GPU interrupt in its last column ("gpu" under the open drm/imagination driver).
+# There is no sysfs attribute for a platform device's IRQ number, and the number is not stable across kernels.
+irq=$(awk '$NF ~ /^(gpu|pvr[a-z]*)$/ { sub(/:/, "", $1); print $1; exit }' /proc/interrupts)
+if [ -z "${irq:-}" ]; then
+  echo "a7a-gpu-irq-affinity: no GPU interrupt in /proc/interrupts (driver not bound yet?)" >&2
+  exit 0        # not an error: udev may run this before the driver requests its IRQ
+fi
+
+if ! echo "$CPUS" > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null; then
+  echo "a7a-gpu-irq-affinity: irq $irq will not take affinity $CPUS" >&2
+  exit 1
+fi
+echo "a7a-gpu-irq-affinity: irq $irq -> cpu $CPUS (effective $(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null))"

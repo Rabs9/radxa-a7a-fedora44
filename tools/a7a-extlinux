@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""a7a-extlinux: edit /boot/extlinux/extlinux.conf on the board without breaking the boot chain.
+
+  a7a-extlinux list                          entries, the default marked with *
+  a7a-extlinux add <release> [--default]     entry fedora-<release> cloned from the current default
+                                             (linux, fdtdir, append updated); --default makes it boot
+                                             first and moves the previous default right behind it (the
+                                             fallback: entry 2 at the menu, kept by prune)
+  a7a-extlinux fallback                      make the previous kernel the default again (rollback); with
+                                             --check-files the next entry whose files exist
+  a7a-extlinux default <label>               set the default entry
+  a7a-extlinux prune [--keep N]              drop the oldest fedora-* entries beyond N (recovery stays)
+  a7a-extlinux remove <label>                drop one entry (never the default; an absent label is not an
+                                             error: the kernel packages call this from %postun)
+  a7a-extlinux add-test <name> <release> <root>
+                                             entry test-<name>: this disk's kernel <release> with another
+                                             root (PARTUUID=..., PARTLABEL=..., /dev/sda3): a system on a USB
+                                             stick, tried without touching the one here. Never the default;
+                                             remove it with `remove test-<name>`
+Options: --conf PATH (default /boot/extlinux/extlinux.conf), --root DIR with --check-files to
+refuse a write that would make the entry just added, the new default (fallback, default) or the
+recovery entry point at a missing kernel or fdtdir (other entries are not judged: a stale
+hand-made entry must not block a kernel package's %post), --dry-run to print the result instead.
+The file is immutable on shipped images (chattr +i): it is cleared and restored around a write.
+Python 3 standard library only, so it runs on the board and in this project's tests.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+DEFAULT_CONF = "/boot/extlinux/extlinux.conf"
+
+
+@dataclass
+class Entry:
+    label: str
+    fields: Dict[str, str] = field(default_factory=dict)   # menu label, linux, fdtdir, initrd, append (in order)
+    indent: str = "    "
+
+
+@dataclass
+class Conf:
+    header: List[str] = field(default_factory=list)          # lines before the first label (timeout, default, menu title...)
+    entries: List[Entry] = field(default_factory=list)
+
+    @property
+    def default(self) -> Optional[str]:
+        for line in self.header:
+            m = re.match(r"^default\s+(\S+)", line)
+            if m:
+                return m.group(1)
+        return None
+
+    @default.setter
+    def default(self, label: str) -> None:
+        for i, line in enumerate(self.header):
+            if re.match(r"^default\s+", line):
+                self.header[i] = f"default {label}"
+                return
+        self.header.insert(0, f"default {label}")
+
+    def entry(self, label: str) -> Optional[Entry]:
+        return next((e for e in self.entries if e.label == label), None)
+
+
+def parse(text: str) -> Conf:
+    conf = Conf()
+    cur: Optional[Entry] = None
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        m = re.match(r"^label\s+(\S+)", line)
+        if m:
+            cur = Entry(m.group(1))
+            conf.entries.append(cur)
+            continue
+        if cur is None:
+            if line.strip() or conf.header:
+                conf.header.append(line)
+            continue
+        if not line.strip():
+            continue
+        indent = re.match(r"^(\s*)", line).group(1) or "    "
+        cur.indent = indent
+        body = line.strip()
+        m = re.match(r"^(menu label|linux|fdtdir|fdt|initrd|append|devicetree)\s+(.*)$", body)
+        if m:
+            cur.fields[m.group(1)] = m.group(2).strip()
+        else:
+            k, _, v = body.partition(" ")
+            cur.fields[k] = v.strip()
+    while conf.header and not conf.header[-1].strip():
+        conf.header.pop()
+    return conf
+
+
+def render(conf: Conf) -> str:
+    out = list(conf.header)
+    for e in conf.entries:
+        out.append("")
+        out.append(f"label {e.label}")
+        for k, v in e.fields.items():
+            out.append(f"{e.indent}{k} {v}")
+    return "\n".join(out) + "\n"
+
+
+def is_test(entry: Entry) -> bool:
+    return entry.label.startswith("test-")
+
+
+def is_recovery(entry: Entry) -> bool:
+    return entry.label.endswith("-recovery") and not is_test(entry)
+
+
+def kernel_entries(conf: Conf) -> List[Entry]:
+    """The entries that boot this system with one of its kernels: not recovery, not a test entry (another root)."""
+    return [e for e in conf.entries if not is_recovery(e) and not is_test(e)]
+
+
+# a release goes into the label and into two path names: nothing that could start another word or another line there
+RELEASE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+
+
+def dtb_dir(release: str, like: Optional[Entry]) -> str:
+    """fdtdir of an entry for <release>: the kernel package's device trees, or the standard ones beside them
+    (/usr/lib/linux-image-<release>-standard/, the vendor's clocks: tools/standard-dtb.sh) when the entry it is
+    modelled on boots those. A standard system stays standard through a kernel update; a kernel that comes without
+    its standard device tree then fails --check-files instead of booting the overclocked one unasked."""
+    standard = like is not None and like.fields.get("fdtdir", "").rstrip("/").endswith("-standard")
+    return f"/usr/lib/linux-image-{release}{'-standard' if standard else ''}/"
+
+
+def release_of(entry: Entry) -> Optional[str]:
+    m = re.search(r"vmlinuz-(\S+)$", entry.fields.get("linux", ""))
+    return m.group(1) if m else None
+
+
+def add_kernel(conf: Conf, release: str, make_default: bool = False) -> Entry:
+    if not RELEASE.fullmatch(release):
+        raise ValueError(f"release {release!r} is not a kernel release (letters, digits and . _ + - only)")
+    label = f"fedora-{release}"
+    existing = conf.entry(label)
+    base = conf.entry(conf.default or "")
+    if base is None or is_test(base):       # a test entry boots another disk's system: never what a kernel's entry is cloned from
+        base = (kernel_entries(conf) or conf.entries or [None])[0]
+    if base is None:
+        raise SystemExit("extlinux.conf has no entries to clone from")
+    if existing is None:
+        fields = dict(base.fields)
+        fields["linux"] = f"/boot/vmlinuz-{release}"
+        fields["fdtdir"] = dtb_dir(release, base)
+        fields.pop("initrd", None)
+        old_rel = release_of(base)
+        ml = fields.get("menu label", f"Fedora, Linux {release}")
+        fields["menu label"] = ml.replace(old_rel, release) if old_rel and old_rel in ml else f"Fedora 44 KDE, Linux {release}"
+        existing = Entry(label, fields, base.indent)
+        conf.entries.insert(0 if make_default else 1, existing)
+    if make_default:
+        conf.entries.remove(existing)
+        conf.entries.insert(0, existing)
+        conf.default = label
+        if base is not existing and base in conf.entries:
+            # the previous default becomes the fallback: entry 2 at the menu, first pick for `fallback`, kept by `prune`
+            conf.entries.remove(base)
+            conf.entries.insert(1, base)
+        rec = next((e for e in conf.entries if is_recovery(e)), None)
+        if rec is not None:          # recovery boots the same kernel as the default, single user
+            rec.fields["linux"] = existing.fields["linux"]
+            rec.fields["fdtdir"] = existing.fields["fdtdir"]
+            rec.fields["menu label"] = re.sub(r"Linux \S+,", f"Linux {release},", rec.fields.get("menu label", ""))
+    return existing
+
+
+# what the kernel resolves by itself: there is no initramfs here, so no UUID= and no LABEL= (those are udev's)
+TEST_ROOT = re.compile(r"PARTUUID=[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}|PARTLABEL=[A-Za-z0-9_.-]+|/dev/[a-z]+[0-9a-z]*")
+TEST_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+
+
+def add_test_entry(conf: Conf, name: str, release: str, root: str) -> Entry:
+    """Entry test-<name>: the kernel and DTB <release> of THIS disk with another root filesystem, e.g. an image on a
+    USB stick (root=PARTUUID=<its partition 3>). For trying a system without giving up the one on this card: never
+    the default, behind the kernels and in front of recovery, replaced when it exists; fallback and prune do not see
+    it. The other system must hold the modules of <release>."""
+    # fullmatch: with match and "$" a trailing newline passes, and the three values are written into the boot menu
+    if not TEST_NAME.fullmatch(name):
+        raise ValueError(f"test entry name {name!r}: lower-case letters, digits and - only")
+    if not RELEASE.fullmatch(release):
+        raise ValueError(f"release {release!r} is not a kernel release (letters, digits and . _ + - only)")
+    if not TEST_ROOT.fullmatch(root):
+        raise ValueError(f"root {root!r}: PARTUUID=<partition GUID>, PARTLABEL=<name> or /dev/<partition> "
+                         "(UUID= and LABEL= need an initramfs, which this boot chain does not have)")
+    base = conf.entry(f"fedora-{release}") or conf.entry(conf.default or "") or (kernel_entries(conf) or conf.entries or [None])[0]
+    if base is None:
+        raise SystemExit("extlinux.conf has no entries to clone from")
+    fields = dict(base.fields)
+    fields["linux"] = f"/boot/vmlinuz-{release}"
+    fields["fdtdir"] = dtb_dir(release, base)
+    fields.pop("initrd", None)
+    fields["menu label"] = f"TEST {name}: root on {root}, Linux {release}"
+    words = [w for w in fields.get("append", "").split() if not w.startswith("root=") and w != "rootwait"]
+    fields["append"] = " ".join([f"root={root}", "rootwait"] + words)
+    old = conf.entry(f"test-{name}")
+    if old is not None:
+        conf.entries.remove(old)
+    entry = Entry(f"test-{name}", fields, base.indent)
+    at = next((i for i, e in enumerate(conf.entries) if is_recovery(e)), len(conf.entries))
+    conf.entries.insert(at, entry)
+    return entry
+
+
+def point_recovery_at(conf: Conf, kernel: Entry) -> None:
+    """The recovery entries boot the given kernel, single user (what `add --default` does for a new default)."""
+    rel = release_of(kernel)
+    for rec in (e for e in conf.entries if is_recovery(e)):
+        rec.fields["linux"] = kernel.fields["linux"]
+        if "fdtdir" in kernel.fields:
+            rec.fields["fdtdir"] = kernel.fields["fdtdir"]
+        if rel:
+            rec.fields["menu label"] = re.sub(r"Linux \S+,", f"Linux {rel},", rec.fields.get("menu label", ""))
+
+
+def fallback(conf: Conf, root: Optional[Path] = None) -> Optional[str]:
+    """Make the previous kernel entry the default (and the kernel recovery boots); returns its label. With root,
+    entries whose kernel or fdtdir is missing under it are skipped (the kernel packages' %postun after an erase),
+    so the next BOOTABLE entry wins; None when there is none."""
+    kernels = kernel_entries(conf)
+    cur = conf.entry(conf.default or "")
+    prev = next((e for e in kernels if e is not cur and (root is None or not check_files(conf, root, [e.label]))), None)
+    if prev is None:
+        return None
+    conf.entries.remove(prev)
+    conf.entries.insert(0, prev)
+    conf.default = prev.label
+    point_recovery_at(conf, prev)
+    return prev.label
+
+
+def prune(conf: Conf, keep: int = 2) -> List[str]:
+    kernels = kernel_entries(conf)
+    default = conf.entry(conf.default or "")
+    keepers = [default] if default in kernels else []
+    for e in kernels:
+        if len(keepers) >= keep:
+            break
+        if e not in keepers:
+            keepers.append(e)
+    removed = [e.label for e in kernels if e not in keepers]
+    conf.entries = [e for e in conf.entries if e not in kernels or e in keepers]
+    return removed
+
+
+def remove_entry(conf: Conf, label: str) -> Optional[str]:
+    """Drop one entry; returns its label, None when absent. The default entry is refused (ValueError)."""
+    entry = conf.entry(label)
+    if entry is None:
+        return None
+    if label == conf.default:
+        raise ValueError(f"{label} is the default entry; set another default first (a7a-extlinux default <label>)")
+    conf.entries.remove(entry)
+    # a recovery entry that booted the removed kernel follows the default kernel instead
+    default = conf.entry(conf.default or "")
+    if default is not None and default in kernel_entries(conf) and any(
+            is_recovery(e) and e.fields.get("linux") == entry.fields.get("linux") for e in conf.entries):
+        point_recovery_at(conf, default)
+    return label
+
+
+def check_files(conf: Conf, root: Path, labels: Optional[List[str]] = None) -> List[str]:
+    """Kernel images and fdtdirs that do not exist under root, for the given entries (default: all of them)."""
+    missing = []
+    for e in conf.entries:
+        if labels is not None and e.label not in labels:
+            continue
+        for key in ("linux", "initrd"):
+            if key in e.fields and not (root / e.fields[key].lstrip("/")).exists():
+                missing.append(f"{e.label}: {e.fields[key]}")
+        if "fdtdir" in e.fields and not (root / e.fields["fdtdir"].strip("/")).is_dir():
+            missing.append(f"{e.label}: {e.fields['fdtdir']}")
+    return missing
+
+
+def write(path: Path, text: str) -> None:
+    immutable = False
+    if os.geteuid() == 0 and path.exists():
+        r = subprocess.run(["lsattr", str(path)], capture_output=True, text=True)
+        immutable = r.returncode == 0 and "i" in r.stdout.split()[0]
+        if immutable:
+            subprocess.run(["chattr", "-i", str(path)], check=False)
+    backup = path.with_name(path.name + ".prev")
+    if path.exists():
+        backup.write_text(path.read_text())
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+    if immutable:
+        subprocess.run(["chattr", "+i", str(path)], check=False)
+
+
+def main(argv: Optional[List[str]] = None) -> Tuple[int, str]:
+    ap = argparse.ArgumentParser(prog="a7a-extlinux", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--conf", default=DEFAULT_CONF)
+    ap.add_argument("--root", default="/")
+    ap.add_argument("--check-files", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    a = sub.add_parser("add"); a.add_argument("release"); a.add_argument("--default", action="store_true")
+    sub.add_parser("fallback")
+    d = sub.add_parser("default"); d.add_argument("label")
+    p = sub.add_parser("prune"); p.add_argument("--keep", type=int, default=2)
+    r = sub.add_parser("remove"); r.add_argument("label")
+    t = sub.add_parser("add-test"); t.add_argument("name"); t.add_argument("release"); t.add_argument("test_root", metavar="root")
+    args = ap.parse_args(argv)
+    path = Path(args.conf)
+    if not path.exists():
+        return 1, f"{path} does not exist"
+    conf = parse(path.read_text())
+    out: List[str] = []
+    changed = False
+    touched: Optional[List[str]] = None      # entries --check-files judges; None = the write needs no check
+    recovery = [e.label for e in conf.entries if is_recovery(e)]
+    if args.cmd == "list":
+        for i, e in enumerate(conf.entries, 1):
+            out.append(f"{'*' if e.label == conf.default else ' '} {e.label} [{i}] {e.fields.get('linux', '?')} {e.fields.get('fdtdir', '')}")
+    elif args.cmd == "add":
+        try:
+            add_kernel(conf, args.release, make_default=args.default)
+        except ValueError as e:
+            return 1, str(e)
+        out.append(f"added fedora-{args.release}" + (" as default" if args.default else ""))
+        changed = True
+        touched = [f"fedora-{args.release}"] + (recovery if args.default else [])
+    elif args.cmd == "add-test":
+        try:
+            entry = add_test_entry(conf, args.name, args.release, args.test_root)
+        except ValueError as e:
+            return 1, str(e)
+        out.append(f"added {entry.label}: Linux {args.release} with root={args.test_root} (entry {conf.entries.index(entry) + 1} at the menu; "
+                   f"the default stays {conf.default})")
+        changed = True
+        touched = [entry.label]
+    elif args.cmd == "fallback":
+        prev = fallback(conf, Path(args.root) if args.check_files else None)
+        if prev is None:
+            return 1, "no previous kernel entry to fall back to" + (" whose kernel and fdtdir exist" if args.check_files else "")
+        out.append(f"default is now {prev}")
+        changed = True
+        touched = [prev] + recovery
+    elif args.cmd == "default":
+        if conf.entry(args.label) is None:
+            return 1, f"no entry {args.label}; have: {', '.join(e.label for e in conf.entries)}"
+        if is_test(conf.entry(args.label)):
+            # as the default it would be what the next kernel's entry is cloned from (root= of the other disk included),
+            # and a board that boots it unattended runs another system than the one that is being administered
+            return 1, f"{args.label} is a test entry (another disk's system): it is chosen at the boot menu, not made the default"
+        conf.default = args.label
+        out.append(f"default is now {args.label}")
+        changed = True
+        touched = [args.label]
+    elif args.cmd == "prune":
+        removed = prune(conf, keep=args.keep)
+        out.append("removed: " + (", ".join(removed) or "nothing"))
+        changed = bool(removed)
+    elif args.cmd == "remove":
+        try:
+            gone = remove_entry(conf, args.label)
+        except ValueError as e:
+            return 1, str(e)
+        if gone is None:
+            return 0, f"no entry {args.label}; nothing to remove"
+        out.append(f"removed {gone}")
+        changed = True
+    if changed and args.check_files and touched is not None:
+        missing = check_files(conf, Path(args.root), touched)
+        if missing:
+            return 1, "refusing to write: missing " + "; ".join(missing)
+    if changed:
+        text = render(conf)
+        if args.dry_run:
+            out.append(text)
+        else:
+            write(path, text)
+    return 0, "\n".join(out)
+
+
+if __name__ == "__main__":
+    rc, text = main()
+    print(text)
+    sys.exit(rc)

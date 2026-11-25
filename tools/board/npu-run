@@ -1,0 +1,8 @@
+#!/bin/bash
+# npu-run <program...>: run a VIPLite (Vivante VIP9000 NPU) program with the SDK's libraries on the path.
+#   cd ~/ai-sdk/examples/resnet50 && npu-run ./resnet50 model/v3/resnet50.nb input_data/dog_224_224.jpg
+# The demo binaries also want OpenCV 4.10 sonames: `sudo dnf install opencv` once, then
+#   for l in core imgcodecs imgproc; do sudo ln -s /usr/lib64/libopencv_$l.so.4?? /opt/pvr/lib/libopencv_$l.so.410; done
+SDK=${A7A_AI_SDK:-/home/radxa/ai-sdk}
+export LD_LIBRARY_PATH=/opt/pvr/lib:$SDK/viplite-tina/lib/glibc-gcc11_3_0/v1.13${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+exec "$@"

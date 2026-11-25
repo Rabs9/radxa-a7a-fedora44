@@ -1,0 +1,30 @@
+From f6c6adef9f17c513506f2a38a3d7f0a7134317f9 Mon Sep 17 00:00:00 2001
+From: Feng Zhang <feng@radxa.com>
+Date: Mon, 19 Oct 2026 10:25:32 +0800
+Subject: [PATCH] fix(drm): retry HDMI DDC writes with the same byte
+
+The DDC write loop advances both the data pointer and register address
+before checking completion. On an I2C error, it restores only the
+address and remaining length, so retries send the next byte and can read
+past a short payload.
+
+Rewind the data pointer together with the register address before
+retrying. Preserve the existing retry count and error returns.
+
+Signed-off-by: Feng Zhang <feng@radxa.com>
+---
+ drivers/drm/sunxi_device/hardware/lowlevel_hdmi20/dw_i2cm.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/drm/sunxi_device/hardware/lowlevel_hdmi20/dw_i2cm.c b/drivers/drm/sunxi_device/hardware/lowlevel_hdmi20/dw_i2cm.c
+index 8a89d713..9aab3daa 100644
+--- a/drivers/drm/sunxi_device/hardware/lowlevel_hdmi20/dw_i2cm.c
++++ b/drivers/drm/sunxi_device/hardware/lowlevel_hdmi20/dw_i2cm.c
+@@ -177,6 +177,7 @@ int _dw_i2cm_write(unsigned char *buf, unsigned int length)
+ 			hdmi_err("dw i2c write error, retry count: %d\n", retry_cnt);
+ 			if (retry_cnt) {
+ 				length++;
++				buf--;
+ 				i2cm->slave_reg--;
+ 				retry_cnt--;
+ 				continue;

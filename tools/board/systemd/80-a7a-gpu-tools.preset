@@ -1,0 +1,3 @@
+# a7a-gpu-tools: the session unit runs at every boot; the nocap units are enabled/disabled by it per boot, never by
+# the package (Fedora's 99-default-disable.preset leaves them disabled).
+enable a7a-gpu-session.service

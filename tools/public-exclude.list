@@ -1,0 +1,27 @@
+# tools/public-export.sh: paths of the development repository (Gitea) that the public copy leaves out.
+# One shell glob per line, relative to the repository's root; a directory takes everything in it.
+# Session logs, hand-overs and plans written for the next session, drafts of mails, scratch scripts:
+SESSION.md
+SESSION-full.md
+PROGRESS.md
+HANDOFF-WAYLAND.md
+FEATURES.md
+PLAN.md
+notes
+# the open-stack backport's scratch scripts (its patch, compat header, includes and firmware are build inputs: kept)
+powervr-backport/*.sh
+powervr-backport/*.py
+powervr-backport/HANDOFF-*.md
+docs/NEXT-SESSION-PROMPT.md
+# the development logs of the sessions since 2026-11-15 and the owner's hardware test notes (stories of the owner's
+# home, network and days; the release carries a test record of its own)
+docs/RADXA-SYNC-2026-11-15.md
+docs/HARDWARE-CHECKLIST.md
+docs/superpowers
+# the run log of one builder's machine (src/registry.py writes a new one) and its local settings
+registry.json
+# (a7a-fedora.json: untracked since 2026-11-24, .gitignore keeps it out)
+# the rules of a coding assistant used for this repository
+.clinerules
+# a patch kept beside the one in use, never applied
+tools/patches/*.new

@@ -1,0 +1,12 @@
+# a7a-board-tools: the same as a7a-clock-keep.service at shutdown, every hour (a board that loses its power never
+# shuts down). Enabled by the package itself (a link in /usr/lib/systemd/system/timers.target.wants).
+[Unit]
+Description=Keep the time the next boot starts its clock from, every hour (a7a)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Unit=a7a-clock-keep-tick.service
+
+[Install]
+WantedBy=timers.target

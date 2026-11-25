@@ -1,0 +1,49 @@
+drm: build the upstream drm_gpuvm.c and drivers/gpu/drm/imagination in the 6.6 tree (a7a-fedora open GPU stack)
+
+DRM_GPUVM as a symbol, imagination/ in Kconfig and the Makefile, drm_gpuva_mgr.o out of drm.ko (drm_gpuvm.c
+replaces it; nouveau, its only other user, is off in this build), and the driver's compat header
+(pvr_compat66.h, injected by tools/pvr-graft.sh) for drm_gpuvm.o too: master's drm_gpuvm.c uses kzalloc_obj(),
+init_llist_node(), the two-argument drm_exec_for_each_locked_object() and the three-argument drm_exec_init().
+
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -217,6 +217,14 @@
+ 	help
+ 	  Execution context for command submissions
+ 
++config DRM_GPUVM
++	tristate
++	depends on DRM
++	select DRM_EXEC
++	help
++	  GPU-VM representation providing helpers to manage a GPUs virtual
++	  address space
++
+ config DRM_BUDDY
+ 	tristate
+ 	depends on DRM
+@@ -436,3 +444,5 @@
+ config DRM_PRIVACY_SCREEN
+ 	bool
+ 	default n
++
++source "drivers/gpu/drm/imagination/Kconfig"
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -45,7 +45,6 @@
+ 	drm_vblank.o \
+ 	drm_vblank_work.o \
+ 	drm_vma_manager.o \
+-	drm_gpuva_mgr.o \
+ 	drm_writeback.o
+ drm-$(CONFIG_DRM_LEGACY) += \
+ 	drm_agpsupport.o \
+@@ -198,3 +197,8 @@
+ obj-y			+= solomon/
+ obj-$(CONFIG_DRM_SPRD) += sprd/
+ obj-$(CONFIG_DRM_LOONGSON) += loongson/
++
++# a7a open GPU stack: upstream drm_gpuvm.c (replaces 6.6's drm_gpuva_mgr.c) built with the driver's compat header
++CFLAGS_drm_gpuvm.o += -include $(srctree)/$(src)/imagination/pvr_compat66.h -I$(srctree)/$(src)/imagination/compat-include
++obj-$(CONFIG_DRM_GPUVM) += drm_gpuvm.o
++obj-$(CONFIG_DRM_POWERVR) += imagination/

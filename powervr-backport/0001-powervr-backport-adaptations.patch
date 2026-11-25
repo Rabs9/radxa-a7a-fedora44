@@ -1,0 +1,142 @@
+--- a/drivers/gpu/drm/drm_gpuvm.c
++++ b/drivers/gpu/drm/drm_gpuvm.c
+@@ -1250,7 +1250,7 @@
+ 	unsigned int num_fences = vm_exec->num_fences;
+ 	int ret;
+ 
+-	drm_exec_init(exec, vm_exec->flags, 0);
++	drm_exec_init(exec, vm_exec->flags);
+ 
+ 	drm_exec_until_all_locked(exec) {
+ 		ret = drm_gpuvm_prepare_vm(gpuvm, exec, num_fences);
+@@ -1341,7 +1341,7 @@
+ 	struct drm_exec *exec = &vm_exec->exec;
+ 	int ret;
+ 
+-	drm_exec_init(exec, vm_exec->flags, 0);
++	drm_exec_init(exec, vm_exec->flags);
+ 
+ 	drm_exec_until_all_locked(exec) {
+ 		ret = drm_gpuvm_prepare_range(gpuvm, exec, addr, range,
+--- a/drivers/gpu/drm/imagination/pvr_job.c
++++ b/drivers/gpu/drm/imagination/pvr_job.c
+@@ -746,7 +746,7 @@
+ 	if (err)
+ 		goto out_job_data_cleanup;
+ 
+-	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT | DRM_EXEC_IGNORE_DUPLICATES, 0);
++	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT | DRM_EXEC_IGNORE_DUPLICATES);
+ 
+ 	xa_init_flags(&signal_array, XA_FLAGS_ALLOC);
+ 
+--- a/drivers/gpu/drm/imagination/pvr_queue.c
++++ b/drivers/gpu/drm/imagination/pvr_queue.c
+@@ -1085,7 +1085,7 @@
+ 	if (!pvr_cccb_cmdseq_can_fit(&queue->cccb, job_cmds_size(job, min_native_dep_count)))
+ 		return -E2BIG;
+ 
+-	err = drm_sched_job_init(&job->base, &queue->entity, 1, THIS_MODULE);
++	err = drm_sched_job_init(&job->base, &queue->entity, THIS_MODULE);
+ 	if (err)
+ 		return err;
+ 
+@@ -1284,7 +1284,7 @@
+ 
+ 	err = drm_sched_init(&queue->scheduler,
+ 			     &pvr_queue_sched_ops,
+-			     pvr_dev->sched_wq, 1, 64 * 1024, 1,
++			     64 * 1024, 1,
+ 			     msecs_to_jiffies(500),
+ 			     pvr_dev->sched_wq, NULL, "pvr-queue",
+ 			     pvr_dev->base.dev);
+--- a/drivers/gpu/drm/imagination/pvr_rogue_heap_config.h
++++ b/drivers/gpu/drm/imagination/pvr_rogue_heap_config.h
+@@ -7,6 +7,17 @@
+ #include <linux/sizes.h>
+ 
+ /*
++ * backport: 6.6 sizes.h stops at SZ_32G. Scoped here rather than added to the
++ * core header, which is included almost kernel-wide.
++ */
++#ifndef SZ_64G
++#define SZ_64G				_AC(0x1000000000, ULL)
++#endif
++#ifndef SZ_128G
++#define SZ_128G				_AC(0x2000000000, ULL)
++#endif
++
++/*
+  * ROGUE Device Virtual Address Space Definitions
+  *
+  * This file defines the ROGUE virtual address heaps that are used in
+--- a/include/drm/drm_gem.h
++++ b/include/drm/drm_gem.h
+@@ -634,4 +634,27 @@
+ #define drm_gem_for_each_gpuva_safe(entry__, next__, obj__) \
+ 	list_for_each_entry_safe(entry__, next__, &(obj__)->gpuva.list, gem.entry)
+ 
++/**
++ * drm_gem_for_each_gpuvm_bo() - iterator to walk over a list of &drm_gpuvm_bo
++ * @entry__: &drm_gpuvm_bo structure to assign to in each iteration step
++ * @obj__: the &drm_gem_object the &drm_gpuvm_bo to walk are associated with
++ *
++ * Backported from v6.8 for DRM_POWERVR. Walks the same obj->gpuva.list as
++ * drm_gem_for_each_gpuva(), at the &drm_gpuvm_bo container offset.
++ */
++#define drm_gem_for_each_gpuvm_bo(entry__, obj__) \
++	list_for_each_entry(entry__, &(obj__)->gpuva.list, list.entry.gem)
++
++/**
++ * drm_gem_for_each_gpuvm_bo_safe() - iterator to safely walk over a list of
++ * &drm_gpuvm_bo
++ * @entry__: &drm_gpuvm_bo structure to assign to in each iteration step
++ * @next__: &next &drm_gpuvm_bo to store the next step
++ * @obj__: the &drm_gem_object the &drm_gpuvm_bo to walk are associated with
++ *
++ * Backported from v6.8 for DRM_POWERVR.
++ */
++#define drm_gem_for_each_gpuvm_bo_safe(entry__, next__, obj__) \
++	list_for_each_entry_safe(entry__, next__, &(obj__)->gpuva.list, list.entry.gem)
++
+ #endif /* __DRM_GEM_H__ */
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -217,6 +217,15 @@
+ 	help
+ 	  Execution context for command submissions
+ 
++
++config DRM_GPUVM
++	tristate
++	depends on DRM
++	select DRM_EXEC
++	help
++	  GPU-VM representation providing helpers to manage a GPUs virtual
++	  address space
++
+ config DRM_BUDDY
+ 	tristate
+ 	depends on DRM
+@@ -436,3 +445,5 @@
+ config DRM_PRIVACY_SCREEN
+ 	bool
+ 	default n
++
++source "drivers/gpu/drm/imagination/Kconfig"
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -45,7 +45,6 @@
+ 	drm_vblank.o \
+ 	drm_vblank_work.o \
+ 	drm_vma_manager.o \
+-	drm_gpuva_mgr.o \
+ 	drm_writeback.o
+ drm-$(CONFIG_DRM_LEGACY) += \
+ 	drm_agpsupport.o \
+@@ -198,3 +197,6 @@
+ obj-y			+= solomon/
+ obj-$(CONFIG_DRM_SPRD) += sprd/
+ obj-$(CONFIG_DRM_LOONGSON) += loongson/
++
++obj-$(CONFIG_DRM_GPUVM) += drm_gpuvm.o
++obj-$(CONFIG_DRM_POWERVR) += imagination/

@@ -1,0 +1,332 @@
+From: a7a-fedora
+Subject: [PATCH] pvrsrvkm: dma-buf exporter: map for the importer with the DMA API (A733: the display sits behind an IOMMU)
+
+PVRDmaBufOpsMapCommon() built one sg_table per PMR, shared by every attachment, and wrote the PMR's physical
+addresses straight into sg_dma_address()/sg_dma_len() without ever calling dma_map_sg(); PVRDmaBufOpsUnmapCommon()
+then called dma_unmap_sg() on the importer's device. Correct only for importers that address memory physically.
+On the Allwinner A733 the display engine (sunxi-drm) sits behind an IOMMU: the "DMA addresses" were unusable by it,
+and the unmatched dma_unmap_sg() made dma-iommu unmap a gigantic range of the shared IOMMU domain, destroying every
+other mapping (the compositor's scanout buffers first: the "Bug is in DE0 module" fault storms of
+docs/DE-IOMMU-STORM-2026-09-07.md) and spinning the importing thread in the kernel for minutes. KWin triggers the
+import when it tries direct scanout of a GPU client buffer.
+
+Now: one sg_table per map call, built from the PMR's pages (contiguous runs), mapped for the importer with
+dma_map_sg() (an IOMMU importer gets a contiguous IOVA, a direct-mapped one physical addresses, both with the right
+cache maintenance) and unmapped with dma_unmap_sg(). The PMR's pages stay locked while any mapping exists.
+
+Found 2026-09-07 with a SysRq backtrace of the spinning kwin_wayland thread:
+  __iommu_unmap <- iommu_dma_unmap_sg <- dma_unmap_sg_attrs <- PVRDmaBufOpsUnmapCommon <- dma_buf_unmap_attachment
+  <- drm_gem_prime_import_dev <- drm_prime_fd_to_handle_ioctl
+---
+diff --git a/services/server/env/linux/physmem_dmabuf.c b/services/server/env/linux/physmem_dmabuf.c
+index b6605c3..6e103cf 100644
+--- a/services/server/env/linux/physmem_dmabuf.c
++++ b/services/server/env/linux/physmem_dmabuf.c
+@@ -54,6 +54,9 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ #include <linux/slab.h>
+ #include <linux/dma-buf.h>
+ #include <linux/scatterlist.h>
++#include <linux/dma-mapping.h>
++#include <linux/mm.h>
++#include <linux/pfn.h>
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 5, 0))
+ #include <drm/drm_prime.h>
+ #else
+@@ -279,6 +282,20 @@ static struct sg_table *PVRDmaBufOpsMapCommon(PMR_DMA_BUF_WRAPPER *psPMRWrapper,
+                                               struct dma_buf_attachment *psAttachment,
+                                               enum dma_data_direction eDirection)
+ {
++	/*
++	 * a7a-fedora rewrite (docs/DE-IOMMU-STORM-2026-09-07.md). The original
++	 * built one sg_table per PMR, shared by every attachment, and wrote the
++	 * PMR's physical addresses straight into sg_dma_address()/sg_dma_len()
++	 * without ever calling dma_map_sg(): correct only for importers that
++	 * address memory physically. On the Allwinner A733 the display engine
++	 * (sunxi-drm) sits behind an IOMMU, so those "DMA addresses" were
++	 * unusable by it, and the matching dma_unmap_sg() on unmap wiped the
++	 * whole shared IOMMU domain. Now: one table per map call, built from
++	 * pages, mapped for the importer with dma_map_sg() (an IOMMU importer
++	 * gets a contiguous IOVA, a direct-mapped one gets physical addresses,
++	 * both with the right cache maintenance) and unmapped the same way. The
++	 * PMR's physical pages stay locked while any mapping exists.
++	 */
+ 	PVRSRV_ERROR eError;
+ 	PMR *psPMR = psPMRWrapper->psPMR;
+ 	IMG_UINT uiNents;
+@@ -289,22 +306,14 @@ static struct sg_table *PVRDmaBufOpsMapCommon(PMR_DMA_BUF_WRAPPER *psPMRWrapper,
+ 	IMG_BOOL abValid[PMR_MAX_TRANSLATION_STACK_ALLOC], *pbValid = abValid;
+ 	IMG_UINT32 i;
+ 	IMG_DEV_PHYADDR sPAddrPrev, sPAddrCurr;
++	IMG_UINT64 uiRunStart, uiRunLen;
+ 	struct sg_table *psTable;
+ 	struct scatterlist *psSg;
+-	int iRet = 0;
++	int iRet = 0, iMapped;
+ 	IMG_UINT32 uiDevPageShift, uiDevPageSize;
+ 
+ 	OSLockAcquire(psPMRWrapper->hDeviceMappingLock);
+ 
+-	psPMRWrapper->uiDeviceMappingRefCnt++;
+-
+-	if (psPMRWrapper->uiDeviceMappingRefCnt > 1)
+-	{
+-		goto OkUnlock;
+-	}
+-
+-	PVR_ASSERT(psPMRWrapper->psTable == NULL);
+-
+ 	uiDevPageShift = PMR_GetLog2Contiguity(psPMR);
+ 	uiDevPageSize = 1u << uiDevPageShift;
+ 	uiVirtSize = PMR_LogicalSize(psPMR);
+@@ -313,31 +322,29 @@ static struct sg_table *PVRDmaBufOpsMapCommon(PMR_DMA_BUF_WRAPPER *psPMRWrapper,
+ 	{
+ 		PVR_DPF((PVR_DBG_ERROR, "invalid PMR size"));
+ 		iRet = PVRSRVToNativeError(PVRSRV_ERROR_BAD_MAPPING);
+-		goto ErrUnlockMapping;
++		goto ErrUnlock;
+ 	}
+-
+-	PVR_DPF((PVR_DBG_MESSAGE, "%s(): mapping pmr: 0x%p@0x%" IMG_UINT64_FMTSPECx
+-	         " from heap: \"%s\" with page size: 0x%x", __func__, psPMR,
+-	         uiPhysSize, PhysHeapName(PMR_PhysHeap(psPMR)), uiDevPageSize));
+-
+ 	uiNumVirtPages = uiVirtSize >> uiDevPageShift;
+ 
+-	eError = PMRLockSysPhysAddresses(psPMR);
+-	if (eError != PVRSRV_OK)
++	if (psPMRWrapper->uiDeviceMappingRefCnt == 0)
+ 	{
+-		PVR_LOG_IF_ERROR(eError, "PMRLockSysPhysAddresses");
+-		iRet = PVRSRVToNativeError(eError);
+-		goto ErrUnlockMapping;
++		eError = PMRLockSysPhysAddresses(psPMR);
++		if (eError != PVRSRV_OK)
++		{
++			PVR_LOG_IF_ERROR(eError, "PMRLockSysPhysAddresses");
++			iRet = PVRSRVToNativeError(eError);
++			goto ErrUnlock;
++		}
++		PMR_SetLayoutFixed(psPMR, IMG_TRUE);
+ 	}
+-
+-	PMR_SetLayoutFixed(psPMR, IMG_TRUE);
++	psPMRWrapper->uiDeviceMappingRefCnt++;
+ 
+ 	psTable = OSAllocZMem(sizeof(*psTable));
+ 	if (psTable == NULL)
+ 	{
+ 		PVR_DPF((PVR_DBG_ERROR, "OSAllocMem.1() failed"));
+ 		iRet = -ENOMEM;
+-		goto ErrUnlockPhysAddresses;
++		goto ErrUnref;
+ 	}
+ 
+ 	if (uiNumVirtPages > PMR_MAX_TRANSLATION_STACK_ALLOC)
+@@ -349,18 +356,11 @@ static struct sg_table *PVRDmaBufOpsMapCommon(PMR_DMA_BUF_WRAPPER *psPMRWrapper,
+ 			iRet = -ENOMEM;
+ 			goto ErrFreeTable;
+ 		}
+-
+ 		psPAddr = IMG_OFFSET_ADDR(pvPAddrData, 0);
+ 		pbValid = IMG_OFFSET_ADDR(pvPAddrData, uiNumVirtPages * sizeof(*psPAddr));
+ 	}
+ 
+-	eError = PMR_DevPhysAddr(psPMR,
+-	                         uiDevPageShift,
+-	                         uiNumVirtPages,
+-	                         0,
+-	                         psPAddr,
+-	                         pbValid,
+-	                         DEVICE_USE);
++	eError = PMR_DevPhysAddr(psPMR, uiDevPageShift, uiNumVirtPages, 0, psPAddr, pbValid, DEVICE_USE);
+ 	if (eError != PVRSRV_OK)
+ 	{
+ 		PVR_LOG_ERROR(eError, "PMR_DevPhysAddr");
+@@ -368,45 +368,30 @@ static struct sg_table *PVRDmaBufOpsMapCommon(PMR_DMA_BUF_WRAPPER *psPMRWrapper,
+ 		goto ErrFreePAddrData;
+ 	}
+ 
+-	/* Calculate how many contiguous regions there are in the PMR. This
+-	 * value will be used to allocate one scatter list for every region. */
+-
+-	/* Find first valid physical address. */
++	/* Count the physically contiguous runs (one scatterlist entry each). */
+ 	for (i = 0; i < uiNumVirtPages && !pbValid[i]; i++);
+-
++	if (i == uiNumVirtPages)
++	{
++		PVR_DPF((PVR_DBG_ERROR, "PMR has no valid physical pages"));
++		iRet = -EINVAL;
++		goto ErrFreePAddrData;
++	}
+ 	sPAddrPrev = psPAddr[i];
+ 	uiNents = 1;
+-
+-	PVR_DPF((PVR_DBG_MESSAGE, "%s(): %03u paddr: 0x%" IMG_UINT64_FMTSPECx,
+-	         __func__, i, sPAddrPrev.uiAddr));
+-
+-	/* Find the rest of the addresses. */
+ 	for (i = i + 1; i < uiNumVirtPages; i++)
+ 	{
+ 		if (!pbValid[i])
+ 		{
+ 			continue;
+ 		}
+-
+ 		sPAddrCurr = psPAddr[i];
+-
+-		PVR_DPF((PVR_DBG_MESSAGE, "%s(): %03u paddr: 0x%" IMG_UINT64_FMTSPECx
+-		         ", pprev: 0x%" IMG_UINT64_FMTSPECx ", valid: %u", __func__,
+-		         i, sPAddrCurr.uiAddr, sPAddrPrev.uiAddr, pbValid[i]));
+-
+ 		if (sPAddrCurr.uiAddr != (sPAddrPrev.uiAddr + uiDevPageSize))
+ 		{
+ 			uiNents++;
+ 		}
+-
+ 		sPAddrPrev = sPAddrCurr;
+ 	}
+ 
+-	PVR_DPF((PVR_DBG_MESSAGE, "%s(): found %u contiguous regions", __func__,
+-	         uiNents));
+-
+-	/* Allocate scatter lists from all of the contiguous regions. */
+-
+ 	iRet = sg_alloc_table(psTable, uiNents, GFP_KERNEL);
+ 	if (iRet != 0)
+ 	{
+@@ -414,53 +399,56 @@ static struct sg_table *PVRDmaBufOpsMapCommon(PMR_DMA_BUF_WRAPPER *psPMRWrapper,
+ 		goto ErrFreePAddrData;
+ 	}
+ 
+-	/* Fill in all of the physical addresses and sizes for all of the
+-	 * contiguous regions that were calculated. */
+-
++	/* Fill the entries with the pages of each contiguous run. */
+ 	for (i = 0; i < uiNumVirtPages && !pbValid[i]; i++);
+-
+ 	psSg = psTable->sgl;
++	uiRunStart = psPAddr[i].uiAddr;
++	uiRunLen = uiDevPageSize;
+ 	sPAddrPrev = psPAddr[i];
+-
+-	sg_dma_address(psSg) = sPAddrPrev.uiAddr;
+-	sg_dma_len(psSg) = uiDevPageSize;
+-
+ 	for (i = i + 1; i < uiNumVirtPages; i++)
+ 	{
+ 		if (!pbValid[i])
+ 		{
+ 			continue;
+ 		}
+-
+ 		sPAddrCurr = psPAddr[i];
+-
+ 		if (sPAddrCurr.uiAddr != (sPAddrPrev.uiAddr + uiDevPageSize))
+ 		{
++			sg_set_page(psSg, pfn_to_page(PHYS_PFN(uiRunStart)), uiRunLen, 0);
+ 			psSg = sg_next(psSg);
+ 			PVR_ASSERT(psSg != NULL);
+-
+-			sg_dma_address(psSg) = sPAddrCurr.uiAddr;
+-			sg_dma_len(psSg) = uiDevPageSize;
++			uiRunStart = sPAddrCurr.uiAddr;
++			uiRunLen = uiDevPageSize;
+ 		}
+ 		else
+ 		{
+-			sg_dma_len(psSg) += uiDevPageSize;
++			uiRunLen += uiDevPageSize;
+ 		}
+-
+ 		sPAddrPrev = sPAddrCurr;
+ 	}
++	sg_set_page(psSg, pfn_to_page(PHYS_PFN(uiRunStart)), uiRunLen, 0);
+ 
+ 	if (pvPAddrData != NULL)
+ 	{
+ 		OSFreeMem(pvPAddrData);
++		pvPAddrData = NULL;
+ 	}
+ 
+-	psPMRWrapper->psTable = psTable;
++	iMapped = dma_map_sg(psAttachment->dev, psTable->sgl, psTable->orig_nents, eDirection);
++	if (iMapped <= 0)
++	{
++		PVR_DPF((PVR_DBG_ERROR, "dma_map_sg() failed for %s (%u entries)",
++		         dev_name(psAttachment->dev), uiNents));
++		iRet = -ENOMEM;
++		sg_free_table(psTable);
++		goto ErrFreeTable;
++	}
++	psTable->nents = iMapped;
++	PVR_DPF((PVR_DBG_MESSAGE, "%s(): mapped pmr 0x%p (%u runs -> %d dma segments) for %s", __func__,
++	         psPMR, uiNents, iMapped, dev_name(psAttachment->dev)));
+ 
+-OkUnlock:
+ 	OSLockRelease(psPMRWrapper->hDeviceMappingLock);
+-
+-	return psPMRWrapper->psTable;
++	return psTable;
+ 
+ ErrFreePAddrData:
+ 	if (pvPAddrData != NULL)
+@@ -469,15 +457,15 @@ ErrFreePAddrData:
+ 	}
+ ErrFreeTable:
+ 	OSFreeMem(psTable);
+-ErrUnlockPhysAddresses:
++ErrUnref:
++	psPMRWrapper->uiDeviceMappingRefCnt--;
++	if (psPMRWrapper->uiDeviceMappingRefCnt == 0)
+ 	{
+ 		PVRSRV_ERROR eError2 = PMRUnlockSysPhysAddresses(psPMR);
+ 		PVR_LOG_IF_ERROR(eError2, "PMRUnlockSysPhysAddresses");
+ 	}
+-ErrUnlockMapping:
+-	psPMRWrapper->uiDeviceMappingRefCnt--;
++ErrUnlock:
+ 	OSLockRelease(psPMRWrapper->hDeviceMappingLock);
+-
+ 	return ERR_PTR(iRet);
+ }
+ 
+@@ -488,30 +476,23 @@ static void PVRDmaBufOpsUnmapCommon(PMR_DMA_BUF_WRAPPER *psPMRWrapper,
+ {
+ 	PVRSRV_ERROR eError;
+ 
+-	OSLockAcquire(psPMRWrapper->hDeviceMappingLock);
++	/* undo exactly what PVRDmaBufOpsMapCommon() did for this attachment */
++	dma_unmap_sg(psAttachment->dev, psTable->sgl, psTable->orig_nents, eDirection);
++	sg_free_table(psTable);
++	OSFreeMem(psTable);
+ 
++	OSLockAcquire(psPMRWrapper->hDeviceMappingLock);
+ 	if (psPMRWrapper->uiDeviceMappingRefCnt == 0)
+ 	{
+ 		PVR_DPF((PVR_DBG_ERROR, "reference count on mapping already 0"));
+ 		goto ErrUnlock;
+ 	}
+-
+ 	psPMRWrapper->uiDeviceMappingRefCnt--;
+-
+-	if (psPMRWrapper->uiDeviceMappingRefCnt > 0)
++	if (psPMRWrapper->uiDeviceMappingRefCnt == 0)
+ 	{
+-		goto ErrUnlock;
++		eError = PMRUnlockSysPhysAddresses(psPMRWrapper->psPMR);
++		PVR_LOG_IF_ERROR(eError, "PMRUnlockSysPhysAddresses");
+ 	}
+-
+-	dma_unmap_sg(psAttachment->dev, psTable->sgl, psTable->nents, eDirection);
+-	sg_free_table(psTable);
+-
+-	eError = PMRUnlockSysPhysAddresses(psPMRWrapper->psPMR);
+-	PVR_LOG_IF_ERROR(eError, "PMRUnlockSysPhysAddresses");
+-
+-	OSFreeMem(psPMRWrapper->psTable);
+-	psPMRWrapper->psTable = NULL;
+-
+ ErrUnlock:
+ 	OSLockRelease(psPMRWrapper->hDeviceMappingLock);
+ }

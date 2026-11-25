@@ -1,0 +1,21 @@
+#!/bin/bash
+# pvr-wl-run <command...>: run one program on the vendor DDK through the Wayland-capable Mesa glue in /opt/pvr-wl
+# (tools/mesa-img/build-mesa-img.sh, docs/DDK-WAYLAND-2026-09-10.md) without changing the system GL stack: EGL on
+# Wayland, X11, GBM and surfaceless and GLES 1/2/3 (no GLX: the DDK has no desktop GL), plus the DDK's Vulkan for
+# offscreen/compute (its swapchains do not work: docs step 3). Only meaningful on the DDK kernel (pvrsrvkm bound).
+#   pvr-wl-run eglinfo -B        pvr-wl-run glmark2-es2-wayland        pvr-wl-run vulkaninfo --summary
+# PVR_WL_NO_OVERRIDE=1 leaves MESA_LOADER_DRIVER_OVERRIDE unset (the loader then picks the DRI driver from the
+# kernel driver name of the device it opens: sunxi-drm for card0, pvr for the render node).
+# PVR_WL_VK_ICDS=<json:json...> replaces the Vulkan driver list (default: the DDK's ICD only).
+[ -d /opt/pvr-wl/lib ] || { echo "pvr-wl-run: /opt/pvr-wl is missing (the Wayland-capable DDK Mesa is not installed)"; exit 1; }
+[ -d /opt/pvr/lib ] || { echo "pvr-wl-run: /opt/pvr/lib is missing (the DDK is not installed)"; exit 1; }
+# the closed DDK libraries through the package's lib/ddk links (only those seven); without them (a hand-unpacked tree)
+# all of /opt/pvr/lib, which also brings Radxa's libvulkan.so.1: a loader built WITHOUT Wayland support (no
+# vkCreateWaylandSurfaceKHR in it at all), so no Vulkan app can even ask for a Wayland surface through it
+DDK=/opt/pvr-wl/lib/ddk; [ -e "$DDK/libpvr_dri_support.so" ] || DDK=/opt/pvr/lib
+export LD_LIBRARY_PATH=/opt/pvr-wl/lib:$DDK${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+export LIBGL_DRIVERS_PATH=/opt/pvr-wl/lib/dri
+if [ "${PVR_WL_NO_OVERRIDE:-0}" = 1 ]; then unset MESA_LOADER_DRIVER_OVERRIDE
+else export MESA_LOADER_DRIVER_OVERRIDE=sunxi-drm; fi
+export VK_ICD_FILENAMES=${PVR_WL_VK_ICDS:-/opt/pvr/icd/powervr_icd.json}
+exec "$@"

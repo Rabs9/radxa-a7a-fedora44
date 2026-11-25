@@ -1,0 +1,328 @@
+#!/bin/bash
+# a7a-llm - run a local LLM on the Radxa Cubie A7A (Allwinner A733)
+# Companion to a7a-clock. Generation here is limited by the TWO A76 cores, not by
+# memory bandwidth (measured: the DRAM bus peaks at 16.4 GB/s and llama.cpp only
+# reaches 7.2). So the big cores must be awake: schedutil leaves the A76 pair idling
+# at ~780MHz (same bug that made SuperTuxKart lag), which costs a large chunk of tok/s.
+set -e
+
+MODELS=${A7A_LLM_MODELS:-$HOME/models}
+# llama.cpp: a build of its own in the home directory first (built for this CPU: the speeds below were measured with
+# one), else Fedora's package (sudo dnf install llama-cpp)
+if [ -z "${A7A_LLM_BIN:-}" ]; then
+  if [ -x "$HOME/llama.cpp/build/bin/llama-server" ]; then A7A_LLM_BIN=$HOME/llama.cpp/build/bin
+  elif command -v llama-server > /dev/null 2>&1; then A7A_LLM_BIN=$(dirname "$(command -v llama-server)")
+  else A7A_LLM_BIN=$HOME/llama.cpp/build/bin; fi
+fi
+BIN=$A7A_LLM_BIN
+PORT=${A7A_LLM_PORT:-8080}
+# This board only, unless asked: the API answers anyone who can reach it, and Fedora's desktop firewall leaves the
+# high ports open to the local network. A7A_LLM_HOST=0.0.0.0 shares it with the network.
+HOST=${A7A_LLM_HOST:-127.0.0.1}
+# MEASURED 2026-08-13 on this board, and it is the opposite of the usual advice:
+#   generation  -> 2 threads (the A76 pair).  Adding the 6 A55s made it 35% SLOWER
+#                  (4B: 3.12 t/s on 2 A76 vs 2.04 t/s on all 8) because ggml splits
+#                  work evenly and the slow cores stall the barrier every layer.
+#   prompt      -> all 8 threads (compute-bound, scales fine).
+# llama.cpp lets us have both: -t for generation, -tb for batch/prompt.
+THREADS=${A7A_LLM_THREADS:-2}
+THREADS_BATCH=${A7A_LLM_THREADS_BATCH:-8}
+# 8192: the Assistant's tool list, three exchanges and a few tool results overflowed 4096 (review, 2026-11-17); the
+# memory is reserved at start (about 1.2 GB for the 4B model), the speed depends on what is actually used. The
+# Assistant tab's settings may ask for another ("context" in a7a-panel's assistant.json: 4096, 8192 or 16384);
+# A7A_LLM_CTX wins over them.
+settings_ctx() {
+  python3 - "${XDG_CONFIG_HOME:-$HOME/.config}/a7a-panel/assistant.json" 2>/dev/null <<'PY'
+import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("context")
+except Exception:
+    v = None
+print(v if type(v) is int and v in (4096, 8192, 16384) else "")   # (16384.0 == 16384 in Python, not in bash)
+PY
+}
+CTX=${A7A_LLM_CTX:-$(settings_ctx || true)}   # (set -e: no python3 must not end every command)
+CTX=${CTX:-8192}
+# Q4_0 not Q4_K_M: llama.cpp repacks Q4_0 into aarch64 dotprod-interleaved layouts,
+# which measured 2.3x faster prompt processing (17.1 vs 7.5 t/s) at equal generation.
+# The DEFAULT is the small dense model, not the fast one. Ling-mini-2.0 is nearly
+# twice as fast (6.63 vs 3.33 tok/s generation, 25.9 vs 17.6 prompt) because it reads
+# only ~1.43B of its 16B params per token - but it is 9.0GB on a 12GB board with no
+# swap, and it locked the board up twice on 2026-08-13 with a desktop running.
+# Speed is not worth a default that can wedge the machine.
+#   A7A_LLM_MODEL=inclusionAI_Ling-mini-2.0-Q4_0.gguf   # the fast one, headless only
+DEFAULT_MODEL=${A7A_LLM_MODEL:-Qwen3-4B-Instruct-2507-Q4_0.gguf}
+# `a7a-llm build`: a llama.cpp release known to work here (tag of github.com/ggml-org/llama.cpp)
+BUILD_TAG=${A7A_LLM_BUILD_TAG:-b10816}
+# where `a7a-llm get` fetches the default model, and what it must be (Hugging Face's own size and sha256 of the file)
+# (a fixed commit of the repository, not "main": the size and checksum below are of that file)
+GET_URL=https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_0.gguf
+GET_SIZE=2375773280
+GET_SHA256=e0ba675d86ab277c61701c6793659b2ae801d95e3be791464c321e6fbf613be2
+PIDFILE=/run/user/$(id -u)/a7a-llm.pid
+GOVFILE=/run/user/$(id -u)/a7a-llm.gov
+
+usage() {
+  cat <<EOF
+a7a-llm - local LLM on the A7A
+
+  a7a-llm get                  download the default model (Qwen3-4B-Instruct-2507, 2.4 GB) into $MODELS
+  a7a-llm build [tag]          build llama.cpp for this CPU into ~/llama.cpp (default $BUILD_TAG; newer models,
+                               and faster than Fedora's llama-cpp package; about half an hour)
+  a7a-llm list                 list installed models
+  a7a-llm serve [model]        start llama-server on :$PORT (OpenAI-compatible)
+  a7a-llm stop                 stop the server, restore CPU governor
+  a7a-llm status               show server state, model, speed settings
+  a7a-llm chat [model]         one-off interactive chat in the terminal
+  a7a-llm bench [model]        measure prompt + generation speed
+
+Env: A7A_LLM_MODEL THREADS CTX PORT HOST MODELS BIN
+API: http://127.0.0.1:$PORT  (A7A_LLM_HOST=0.0.0.0 to reach it from other machines; the chat itself is the
+Assistant tab of a7a-panel)
+EOF
+}
+
+gov_set() {  # remember the current governor, then pin performance via a7a-clock
+  cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor > "$GOVFILE" 2>/dev/null || true
+  sudo a7a-clock cpu performance >/dev/null 2>&1 || \
+    for p in /sys/devices/system/cpu/cpufreq/policy*; do
+      echo performance | sudo tee "$p/scaling_governor" >/dev/null
+    done
+}
+gov_restore() {
+  local g; g=$(cat "$GOVFILE" 2>/dev/null || echo schedutil)
+  sudo a7a-clock cpu "$g" >/dev/null 2>&1 || \
+    for p in /sys/devices/system/cpu/cpufreq/policy*; do
+      echo "$g" | sudo tee "$p/scaling_governor" >/dev/null
+    done
+  rm -f "$GOVFILE"
+}
+
+fa_for() {  # FA=(...): --flash-attn takes on/off/auto since llama.cpp b6325; older builds (Fedora 44 ships b6153) take it bare
+  FA=(--flash-attn auto)
+  "$BIN/$1" --help 2>&1 | grep -q -- "--flash-attn.*auto" || FA=(--flash-attn)
+}
+
+pick() {  # resolve a model argument to a path
+  local want=${1:-$DEFAULT_MODEL}
+  [ -f "$want" ] && { echo "$want"; return; }
+  [ -f "$MODELS/$want" ] && { echo "$MODELS/$want"; return; }
+  local hit; hit=$(ls "$MODELS"/*"$want"*.gguf 2>/dev/null | head -1)
+  [ -n "$hit" ] && { echo "$hit"; return; }
+  echo "no model matching '$want' in $MODELS" >&2; exit 1
+}
+
+case "${1:-}" in
+  get)
+    mkdir -p "$MODELS"
+    dest=$MODELS/$(basename "$GET_URL")
+    if [ -f "$dest" ] && [ "$(stat -c %s "$dest")" = "$GET_SIZE" ]; then
+      echo "already here: $dest"; exit 0
+    fi
+    # one download at a time: two would write into the same part file (the panel's button, a terminal)
+    exec 9> "$dest.lock"
+    flock -n 9 || { echo "a download of $(basename "$dest") is already running" >&2; exit 1; }
+    # a part that is not the model's start (a network's login page an older run saved) goes first: a download carried
+    # on after it would be thrown away whole at the checksum (review 2026-11-24)
+    gguf() { [ "$(head -c 4 "$1" 2>/dev/null)" = GGUF ]; }
+    if [ -s "$dest.part" ] && ! gguf "$dest.part"; then rm -f "$dest.part"; fi
+    have=$(stat -c %s "$dest.part" 2>/dev/null || echo 0)
+    free=$(( $(df --output=avail -B1 "$MODELS" | tail -1) ))
+    need=$(( GET_SIZE - have + 500000000 ))
+    if [ "$need" -gt "$free" ]; then
+      # the figure checked against, not the model's alone (2026-11-24: "needs 2265 MB" with 2360 free, refused)
+      echo "not enough space in $MODELS: $((free / 1048576)) MB free, the download needs $((need / 1048576)) MB (the model and 500 MB kept spare)" >&2; exit 1
+    fi
+    echo "downloading $(basename "$GET_URL") ($((GET_SIZE / 1048576)) MB) into $MODELS"
+    # -C -: an interrupted download carries on where it stopped. A failure in words, on stderr: the panel shows the
+    # last line of stdout then stderr, which would otherwise be curl's own (2026-11-24, a first run offline)
+    # curl's progress bar only on a terminal: captured (the panel, which shows the progress from the part's size), it is
+    # tens of thousands of carriage-returned states in one line (it filled the Voice tab and froze the panel: 2026-11-24)
+    host=${GET_URL#*://}; host=${host%%/*}; rc=0; bar=-sS; [ -t 2 ] && bar=--progress-bar
+    curl -fL --retry 5 --retry-delay 5 -C - "$bar" -o "$dest.part" "$GET_URL" || rc=$?
+    case $rc in
+      0) ;;
+      6|7|28) echo "no connection to $host (curl $rc). Is the board on the internet? Connect, then download again: it carries on where it stopped" >&2; exit 1 ;;
+      22) echo "$host refused the file (curl 22, an HTTP error): try again later" >&2; exit 1 ;;
+      *) echo "the download stopped (curl $rc): downloading again carries on where it stopped" >&2; exit 1 ;;
+    esac
+    # each failure on stderr, after what curl may have said there while it retried (review 2026-11-24)
+    if [ "$(stat -c %s "$dest.part" 2>/dev/null || echo 0)" != "$GET_SIZE" ]; then
+      if [ -s "$dest.part" ] && ! gguf "$dest.part"; then
+        rm -f "$dest.part"
+        echo "the answer was not the model (a network's login page?): is the board on the internet? Connect, then download again" >&2
+      else
+        echo "the download is incomplete: downloading again carries on where it stopped" >&2
+      fi
+      exit 1
+    fi
+    echo "checking the file..."
+    echo "$GET_SHA256  $dest.part" | sha256sum -c --quiet || { rm -f "$dest.part"; echo "the file is damaged and was removed: download it again" >&2; exit 1; }
+    mv "$dest.part" "$dest"
+    rm -f "$dest.lock"
+    echo "ready: $dest   (start it with: a7a-llm serve)"
+    ;;
+  build)
+    tag=${2:-$BUILD_TAG}
+    [[ "$tag" =~ ^b[0-9]+$ ]] || { echo "usage: a7a-llm build [b<number>]   (a llama.cpp release tag, e.g. $BUILD_TAG)"; exit 1; }
+    need=(); for p in cmake gcc-c++ git-core; do rpm -q "$p" > /dev/null 2>&1 || need+=("$p"); done
+    if [ ${#need[@]} -gt 0 ]; then echo "installing ${need[*]}"; sudo dnf install -y "${need[@]}" > /dev/null || exit 1; fi
+    src=$HOME/llama.cpp
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "the model server is running from this build: a7a-llm stop first"; exit 1
+    fi
+    if [ -d "$src/.git" ]; then
+      git -C "$src" fetch -q --depth 1 origin tag "$tag" && git -C "$src" checkout -q "$tag" || exit 1
+    elif [ -e "$src" ]; then
+      echo "$src is there and is not a llama.cpp checkout: move it away first (nothing was changed)"; exit 1
+    else
+      # into a new directory first: a failed clone leaves nothing half made in ~/llama.cpp
+      tmp=$(mktemp -d "$HOME/.llama.cpp.XXXXXX")
+      git clone -q --depth 1 --branch "$tag" https://github.com/ggml-org/llama.cpp "$tmp/src" || { rm -rf "$tmp"; exit 1; }
+      mv "$tmp/src" "$src" && rmdir "$tmp"
+    fi
+    # both core types do dotprod and fp16 (Armv8.2): one build for the A76 pair and the A55s, not -mcpu=native
+    # (whichever core runs the compiler would decide). No web page in the server: the panel's Assistant is the
+    # interface, and the prebuilt page the build downloads arrived incomplete and failed it (b10816, 2026-11-17).
+    # A clean build directory every time: a failed build leaves half a page behind that the next one would embed.
+    rm -rf "$src/build"
+    cmake -S "$src" -B "$src/build" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
+      -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 -DLLAMA_BUILD_TESTS=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF \
+      > "$src/configure.log" 2>&1 \
+      || { tail -20 "$src/configure.log"; echo "cmake failed (log: $src/configure.log)"; exit 1; }
+    # one compiler per 800 MB available (the heaviest files take 0.4-0.75 GB each), at most one per core
+    jobs=$(( $(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo) / 800 )); [ "$jobs" -ge 1 ] || jobs=1
+    [ "$jobs" -le "$(nproc)" ] || jobs=$(nproc)
+    echo "building llama.cpp $tag with $jobs compilers (about half an hour; the desktop stays usable but slower)"
+    nice -n 10 cmake --build "$src/build" -j "$jobs" --target llama-server llama-cli llama-bench > "$src/build.log" 2>&1 \
+      || { tail -20 "$src/build.log"; echo "the build failed (log: $src/build.log)"; exit 1; }
+    "$src/build/bin/llama-server" --version 2>&1 | grep -m1 -i version
+    echo "a7a-llm serve uses it from now on ($src/build/bin)"
+    ;;
+  list)
+    printf '%-42s %8s\n' MODEL SIZE
+    for f in "$MODELS"/*.gguf; do
+      [ -e "$f" ] || continue
+      printf '%-42s %8s\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+    done
+    ;;
+  serve)
+    M=$(pick "${2:-}")
+    # one start at a time: two at once (a question by voice, the Assistant tab's Start) both passed the check below,
+    # and the second server, failing on the port, left its pid over the first's, which then ran untracked: Stop
+    # killed nothing (review 2026-11-18). The server itself does not keep the lock (8>&- below).
+    exec 8> "$(dirname "$PIDFILE")/a7a-llm.serve.lock"
+    flock -w 30 8 || { echo "another start of the model server is under way"; exit 1; }
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "already running (pid $(cat "$PIDFILE")); a7a-llm stop first"; exit 1
+    fi
+    # Memory guard. This board has 12GB and NO SWAP, so if the model plus the KV
+    # cache plus the desktop exceed RAM there is nowhere for the pressure to go and
+    # the whole board wedges (it did, 2026-08-13, with the 8.8GB MoE + a desktop +
+    # a second client). Refuse rather than freeze.
+    MSZ=$(( $(stat -c %s "$M") / 1048576 ))
+    AVAIL=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+    # model + KV cache + server overhead: 700 MB covered 8192 tokens; a larger context reserves about 147 KB more a
+    # token for the 4B model (36 layers x 8 KV heads x 128 x K and V x 2 bytes), 1.2 GB more for 16384
+    NEED=$(( MSZ + 700 + (CTX > 8192 ? (CTX - 8192) * 147 / 1000 : 0) ))
+    HEADROOM=$(( AVAIL - NEED ))
+    # Fitting exactly is not enough: the desktop keeps growing after the model loads
+    # (a browser tab is easily 500MB), and with no swap the board does not slow down,
+    # it wedges. Journal from the 2026-08-13 freeze: two OOM kills of llama-cli at
+    # 10.0GB and 7.5GB anon-rss, then a hard lockup. Demand real slack.
+    # 1200MB was measured to be too thin: with ~10.9GB available the 9.0GB Ling model
+    # cleared the check by a hair and then took the board down anyway (2026-08-13,
+    # second lockup of the day). The desktop, page cache and the server's own working
+    # set all grow AFTER the check passes, so the margin has to be genuinely large.
+    MIN_HEADROOM=${A7A_LLM_MIN_HEADROOM:-2000}
+    if [ "$HEADROOM" -lt "$MIN_HEADROOM" ]; then
+      echo "REFUSING: $(basename "$M") needs ~${NEED}MB, only ${AVAIL}MB available"
+      echo "  -> ${HEADROOM}MB headroom, under the ${MIN_HEADROOM}MB minimum."
+      echo "  This board has NO SWAP: over-committing wedges it rather than slowing down."
+      echo "  Options:"
+      echo "    - pick a smaller model:  a7a-llm list   (Qwen3-4B-Instruct-2507-Q4_0 is 2.3GB)"
+      echo "    - close desktop apps and retry"
+      echo "    - override:  A7A_LLM_FORCE=1 a7a-llm serve"
+      [ -n "$A7A_LLM_FORCE" ] || { rm -f "$GOVFILE"; exit 1; }
+      echo "  A7A_LLM_FORCE set - continuing anyway."
+    fi
+    echo "  memory: model ${MSZ}MB, available ${AVAIL}MB, headroom ${HEADROOM}MB"
+    gov_set
+    echo "serving $(basename "$M")  gen-threads=$THREADS prompt-threads=$THREADS_BATCH ctx=$CTX port=$PORT"
+    # Speculative decoding is OFF by default because it MEASURED SLOWER here
+    # (draft-simple n=4: 2.17 tok/s vs 3.08 baseline) - the draft model competes for
+    # the same two A76 cores. Note --spec-type: without it, -md is a silent no-op.
+    # A7A_LLM_DRAFT=<file> for a draft model, or A7A_LLM_SPEC=ngram-map-k4v for the
+    # draftless n-gram mode (the only variant that was marginally ahead, 3.21).
+    DRAFT_ARGS=()
+    if [ -n "$A7A_LLM_DRAFT" ] && [ -f "$MODELS/$A7A_LLM_DRAFT" ]; then
+      DRAFT_ARGS=(--spec-type draft-simple -md "$MODELS/$A7A_LLM_DRAFT" --spec-draft-n-max 4)
+      echo "  speculative decoding with draft model $A7A_LLM_DRAFT (measured slower - benchmark it)"
+    elif [ -n "$A7A_LLM_SPEC" ]; then
+      DRAFT_ARGS=(--spec-type "$A7A_LLM_SPEC")
+      echo "  draftless speculation: $A7A_LLM_SPEC"
+    fi
+    # --jinja activates the model's own chat template, including its tool-call
+    # section. Without it the OpenAI "tools" field is ignored and the panel's Assistant gets
+    # no tool_calls back, so the model just guesses instead of reading the machine.
+    # -np 1 IS LOAD-BEARING, not tidiness. llama.cpp picks the threadpool with
+    # `batched = ubatch.n_tokens > 1`, so with the default 4 slots a generation
+    # ubatch counts as batched and decode runs on the -tb pool: 8 threads, i.e. the
+    # six A55 cores, which measured 2.04 tok/s against 3.12 for the A76 pair alone.
+    # Symptom when this is missing: the server logs `n_slots = 4` and on-screen
+    # speed sits around 1.6 tok/s instead of ~3.3.
+    # Optional QLoRA adapter (A7A_LLM_LORA=<file in $MODELS>). Trained to call this
+    # board's tools without the schemas riding in every prompt - which matters here
+    # because generation collapses with KV depth (2.73 tok/s at depth 0 vs 0.72 at
+    # 512, measured with llama-bench -d, no prefill charged).
+    # Default to the v2 adapter when it is on disk: measured strictly better than
+    # stock AND 68% faster in schema-free mode (27/28 vs 25/28, 2.88 vs 1.71 tok/s).
+    : "${A7A_LLM_LORA:=a7a-tools-lora-v2-f16.gguf}"
+    LORA_ARGS=()
+    if [ -n "$A7A_LLM_LORA" ] && [ -f "$MODELS/$A7A_LLM_LORA" ]; then
+      LORA_ARGS=(--lora "$MODELS/$A7A_LLM_LORA")
+      echo "  lora: $A7A_LLM_LORA"
+    fi
+    [ -x "$BIN/llama-server" ] || { echo "llama-server is not installed: sudo dnf install llama-cpp"; gov_restore; exit 1; }
+    fa_for llama-server
+    nohup "$BIN/llama-server" -m "$M" -t "$THREADS" -tb "$THREADS_BATCH" -c "$CTX" \
+      -np 1 --jinja --host "$HOST" --port "$PORT" "${FA[@]}" \
+      "${LORA_ARGS[@]}" "${DRAFT_ARGS[@]}" \
+      > /tmp/a7a-llm.log 2>&1 8>&- &
+    echo $! > "$PIDFILE"
+    sleep 6
+    if kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      if [ "$HOST" = 0.0.0.0 ]; then echo "up: http://$(hostname -I | awk '{print $1}'):$PORT   (log /tmp/a7a-llm.log)"
+      else echo "up: http://$HOST:$PORT   (log /tmp/a7a-llm.log)"; fi
+    else
+      echo "FAILED to start:"; tail -20 /tmp/a7a-llm.log; gov_restore; exit 1
+    fi
+    ;;
+  stop)
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null && echo stopped || echo "not running"
+    rm -f "$PIDFILE"; gov_restore
+    ;;
+  status)
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+      echo "server: RUNNING pid $(cat "$PIDFILE") port $PORT"
+      curl -s "http://127.0.0.1:$PORT/v1/models" 2>/dev/null | head -c 300; echo
+    else
+      echo "server: stopped"
+    fi
+    echo "context: $CTX tokens (from the next start)"
+    echo "governor: $(cat /sys/devices/system/cpu/cpufreq/policy0/scaling_governor) (little) / $(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_governor) (big A76)"
+    echo "big-core freq: $(( $(cat /sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq) / 1000 )) MHz"
+    ;;
+  chat)
+    M=$(pick "${2:-}")
+    fa_for llama-cli
+    gov_set; trap gov_restore EXIT
+    "$BIN/llama-cli" -m "$M" -t "$THREADS" -c "$CTX" "${FA[@]}" -cnv
+    ;;
+  bench)
+    M=$(pick "${2:-}")
+    gov_set; trap gov_restore EXIT
+    "$BIN/llama-bench" -m "$M" -t "$THREADS" -p 128 -n 64 -r 2
+    ;;
+  *) usage ;;
+esac

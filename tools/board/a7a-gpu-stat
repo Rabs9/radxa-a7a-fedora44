@@ -1,0 +1,20 @@
+#!/bin/bash
+# a7a-gpu-stat: the GPU's state from the PowerVR driver's debugfs, which only root can read, as key=value lines for
+# a7a-panel (through `a7a-clock json`):
+#   hwr         hardware recoveries this boot
+#   gpu_load    utilisation in percent (the driver's own average)
+#   gpu_3d, gpu_geom, gpu_cdm   the same for the 3D (pixels), geometry and compute units
+#   gpu_mem_mb  GPU memory allocated by all programs, in MiB
+# Nothing at all when the driver is not there (the open-stack boot entries). Read-only. Run through sudo; the drop-in
+# /etc/sudoers.d/a7a-gpu-stat keeps those runs out of the journal, since the panel asks every 2 s while it is open.
+D=/sys/kernel/debug/pvr
+[ -r "$D/status" ] || exit 0
+awk -F: '
+  /HWR Event Count/ { gsub(/[ \t]/, "", $2); print "hwr=" $2 }
+  /GPU Utilisation/ { gsub(/[ \t%]/, "", $2); print "gpu_load=" $2 }
+  $1 ~ /^[ \t]*3D$/   { gsub(/[ \t%]/, "", $2); print "gpu_3d=" $2 }
+  $1 ~ /^[ \t]*GEOM$/ { gsub(/[ \t%]/, "", $2); print "gpu_geom=" $2 }
+  $1 ~ /^[ \t]*CDM$/  { gsub(/[ \t%]/, "", $2); print "gpu_cdm=" $2 }
+' "$D/status"
+[ -r "$D/driver_stats" ] && awk '$1 == "MemoryUsageAllocGPUMemUMA" { printf "gpu_mem_mb=%d\n", $2 / 1048576 }' "$D/driver_stats"
+exit 0

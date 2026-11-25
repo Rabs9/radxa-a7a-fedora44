@@ -1,0 +1,57 @@
+#!/bin/bash
+# a7a-boot-canary arm|confirm|status|run: a one-shot way back for a reboot made WITHOUT the serial console.
+#
+# backtoddk.sh changes the extlinux default and reboots. With the serial adapter on the laptop, `src.cli update`
+# watches the boot and can pick another entry in the U-Boot menu; without it, a boot that comes up with no network
+# or no desktop leaves the board on that entry until someone opens the card. The canary closes that gap for every
+# failure in which the system itself still boots:
+#   arm      (before the reboot) writes the marker and a systemd unit that starts `run` at every boot
+#   run      (from the unit) on the NEXT boot: on an open-stack kernel it disarms (nothing to guard); on any other
+#            kernel it waits CANARY_WAIT seconds (default 600) and, if nobody ran `confirm` by then, disarms and
+#            calls prepare616.sh (open-stack entry default again + reboot)
+#   confirm  (over ssh once the new boot is reachable) keeps the boot, stops the waiting `run`, removes the unit
+#   status   what is armed
+# It fires at most once (the marker goes before the action), only on the boot after the arming one, and an arm whose
+# reboot landed on the open stack is dropped there instead of waiting for some later vendor boot.
+# The CANARY_* overrides given to `arm` are written into the unit, so `run` sees the same values.
+set -u
+MARK=${CANARY_MARK:-/etc/a7a/boot-canary.armed}; OK=${CANARY_OK:-/run/a7a-boot-confirmed}
+UNIT=/etc/systemd/system/a7a-boot-canary.service
+WAIT=${CANARY_WAIT:-600}; ACTION=${CANARY_ACTION:-/usr/local/bin/prepare616.sh}; REL=${CANARY_RELEASE:-$(uname -r)}
+BOOT=${CANARY_BOOT:-$(cat /proc/sys/kernel/random/boot_id)}
+[ "$(id -u)" = 0 ] || exec sudo -n CANARY_MARK="$MARK" CANARY_OK="$OK" CANARY_WAIT="$WAIT" CANARY_ACTION="$ACTION" \
+  CANARY_RELEASE="$REL" CANARY_BOOT="$BOOT" "$0" "$@"
+disarm() { rm -f "$MARK"; if [ -e "$UNIT" ]; then systemctl disable a7a-boot-canary.service >/dev/null 2>&1; rm -f "$UNIT"; systemctl daemon-reload; fi; }
+case "${1:-status}" in
+  arm)
+    # the way back must exist before anything is armed: prepare616.sh refuses without these two
+    if [ "$ACTION" = /usr/local/bin/prepare616.sh ]; then
+      [ "$(systemctl is-enabled a7a-gpu-session.service 2>/dev/null)" = enabled ] \
+        || { echo "not armed: a7a-gpu-session.service is not enabled (prepare616.sh would refuse)"; exit 1; }
+      a7a-extlinux list 2>/dev/null | grep -qE 'fedora-[0-9][0-9.]*-a7apvr\.[0-9]+' \
+        || { echo "not armed: no packaged open-stack (a7apvr) boot entry to return to"; exit 1; }
+    fi
+    mkdir -p "$(dirname "$MARK")"; echo "$BOOT $(date -u +%FT%TZ)" > "$MARK"
+    printf '%s\n' '[Unit]' 'Description=a7a: back to the open-stack boot entry unless this boot is confirmed' \
+      "ConditionPathExists=$MARK" '' '[Service]' 'Type=simple' \
+      "Environment=\"CANARY_MARK=$MARK\" \"CANARY_OK=$OK\" \"CANARY_WAIT=$WAIT\"" "Environment=\"CANARY_ACTION=$ACTION\"" \
+      "ExecStart=$(readlink -f "$0") run" '' '[Install]' 'WantedBy=multi-user.target' > "$UNIT"
+    systemctl daemon-reload; systemctl enable a7a-boot-canary.service >/dev/null 2>&1
+    [ "$(systemctl is-enabled a7a-boot-canary.service 2>/dev/null)" = enabled ] \
+      || { rm -f "$MARK" "$UNIT"; systemctl daemon-reload; echo "not armed: the unit could not be enabled"; exit 1; }
+    echo "armed: the next boot, unless it is the open stack or confirmed within $WAIT s, returns to the open stack" ;;
+  confirm)
+    touch "$OK"; systemctl stop a7a-boot-canary.service 2>/dev/null; disarm; echo "confirmed: this boot stays ($REL)" ;;
+  run)
+    [ -e "$MARK" ] || exit 0
+    read -r armed_boot _ < "$MARK"
+    [ "$armed_boot" != "$BOOT" ] || { echo "armed on this very boot: the next boot is the guarded one"; exit 0; }
+    case "$REL" in *-a7apvr.*|*-pvr+) echo "open-stack kernel $REL: nothing to guard, disarmed"; disarm; exit 0 ;; esac
+    sleep "$WAIT"
+    if [ -e "$OK" ]; then echo "confirmed"; disarm; exit 0; fi
+    echo "boot $REL not confirmed within $WAIT s: back to the open stack"; logger -t a7a-boot-canary "boot $REL not confirmed within $WAIT s: back to the open stack" 2>/dev/null
+    disarm; exec $ACTION ;;
+  status)
+    [ -e "$MARK" ] && echo "armed since $(cut -d' ' -f2 "$MARK") (unit: $(systemctl is-enabled a7a-boot-canary.service 2>/dev/null))" || echo "not armed" ;;
+  *) echo "usage: a7a-boot-canary arm|confirm|status|run"; exit 2 ;;
+esac
