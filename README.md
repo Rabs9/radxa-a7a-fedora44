@@ -286,7 +286,9 @@ These were asked for publicly in September 2026:
 - Imagination's PowerVR firmware and libraries: Imagination's terms (see the GPU section).
 
 <sub>Credits: the PowerVR GPU driver, its firmware and its libraries are © Imagination Technologies Ltd and are
-included as Radxa ships them for the Cubie A7A; the firmware's licence is in `licenses/LICENSE.powervr`. The board, its
+included as Radxa ships them for the Cubie A7A, except the open driver's firmware (`rogue_36.56.104.183_v1.fw`), which
+is Imagination's own open-source release from gitlab.freedesktop.org/imagination/linux-firmware; its licence is in
+`licenses/LICENSE.powervr`. The board, its
 kernel tree and its board support are Radxa's (radxa.com); the A733 and its BSP are Allwinner's. Thanks to all three:
 this image builds on their work. It is not endorsed by any of them, and anything here will be taken down on a
 rights holder's request.</sub>
