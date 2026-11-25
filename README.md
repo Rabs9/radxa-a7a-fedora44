@@ -9,6 +9,7 @@ Built and tested by Rabs9 on one Cubie A7A. It is a hobby project, not a Radxa o
 - [Screenshots](#screenshots)
 - [Download and first start](#download-and-first-start)
 - [What you get](#what-you-get)
+- [GPU acceleration](#gpu-acceleration)
 - [The A7A Panel](#the-a7a-panel)
 - [Clocks and overclocking](#clocks-and-overclocking)
 - [Voice commands and the NPU](#voice-commands-and-the-npu)
@@ -61,6 +62,8 @@ longer. Then:
 ## What you get
 
 - Fedora 44 KDE Plasma 6 on Wayland, composited on the PowerVR GPU through Imagination's driver.
+- GPU acceleration for programs, with nothing to set up: Firefox (WebRender and WebGL 2.0), KDE and Qt programs,
+  OpenGL ES games, and X11 programs through Xwayland.
 - Two boot entries: the vendor GPU driver (the default, fast desktop and 3D) and the open upstream driver
   (`drm/imagination` with Mesa's PowerVR Vulkan driver), plus a recovery entry.
 - The A7A Panel: clocks, temperatures, power profiles, the headphone jack, the assistant and voice settings.
@@ -69,6 +72,36 @@ longer. Then:
 - Spoken answers in ten voices, made on the board.
 - Cloud assistants with your own free or paid key ("hey cloud, …").
 - Board packages kept up to date through Discover or `dnf upgrade`, signed with the project's key.
+
+## GPU acceleration
+
+On the default boot entry, programs draw on the PowerVR GPU by themselves: no settings, no environment variables.
+Measured on the board:
+
+- **The desktop**: KWin and Plasma, and KDE and Qt programs (OpenGL ES 3.2).
+- **Firefox**, unmodified, with its default profile: hardware WebRender, and WebGL 2.0 on the PowerVR.
+- **OpenGL ES programs and games**, on Wayland and on X11 through Xwayland: glmark2-es2 scores about 2000;
+  SuperTuxKart runs natively on Wayland at about 30 frames a second.
+
+To see it: the A7A Panel's **Hardware** tab marks each program that uses the GPU, and `a7a-gpu-check` (in a
+terminal) checks the whole stack and ends with "0 fail, 0 warn".
+
+### Installing an app that needs the GPU
+
+1. **Install it from Fedora's packages**: in Discover, pick the "Fedora" source when it offers both Fedora and
+   Flathub; or in a terminal, `sudo dnf install <name>`. Fedora's builds use the system's graphics libraries, which
+   on this image lead to the PowerVR driver.
+2. **Start it as usual** and look at the Hardware tab: a **GPU** mark beside it means it draws on the PowerVR.
+3. **If it needs desktop OpenGL**, it may not start on the default entry, or say "Failed to bind api" or something
+   about GLX. Imagination's driver has OpenGL ES only (see
+   [the GPU section](#imaginations-gpu-driver-the-one-piece-we-need)). Two ways:
+   - on the default entry, in software: `LD_LIBRARY_PATH=/usr/lib64 <program>` (slower, but it runs);
+   - on the GPU: start the board on the **second boot entry** (the open driver). There, desktop OpenGL runs on the
+     PowerVR through zink (OpenGL on top of Mesa's PowerVR Vulkan driver), for Wayland and X11 programs alike.
+4. **Vulkan programs** need the second boot entry too: Mesa's PowerVR Vulkan driver (Vulkan 1.2) shows windows on
+   Wayland. On the default entry, Imagination's Vulkan driver cannot.
+5. **Flatpak apps** (Flathub) bring their own graphics libraries, which do not include Imagination's driver: expect
+   them to draw in software. For anything that needs the GPU, prefer Fedora's package. (Not measured here.)
 
 ## The A7A Panel
 
