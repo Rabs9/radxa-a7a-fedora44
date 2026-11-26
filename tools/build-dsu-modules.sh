@@ -45,7 +45,7 @@ for REL in "$@"; do
   RPM=$(ls "$OUT"/rpms/kernel-*-"${REL//-/_}"-*.aarch64.rpm 2>/dev/null | tail -1 || true)
   [ -n "$RPM" ] || { echo "no kernel package for $REL in $OUT/rpms"; exit 1; }
   step "$REL: its configuration, out of $(basename "$RPM")"
-  mkdir -p "$TMP/$REL"; ( cd "$TMP/$REL" && rpm2cpio "$RPM" | cpio -id --quiet "./boot/vmlinuz-$REL" )
+  mkdir -p "$TMP/$REL"; ( cd "$TMP/$REL" && rpm2cpio "$RPM" | ( cpio -id --quiet "./boot/vmlinuz-$REL"; s=$?; cat > /dev/null; exit $s ) )
   bash "$K/scripts/extract-ikconfig" "$TMP/$REL/boot/vmlinuz-$REL" > "$TMP/$REL/config" 2>/dev/null \
     || { echo "the kernel in $RPM carries no configuration (CONFIG_IKCONFIG)"; exit 1; }
   flavour='^(# )?CONFIG_(DRM_(EXEC|GPUVM|POWERVR)|EXFAT_FS|EXFAT_DEFAULT_IOCHARSET|ISO9660_FS|JOLIET|ZISOFS|INPUT_UINPUT)[= ]'

@@ -39,7 +39,7 @@ for OLD in "$@"; do
   HOST=$(rpm -qp --qf '%{BUILDHOST}' "$OLD"); REL=$(rpm -qp --qf '%{RELEASE}' "$OLD")
   [ "$HOST" != a7a-fedora ] || { echo "$B: built as a7a-fedora already"; continue; }
   R=$WORK/$NAME; rm -rf "$R"; mkdir -p "$R/root" "$R/out"
-  ( cd "$R/root" && rpm2cpio "$OLD" | cpio -idm --quiet )
+  ( cd "$R/root" && rpm2cpio "$OLD" | ( cpio -idm --quiet; s=$?; cat > /dev/null; exit $s ) )
   case "$NAME" in
     kernel-a7a|kernel-a7apvr)
       K=$(rpm -qp --provides "$OLD" | sed -n 's/^kernel-uname-r = //p')

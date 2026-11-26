@@ -12,16 +12,35 @@
 #      ~100 ms of CPU per frame for windows taller than ~500 rows. Reuse when the cached buffer is big enough.
 #   2. pvr_physical_device.c: treat BVNC 36.56.104.183 (Allwinner A733) as conformant so no
 #      PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 is needed anywhere (not CTS-certified; the DDK has the same GPU).
-# usage: build-pvr-vulkan.sh [--install] [srcrpm]   (default: the newest mesa-*.src.rpm in the current directory)
+# usage: build-pvr-vulkan.sh [--install] [srcrpm | mesa-X.Y.Z.tar.xz]
+#   default: the newest mesa-*.src.rpm in the current directory. A release tarball from archive.mesa3d.org (Fedora 44
+#   has no 26.3: 2026-11-25) is taken only with its sha256 in RELEASES below (its signature checked when it was added).
 set -euo pipefail
 W=/home/radxa/mesa-build; cd "$W"
 INSTALL=0; [ "${1:-}" = --install ] && { INSTALL=1; shift; }
-SRPM=${1:-$(ls -t mesa-*.src.rpm | head -1)}
-[ -f "$SRPM" ] || { echo "no mesa src.rpm in $W (dnf download --source mesa)"; exit 1; }
+SRC=${1:-$(ls -t mesa-*.src.rpm | head -1)}
 step() { echo "== [$(date +%H:%M:%S)] $*"; }
-step "unpack $SRPM"
-rpm2cpio "$SRPM" | cpio -id --quiet "./mesa-*.tar.xz"
-T=$(ls -t mesa-*.tar.xz | head -1); D=${T%.tar.xz}
+# Mesa release tarballs taken as they are: sha256, checked against the release signature when the line was added
+#   26.3.1: signed by Dylan Baker, EDDSA key 71C4B75620BC75708B4BDB254C95FAAB3EB073EC (2026-11-18)
+RELEASES="mesa-26.3.1.tar.xz 4e4e438eac7b840a9383988cbb7c08dad8041da544b9319fc26d319fa7348961"
+case "$SRC" in
+  *.tar.xz)
+    [ -f "$SRC" ] || { echo "no $SRC"; exit 1; }
+    want=$(awk -v f="$(basename "$SRC")" '$1 == f {print $2}' <<< "$RELEASES")
+    [ -n "$want" ] || { echo "$(basename "$SRC") is not in RELEASES: check its signature, then add its sha256"; exit 1; }
+    [ "$(sha256sum < "$SRC" | cut -d' ' -f1)" = "$want" ] || { echo "$SRC: sha256 differs from the signed release"; exit 1; }
+    step "release tarball $(basename "$SRC") (sha256 as signed)"
+    [ "$(readlink -f "$SRC")" = "$(readlink -f "$(basename "$SRC")")" ] || cp "$SRC" .
+    T=$(basename "$SRC") ;;
+  *)
+    [ -f "$SRC" ] || { echo "no mesa src.rpm in $W (dnf download --source mesa)"; exit 1; }
+    step "unpack $SRC"
+    # the SRPM's own tarball, never the newest one lying here (a release tarball from an earlier run would win)
+    T=mesa-$(rpm -qp --qf '%{VERSION}' "$SRC").tar.xz
+    rpm2cpio "$SRC" | ( cpio -idu --quiet "./$T"; s=$?; cat > /dev/null; exit $s )
+    [ -f "$T" ] || { echo "$SRC has no $T"; exit 1; } ;;
+esac
+D=${T%.tar.xz}
 # always a clean tree: the edits below assume pristine sources (a leftover tree with a partial edit set is unsafe)
 rm -rf "$D"; tar -xJf "$T"
 cd "$D"
@@ -41,8 +60,8 @@ edit("src/imagination/vulkan/pvr_spm.c",
      "   if (store->head_ref && store->head_ref->size >= size) {",
      "pvr_spm.c: scratch buffer reuse by size >=")
 edit("src/imagination/vulkan/pvr_physical_device.c",
-     "   switch (bvnc) {\n   case PVR_BVNC_PACK(36, 53, 104, 796):\n      return true;",
-     "   switch (bvnc) {\n   case PVR_BVNC_PACK(36, 53, 104, 796):\n"
+     "   case PVR_BVNC_PACK(36, 53, 104, 796):\n      return true;",
+     "   case PVR_BVNC_PACK(36, 53, 104, 796):\n"
      "   /* a7a-fedora: Allwinner A733 (Radxa Cubie A7A). Not CTS-certified; treated as conformant so that no\n"
      "    * PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 is needed in any environment. */\n"
      "   case PVR_BVNC_PACK(36, 56, 104, 183):\n      return true;",
@@ -188,12 +207,16 @@ edit("src/imagination/vulkan/pvr_mrt.h",
      "   bool progs_from_cache;\n",
      "pvr_mrt.h: progs_from_cache flag")
 edit("src/imagination/vulkan/pvr_device.h",
-     "   simple_mtx_t rs_mtx;\n   struct list_head render_states;\n};\n",
+     "   simple_mtx_t rs_mtx;\n   struct list_head render_states;\n",
      "   simple_mtx_t rs_mtx;\n   struct list_head render_states;\n\n"
      "   /* a7a-fedora: cache of compiled load-op programs (pvr_arch_load_op_shader_generate) */\n"
-     "   simple_mtx_t loadop_cache_mtx;\n   struct list_head loadop_cache;\n   uint32_t loadop_cache_count;\n};\n\n"
-     "void pvr_loadop_cache_finish(struct pvr_device *device);\n",
+     "   simple_mtx_t loadop_cache_mtx;\n   struct list_head loadop_cache;\n   uint32_t loadop_cache_count;\n",
      "pvr_device.h: load-op cache fields")
+edit("src/imagination/vulkan/pvr_device.h",
+     "#endif /* PVR_DEVICE_H */",
+     "/* a7a-fedora: the load-op program cache (pvr_arch_mrt.c) */\n"
+     "void pvr_loadop_cache_finish(struct pvr_device *device);\n\n#endif /* PVR_DEVICE_H */",
+     "pvr_device.h: load-op cache prototype")
 edit("src/imagination/vulkan/pvr_arch_device.c",
      "   simple_mtx_init(&device->rs_mtx, mtx_plain);\n   list_inithead(&device->render_states);\n",
      "   simple_mtx_init(&device->rs_mtx, mtx_plain);\n   list_inithead(&device->render_states);\n"
@@ -396,12 +419,18 @@ edit("src/imagination/vulkan/pvr_bo.c",
 # (docs/GPU-GAP-2026-09-10.md). The value is only reported: the descriptor code has no per-stage UBO array.
 # maxPerStageResources follows (the sum of the per-stage descriptor limits + 4 colour attachments, 48 -> 49 in
 # 26.1.8; upstream main had 56 -> 57 because its storage-buffer limit is 16). ----
-edit("src/imagination/vulkan/pvr_physical_device.c",
+_pd = open("src/imagination/vulkan/pvr_physical_device.c").read()
+if ".maxPerStageDescriptorUniformBuffers = 12," not in _pd:
+    if ".maxPerStageDescriptorUniformBuffers = 13," not in _pd:
+        sys.exit("pvr_physical_device.c: neither 12 nor 13 uniform buffers per stage: look at this Mesa by hand")
+    print("  = 13 uniform buffers per stage: upstream has them (26.3: 13 and 57 resources)")
+else:
+  edit("src/imagination/vulkan/pvr_physical_device.c",
      "      .maxPerStageDescriptorUniformBuffers = 12,\n",
      "      /* a7a-fedora: upstream cece4db940: 12 for the GL state tracker + 1 for the default uniform block */\n"
      "      .maxPerStageDescriptorUniformBuffers = 13,\n",
      "pvr_physical_device.c: 13 uniform buffers per stage (upstream cece4db940)")
-edit("src/imagination/vulkan/pvr_physical_device.c",
+  edit("src/imagination/vulkan/pvr_physical_device.c",
      "      .maxPerStageResources = 48,\n",
      "      .maxPerStageResources = 49, /* a7a-fedora: + the 13th uniform buffer (upstream cece4db940) */\n",
      "pvr_physical_device.c: maxPerStageResources 49")

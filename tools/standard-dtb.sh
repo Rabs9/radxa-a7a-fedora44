@@ -29,7 +29,7 @@ echo "vendor reference: $D/vendor-reference.dtb ($(basename "$DEV"), $(basename 
 for REL in "$@"; do
   RPM=$(ls "$OUT"/rpms/kernel-a7a*-"${REL//-/_}"-*.aarch64.rpm 2>/dev/null | tail -1)
   [ -n "$RPM" ] || { echo "no kernel package for $REL in $OUT/rpms"; exit 1; }
-  rpm2cpio "$RPM" | cpio -i --quiet --to-stdout "./usr/lib/linux-image-$REL/allwinner/sun60i-a733-cubie-a7a.dtb" > "$T/$REL.dtb"
+  rpm2cpio "$RPM" | ( cpio -i --quiet --to-stdout "./usr/lib/linux-image-$REL/allwinner/sun60i-a733-cubie-a7a.dtb"; s=$?; cat > /dev/null; exit $s ) > "$T/$REL.dtb"
   [ -s "$T/$REL.dtb" ] || { echo "$(basename "$RPM") holds no device tree for the Cubie A7A"; exit 1; }
   O=$D/linux-image-$REL-standard/allwinner; mkdir -p "$O"
   echo "== $REL (from $(basename "$RPM"))"

@@ -71,6 +71,7 @@ WLON=$ROOT/etc/a7a/pvr-wl.enabled
 WLGL=$ROOT/opt/pvr-wl/lib/libGL.so.1
 KWINLIB=$ROOT/usr/lib64/libkwin.so.6
 GREETER=$ROOT/run/a7a/greeter-kwin.env
+FFPREF=$ROOT/etc/firefox/pref/a7a-open-stack.js   # Fedora Firefox reads /etc/firefox/pref as default prefs
 REL=${A7A_KERNEL_RELEASE:-$(uname -r)}
 # udev loads the driver from the DT compatible about 2.5 s after coldplug (board, 2026-09-10); the device node exists
 # from early boot, so the binding is waited for. status never waits.
@@ -160,6 +161,22 @@ greeter_state() {   # static | env (...) | MISSING | stale: one line for status;
 }
 greeter_ok() { case "$(greeter_state)" in static*|env*) return 0 ;; *) return 1 ;; esac; }
 
+# Firefox: on the open stack (Mesa's PowerVR Vulkan + zink, OpenGL 3.2 since Mesa 26.3) Firefox picks hardware WebRender,
+# which draws slower there than its software WebRender (video lagged); on the DDK it stays on the GPU. A default pref
+# only: a user's own about:config / user.js setting still wins. Nothing is made where Firefox is not installed.
+ff_text() { printf '%s\n' "// a7a-gpu-session: written on the open GPU stack only, removed on any other" "// software WebRender draws faster here than zink; a user.js or about:config setting overrides this" 'pref("gfx.webrender.software", true);'; }
+ff_apply() {   # appends to the caller's $changed (needs $STACK)
+  if [ "$STACK" = open ] && [ -d "${FFPREF%/*}" ]; then
+    [ "$(cat "$FFPREF" 2>/dev/null)" = "$(ff_text)" ] || { ff_text > "$FFPREF" && changed="$changed firefox-pref-written"; }
+  elif [ -e "$FFPREF" ]; then rm -f "$FFPREF" && changed="$changed firefox-pref-removed"; fi
+}
+ff_state() {
+  if [ -f "$FFPREF" ] && [ "$STACK" = open ]; then echo "software WebRender (open stack)"
+  elif [ -f "$FFPREF" ]; then echo "stale ($FFPREF on the $STACK stack: the next apply removes it)"
+  elif [ -d "${FFPREF%/*}" ]; then echo "as Firefox chooses"
+  else echo "not installed"; fi
+}
+
 config() {   # ddk | software | open | mixed(...): what is on disk now
   local pvr=0 sw=0 cap=0 nocap=0 ld=0 wl want=absent
   [ -f "$DROP/pvr.conf" ] && pvr=1; [ -f "$DROP/software.conf" ] && sw=1; cap_present && cap=1; nocap_any && nocap=1; [ -f "$LDCONF" ] && ld=1
@@ -174,6 +191,7 @@ matches() { case "$1:$2" in open:open|ddk:ddk|ddk:software|nogpu:software) retur
 apply() {
   local before changed=""
   stack
+  ff_apply   # every outcome, the manual marker too: it follows the driver, not the session config
   if [ -e "$MANUAL" ]; then
     # the manual marker leaves the SESSION config alone, but never the pvr-wl loader entry on a kernel without the
     # DDK: there it would put the DDK's Mesa in front of Fedora's for every process, KWin included (black screen)
@@ -253,6 +271,7 @@ status() {
   elif [ -e "$WLGL" ]; then echo "pvr-wl: $w (refused: a stray libGL.so.1 in /opt/pvr-wl/lib, not from mesa-img-a7a)"
   else echo "pvr-wl: $w (mesa-img-a7a with resolvable lib/ddk links not installed)"; fi
   echo "greeter-kwin: $(greeter_state)"
+  echo "firefox: $(ff_state)"
   [ -e "$MANUAL" ] && echo "manual: yes ($MANUAL)"
   case "$STACK" in
     open|ddk|nogpu) if matches "$STACK" "$c" && greeter_ok && ! sw_stale; then echo "match: yes"; return 0; else echo "match: no"; return 1; fi ;;

@@ -28,6 +28,7 @@ def unpack(rpm: Path, into: Path) -> None:
     """rpm2cpio | cpio -idm, without a shell."""
     with subprocess.Popen(["rpm2cpio", str(rpm)], stdout=subprocess.PIPE) as r2c:
         subprocess.run(["cpio", "-idm", "--quiet"], stdin=r2c.stdout, cwd=into, check=True)
+        r2c.stdout.read()   # cpio stops at the trailer; the padding after it, or rpm2cpio dies of SIGPIPE on a busy machine
         r2c.stdout.close()
     if r2c.returncode:
         raise RuntimeError(f"rpm2cpio {rpm} exited {r2c.returncode}")
@@ -564,6 +565,26 @@ class TestRewrap(unittest.TestCase):
 
     def rewrap(self, *rpms: Path) -> subprocess.CompletedProcess:
         return run("rewrap-rpm.sh", {"A7A_OUTPUT": str(self.out)}, *map(str, rpms))
+
+    def test_padding_after_the_cpio_trailer_does_not_kill_the_unpack(self):
+        # cpio stops reading at the archive's trailer; rpm2cpio may still write padding after it. On a busy machine
+        # it came late, cpio had gone, and rpm2cpio died of SIGPIPE: exit 141 under pipefail (2026-11-26, full suite).
+        # Here the padding always comes late.
+        fake = self.d / "bin"
+        fake.mkdir()
+        (fake / "rpm2cpio").write_text(f'#!/bin/bash\n{shutil.which("rpm2cpio")} "$@" || exit\n'
+                                       'sleep 0.3; head -c 65536 /dev/zero\n')
+        (fake / "rpm2cpio").chmod(0o755)
+        old = self.old_kernel("6.6.98-a7a.202609091931", pvr=False)
+        r = run("rewrap-rpm.sh", {"A7A_OUTPUT": str(self.out), "PATH": f"{fake}:{os.environ['PATH']}"}, str(old))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("re-wrapped", r.stdout)
+
+    def test_every_rpm2cpio_pipe_in_the_tools_reads_the_padding(self):
+        for f in sorted((P / "tools").rglob("*.sh")):
+            for n, line in enumerate(f.read_text().splitlines(), 1):
+                if "rpm2cpio" in line and "|" in line.split("rpm2cpio", 1)[1]:
+                    self.assertIn("cat > /dev/null", line, f"{f.name}:{n}")
 
     def dump(self, rpm: Path) -> list[str]:
         """rpm --dump without the files' times"""

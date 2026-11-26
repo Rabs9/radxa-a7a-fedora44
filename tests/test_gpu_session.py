@@ -637,6 +637,66 @@ class TestGpuSession(unittest.TestCase):
         self.assertIn("greeter-kwin: MISSING", s.stdout)
         self.assertIn("match: no", s.stdout)
 
+    # -- Firefox on the open stack (2026-11-26) ------------------------------------------------------------------------
+    def firefox_pref(self):
+        f = self.root / "etc/firefox/pref/a7a-open-stack.js"
+        return f.read_text() if f.exists() else None
+
+    def test_firefox_draws_on_the_cpu_on_the_open_stack_only(self):
+        # Mesa 26.3's PowerVR Vulkan gives zink OpenGL 3.2, and Firefox then draws on the GPU, slower there than its
+        # software WebRender (the owner's video lagged): a default pref on the open stack, gone on any other
+        (self.root / "etc/firefox/pref").mkdir(parents=True)
+        self.gpu("powervr")
+        self.config_open()
+        r = self.run_tool("apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('pref("gfx.webrender.software", true);', self.firefox_pref())
+        self.assertIn("firefox-pref-written", r.stdout)
+        self.assertIn("firefox: software WebRender (open stack)", self.run_tool("status").stdout)
+        # a second boot: nothing to write
+        self.assertNotIn("firefox-pref", self.run_tool("apply").stdout)
+        # the DDK draws Firefox fast on the GPU: the pref goes
+        (self.root / "sys/bus/platform/devices/1800000.gpu/driver").unlink()
+        self.gpu("pvrsrvkm")
+        self.config_ddk()
+        self.assertIn("firefox: stale", self.run_tool("status", release="6.6.98-a7a.202609091931").stdout)
+        r = self.run_tool("apply", release="6.6.98-a7a.202609091931")
+        self.assertIsNone(self.firefox_pref())
+        self.assertIn("firefox-pref-removed", r.stdout)
+        self.assertIn("firefox: as Firefox chooses", self.run_tool("status", release="6.6.98-a7a.202609091931").stdout)
+
+    def test_firefox_pref_goes_on_every_other_outcome_and_is_never_made_without_firefox(self):
+        pref = self.root / "etc/firefox/pref/a7a-open-stack.js"
+        for case in ("nogpu", "other", "manual-ddk"):
+            with self.subTest(case=case):
+                pref.parent.mkdir(parents=True, exist_ok=True)
+                pref.write_text('pref("gfx.webrender.software", true);\n')
+                node = self.root / "sys/bus/platform/devices/1800000.gpu"
+                if (node / "driver").is_symlink():
+                    (node / "driver").unlink()
+                if case == "nogpu":
+                    self.gpu(None)
+                    self.run_tool("apply", release="6.6.98-a7a.202609091931")
+                elif case == "other":
+                    (self.root / "sys/bus/platform/drivers/panfrost").mkdir(exist_ok=True)
+                    self.gpu("panfrost")
+                    self.run_tool("apply")
+                else:
+                    self.gpu("pvrsrvkm")
+                    (self.root / "etc/a7a/gpu-session.manual").touch()
+                    self.run_tool("apply", release="6.6.98-a7a.202609091931")
+                    (self.root / "etc/a7a/gpu-session.manual").unlink()
+                self.assertIsNone(self.firefox_pref(), case)
+        # no Firefox (no /etc/firefox/pref): nothing is made, on the open stack either
+        import shutil
+        shutil.rmtree(self.root / "etc/firefox")
+        (self.root / "sys/bus/platform/devices/1800000.gpu/driver").unlink()
+        self.gpu("powervr")
+        self.config_open()
+        r = self.run_tool("apply")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((self.root / "etc/firefox").exists())
+
     def test_greeter_subcommand_is_for_a_kwin_update_in_a_running_system(self):
         # the package trigger on kwin-libs: the user logs out after `dnf upgrade` and the greeter starts with the new
         # KWin before any reboot. Only the greeter's env and a software drop-in that went stale; nothing else moves

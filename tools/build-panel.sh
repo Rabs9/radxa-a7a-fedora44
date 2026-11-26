@@ -41,7 +41,7 @@ if [ ! -e "$SR/usr/lib64/libgcc_s.so" ]; then
       || { echo "dnf download --forcearch=aarch64 $pkg failed; put the aarch64 $pkg RPM of Fedora 44 into work/sysroot-aarch64-rpms"; exit 1; }
   done
   for r in "$W"/sysroot-aarch64-rpms/*.rpm; do
-    rpm2cpio "$r" | (cd "$SR" && cpio -idm --quiet 2> /dev/null)
+    rpm2cpio "$r" | (cd "$SR" && cpio -idm --quiet 2> /dev/null; s=$?; cat > /dev/null; exit $s )
   done
   # the merged /usr layout of a Fedora system (the filesystem package is not unpacked)
   if [ -d "$SR/lib64" ] && [ ! -L "$SR/lib64" ]; then mv "$SR"/lib64/* "$SR/usr/lib64/"; rmdir "$SR/lib64"; fi

@@ -91,7 +91,7 @@ PANEL_SRC=$(cd "$P/tools/panel" && find Cargo.toml Cargo.lock src vendor -type f
 TREE_SUMS=$(printf '%s\n%s\n' "$TREE_SUMS" "$(sha256sum < "$P/output/panel/a7a-panel" | cut -c1-64)" | sort -u)
 RPMTMP=$(mktemp -d); : > "$RPMTMP/usr.sha256"
 for r in "$R_EXT" "$R_BOARD" "$R_TOOLS" "$R_PANEL" "$R_REPO"; do
-  mkdir "$RPMTMP/x"; ( cd "$RPMTMP/x" && rpm2cpio "$r" | cpio -id --quiet ) || { echo "cannot unpack $r" >&2; exit 1; }
+  mkdir "$RPMTMP/x"; ( cd "$RPMTMP/x" && rpm2cpio "$r" | ( cpio -id --quiet; s=$?; cat > /dev/null; exit $s ) ) || { echo "cannot unpack $r" >&2; exit 1; }
   stale=$(cd "$RPMTMP/x" && find . -type f -exec sha256sum {} + | while read -r sum f; do grep -qx "$sum" <<<"$TREE_SUMS" || echo "${f#.}"; done)
   [ -z "$stale" ] || { echo "$(basename "$r") was not built from this tree as it is now (run tools/build-tools-rpm.sh):" $stale >&2; rm -rf "$RPMTMP"; exit 1; }
   # for the look into the image after the install: the files under /usr (those under /etc are configuration the
@@ -525,7 +525,7 @@ KRPM=$(ls "$OUT"/rpms/kernel-a7a*-"${REL_DEF//-/_}"-*.aarch64.rpm 2>/dev/null | 
 mkdir -p "$OUT/kernels"
 if [ ! -s "$OUT/kernels/Image-$REL_DEF" ]; then
   [ -n "$KRPM" ] || { echo "no kernel package for $REL_DEF in $OUT/rpms: the emulator needs its Image"; exit 1; }
-  rpm2cpio "$KRPM" | cpio -i --quiet --to-stdout "./boot/vmlinuz-$REL_DEF" > "$OUT/kernels/Image-$REL_DEF"
+  rpm2cpio "$KRPM" | ( cpio -i --quiet --to-stdout "./boot/vmlinuz-$REL_DEF"; s=$?; cat > /dev/null; exit $s ) > "$OUT/kernels/Image-$REL_DEF"
 fi
 rm -f "$IMG" "$IMG.sha256" "$IMG.kernel" "$IMG.rpms" "$IMG.build" "$IMG.packages"
 mv "$B" "$IMG"

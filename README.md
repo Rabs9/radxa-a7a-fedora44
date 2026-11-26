@@ -98,8 +98,11 @@ terminal) checks the whole stack and ends with "0 fail, 0 warn".
    - on the default entry, in software: `LD_LIBRARY_PATH=/usr/lib64 <program>` (slower, but it runs);
    - on the GPU, slowly: start the board on the **second boot entry** (the open driver). There, desktop OpenGL runs
      on the PowerVR through zink (OpenGL on top of Mesa's PowerVR Vulkan driver), for Wayland and X11 programs
-     alike, but only up to **OpenGL 2.1** and slowly (glmark2's build scene: 39 fps, against about 2000 for OpenGL
-     ES on the default entry). Programs that need OpenGL 3 or newer do not run there either.
+     alike, up to **OpenGL 3.2** and **OpenGL ES 3.1** (with the Mesa 26.3 driver update, `sudo dnf upgrade`;
+     OpenGL 2.1 before it), but slowly (glmark2 scores around 40, against about 2000 for OpenGL ES on the default
+     entry). Programs that need OpenGL 3.3 or newer do not run there: the driver has no geometry shaders yet.
+     Firefox draws its pages in software there (`gfx.webrender.software`), which is faster on this driver than
+     zink; your own `about:config` setting wins.
 4. **Vulkan programs** need the second boot entry: Mesa's PowerVR Vulkan driver (Vulkan 1.2) shows windows on
    Wayland (`vkcube` runs on the PowerVR). On the default entry, Imagination's Vulkan driver cannot.
 5. **Flatpak apps** (Flathub) bring their own graphics libraries, which do not include Imagination's driver: expect
@@ -109,7 +112,7 @@ terminal) checks the whole stack and ends with "0 fail, 0 warn".
 
 The boot menu shows only on a serial console, so the switch is a command, in a terminal:
 
-- `sudo prepare616.sh`: the open driver (Mesa: Vulkan on Wayland, desktop OpenGL 2.1 through zink) from the next start;
+- `sudo prepare616.sh`: the open driver (Mesa: Vulkan on Wayland, desktop OpenGL 3.2 through zink) from the next start;
 - `sudo backtoddk.sh`: back to Imagination's driver (the default: the fastest desktop and OpenGL ES).
 
 Each makes its entry the default and restarts the board after 3 seconds; nothing is removed, and the session follows
@@ -252,7 +255,8 @@ The A7A's GPU is an Imagination PowerVR BXM-4-64. Two drivers run it in this ima
   firmware, and the closed user-space libraries Radxa ships in its Debian package (installed under `/opt/pvr`). It
   gives OpenGL ES 3.2 and Vulkan, and draws this desktop.
 - **The open driver** (second boot entry): the upstream `drm/imagination` kernel driver and Mesa's PowerVR Vulkan
-  driver. It runs, but is far slower for 3D (SuperTuxKart 4 fps against 30).
+  driver. It runs, and with Mesa 26.3 gives OpenGL 3.2 through zink, but is far slower for 3D (SuperTuxKart 4 fps
+  against 30) and for the desktop itself.
 
 What only Imagination, or Radxa as their licensee, can provide, and what would finish this work:
 
